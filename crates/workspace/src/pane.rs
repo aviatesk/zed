@@ -1,6 +1,6 @@
 use crate::{
     CloseWindow, NewFile, NewTerminal, OpenInTerminal, OpenOptions, OpenTerminal, OpenVisible,
-    SplitDirection, ToggleFileFinder, ToggleProjectSymbols, ToggleZoom, Workspace,
+    SplitDirection, ToggleEditorZoom, ToggleFileFinder, ToggleProjectSymbols, ToggleZoom, Workspace,
     WorkspaceItemBuilder,
     invalid_buffer_view::InvalidBufferView,
     item::{
@@ -266,6 +266,7 @@ pub enum Event {
     Focus,
     ZoomIn,
     ZoomOut,
+    ToggleEditorZoom,
     UserSavedItem {
         item: Box<dyn WeakItemHandle>,
         save_intent: SaveIntent,
@@ -298,6 +299,7 @@ impl fmt::Debug for Event {
             Event::Focus => f.write_str("Focus"),
             Event::ZoomIn => f.write_str("ZoomIn"),
             Event::ZoomOut => f.write_str("ZoomOut"),
+            Event::ToggleEditorZoom => f.write_str("ToggleEditorZoom"),
             Event::UserSavedItem { item, save_intent } => f
                 .debug_struct("UserSavedItem")
                 .field("item", &item.id())
@@ -1224,6 +1226,23 @@ impl Pane {
                 cx.focus_self(window);
             }
             cx.emit(Event::ZoomIn);
+        }
+    }
+
+    pub fn toggle_editor_zoom(
+        &mut self,
+        _: &ToggleEditorZoom,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_toggle_zoom {
+            cx.propagate();
+        } else if !self.items.is_empty() {
+            if !self.focus_handle.contains_focused(window, cx) {
+                cx.focus_self(window);
+            }
+            // Don't set zoomed state for editor zoom - we handle it differently
+            cx.emit(Event::ToggleEditorZoom);
         }
     }
 
@@ -3573,6 +3592,7 @@ impl Render for Pane {
                 cx.emit(Event::JoinAll);
             }))
             .on_action(cx.listener(Pane::toggle_zoom))
+            .on_action(cx.listener(Pane::toggle_editor_zoom))
             .on_action(cx.listener(Self::navigate_backward))
             .on_action(cx.listener(Self::navigate_forward))
             .on_action(
