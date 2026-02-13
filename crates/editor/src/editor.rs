@@ -12675,10 +12675,7 @@ pub fn styled_runs_for_code_label<'a>(
     syntax_theme: &'a theme::SyntaxTheme,
     local_player: &'a theme::PlayerColor,
 ) -> impl 'a + Iterator<Item = (Range<usize>, HighlightStyle)> {
-    let fade_out = HighlightStyle {
-        fade_out: Some(0.35),
-        ..Default::default()
-    };
+    let fade_out = HighlightStyle::FADE_OUT;
 
     if label.runs.is_empty() {
         let desc_start = label.filter_range.end;
