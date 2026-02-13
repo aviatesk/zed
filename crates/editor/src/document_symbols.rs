@@ -220,13 +220,21 @@ impl Editor {
                                 editor.display_map.update(cx, |map, cx| map.snapshot(cx));
                             let language = buffer.read(cx).language().cloned();
                             for item in &mut items {
-                                if let Some(highlights) =
+                                let syntax_highlights =
                                     highlights_from_buffer(&display_snapshot, item, &syntax)
-                                {
-                                    item.highlight_ranges = highlights;
-                                } else if let Some(language) = &language {
-                                    item.highlight_ranges =
-                                        highlight_ranges_from_text(&item.text, language, &syntax);
+                                        .or_else(|| {
+                                            language.as_ref().map(|language| {
+                                                highlight_ranges_from_text(
+                                                    &item.text, language, &syntax,
+                                                )
+                                            })
+                                        });
+                                if let Some(syntax_highlights) = syntax_highlights {
+                                    item.highlight_ranges = gpui::combine_highlights(
+                                        item.highlight_ranges.drain(..),
+                                        syntax_highlights,
+                                    )
+                                    .collect();
                                 }
                             }
                             editor.lsp_document_symbols.insert(buffer_id, items);
@@ -428,6 +436,7 @@ mod tests {
 
     fn nested_symbol(
         name: &str,
+        detail: Option<&str>,
         kind: lsp::SymbolKind,
         range: lsp::Range,
         selection_range: lsp::Range,
@@ -436,7 +445,7 @@ mod tests {
         #[allow(deprecated)]
         lsp::DocumentSymbol {
             name: name.to_string(),
-            detail: None,
+            detail: detail.map(|d| d.to_string()),
             kind,
             tags: None,
             deprecated: None,
@@ -682,6 +691,7 @@ mod tests {
                     Ok(Some(lsp::DocumentSymbolResponse::Nested(vec![
                         nested_symbol(
                             "main",
+                            None,
                             lsp::SymbolKind::FUNCTION,
                             lsp_range(0, 0, 2, 1),
                             lsp_range(0, 3, 0, 7),
@@ -722,12 +732,14 @@ mod tests {
                     Ok(Some(lsp::DocumentSymbolResponse::Nested(vec![
                         nested_symbol(
                             "Foo",
+                            Some("{ bar: u32, baz: String }"),
                             lsp::SymbolKind::STRUCT,
                             lsp_range(0, 0, 3, 1),
                             lsp_range(0, 7, 0, 10),
                             vec![
                                 nested_symbol(
                                     "bar",
+                                    Some(""),
                                     lsp::SymbolKind::FIELD,
                                     lsp_range(1, 4, 1, 13),
                                     lsp_range(1, 4, 1, 7),
@@ -735,6 +747,7 @@ mod tests {
                                 ),
                                 nested_symbol(
                                     "baz",
+                                    None,
                                     lsp::SymbolKind::FIELD,
                                     lsp_range(2, 4, 2, 15),
                                     lsp_range(2, 4, 2, 7),
@@ -753,8 +766,8 @@ mod tests {
         cx.update_editor(|editor, _window, _cx| {
             assert_eq!(
                 outline_symbol_names(editor),
-                vec!["struct Foo", "bar"],
-                "cursor is inside Foo > bar, so we expect the containing chain"
+                vec!["struct Foo { bar: u32, baz: String }", "bar"],
+                "detail is appended to Foo; empty detail on bar is ignored"
             );
         });
     }
@@ -778,6 +791,7 @@ mod tests {
                     Ok(Some(lsp::DocumentSymbolResponse::Nested(vec![
                         nested_symbol(
                             "lsp_main_symbol",
+                            None,
                             lsp::SymbolKind::FUNCTION,
                             lsp_range(0, 0, 2, 1),
                             lsp_range(0, 3, 0, 7),
@@ -857,6 +871,7 @@ mod tests {
                     Ok(Some(lsp::DocumentSymbolResponse::Nested(vec![
                         nested_symbol(
                             "main",
+                            None,
                             lsp::SymbolKind::FUNCTION,
                             lsp_range(0, 0, 2, 1),
                             lsp_range(0, 3, 0, 7),
@@ -955,11 +970,13 @@ mod tests {
                     Ok(Some(lsp::DocumentSymbolResponse::Nested(vec![
                         nested_symbol(
                             "MyModule",
+                            None,
                             lsp::SymbolKind::MODULE,
                             lsp_range(0, 0, 4, 1),
                             lsp_range(0, 4, 0, 12),
                             vec![nested_symbol(
                                 "my_function",
+                                None,
                                 lsp::SymbolKind::FUNCTION,
                                 lsp_range(1, 4, 3, 5),
                                 lsp_range(1, 7, 1, 18),
@@ -1012,6 +1029,7 @@ mod tests {
                     Ok(Some(lsp::DocumentSymbolResponse::Nested(vec![
                         nested_symbol(
                             "test",
+                            None,
                             lsp::SymbolKind::FUNCTION,
                             lsp_range(0, 0, 1, 13), // includes doc comment
                             lsp_range(1, 3, 1, 7),  // "test"
@@ -1109,6 +1127,7 @@ mod tests {
                     Ok(Some(lsp::DocumentSymbolResponse::Nested(vec![
                         nested_symbol(
                             "impl ZzzMissing",
+                            None,
                             lsp::SymbolKind::OBJECT,
                             lsp_range(0, 0, 0, 12),
                             lsp_range(0, 3, 0, 7),
@@ -1208,6 +1227,7 @@ mod tests {
                     Ok(Some(lsp::DocumentSymbolResponse::Nested(vec![
                         nested_symbol(
                             "should_not_appear",
+                            None,
                             lsp::SymbolKind::FUNCTION,
                             lsp_range(0, 0, 2, 1),
                             lsp_range(0, 3, 0, 7),
