@@ -34,18 +34,25 @@ impl Editor {
 
         if lsp_symbols_enabled(buffer.read(cx), cx) {
             let refresh_task = self.refresh_document_symbols_task.clone();
+            let buffer_snapshot = buffer.read(cx).snapshot();
+            let syntax = cx.theme().syntax().clone();
             cx.spawn(async move |editor, cx| {
                 refresh_task.await;
-                editor
+                let lsp_items = editor
                     .read_with(cx, |editor, _| {
-                        editor
-                            .lsp_document_symbols
-                            .get(&buffer_id)
-                            .cloned()
-                            .unwrap_or_default()
+                        editor.lsp_document_symbols.get(&buffer_id).cloned()
                     })
                     .ok()
-                    .unwrap_or_default()
+                    .flatten()
+                    .unwrap_or_default();
+
+                if lsp_items.is_empty() {
+                    cx.background_executor()
+                        .spawn(async move { buffer_snapshot.outline(Some(&syntax)).items })
+                        .await
+                } else {
+                    lsp_items
+                }
             })
         } else {
             let buffer_snapshot = buffer.read(cx).snapshot();
@@ -925,11 +932,11 @@ mod tests {
         assert!(symbol_request.next().await.is_some());
         cx.run_until_parked();
         cx.update_editor(|editor, _window, _cx| {
-            // With LSP enabled but empty response, outline_symbols_at_cursor should be None
-            // (no symbols to show in breadcrumbs)
-            assert!(
-                editor.outline_symbols_at_cursor.is_none(),
-                "Empty LSP response should result in no outline symbols"
+            // With LSP enabled but empty response, should fall back to tree-sitter
+            assert_eq!(
+                outline_symbol_names(editor),
+                vec!["fn main"],
+                "Empty LSP response should fall back to tree-sitter outline symbols"
             );
         });
     }
