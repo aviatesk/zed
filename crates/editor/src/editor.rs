@@ -3984,26 +3984,28 @@ impl Editor {
         let multi_buffer_snapshot = self.buffer().read(cx).snapshot(cx);
 
         if self.uses_lsp_document_symbols(cursor, &multi_buffer_snapshot, cx) {
-            self.outline_symbols_at_cursor =
-                self.lsp_symbols_at_cursor(cursor, &multi_buffer_snapshot, cx);
-            cx.emit(EditorEvent::OutlineSymbolsChanged);
-            cx.notify();
-        } else {
-            let syntax = cx.theme().syntax().clone();
-            let background_task = cx.background_spawn(async move {
-                multi_buffer_snapshot.symbols_containing(cursor, Some(&syntax))
-            });
-            self.refresh_outline_symbols_at_cursor_at_cursor_task =
-                cx.spawn(async move |this, cx| {
-                    let symbols = background_task.await;
-                    this.update(cx, |this, cx| {
-                        this.outline_symbols_at_cursor = symbols;
-                        cx.emit(EditorEvent::OutlineSymbolsChanged);
-                        cx.notify();
-                    })
-                    .ok();
-                });
+            let lsp_symbols = self.lsp_symbols_at_cursor(cursor, &multi_buffer_snapshot, cx);
+            if lsp_symbols.is_some() {
+                self.outline_symbols_at_cursor = lsp_symbols;
+                cx.emit(EditorEvent::OutlineSymbolsChanged);
+                cx.notify();
+                return;
+            }
         }
+
+        let syntax = cx.theme().syntax().clone();
+        let background_task = cx.background_spawn(async move {
+            multi_buffer_snapshot.symbols_containing(cursor, Some(&syntax))
+        });
+        self.refresh_outline_symbols_at_cursor_at_cursor_task = cx.spawn(async move |this, cx| {
+            let symbols = background_task.await;
+            this.update(cx, |this, cx| {
+                this.outline_symbols_at_cursor = symbols;
+                cx.emit(EditorEvent::OutlineSymbolsChanged);
+                cx.notify();
+            })
+            .ok();
+        });
     }
 
     #[ztracing::instrument(skip_all)]
