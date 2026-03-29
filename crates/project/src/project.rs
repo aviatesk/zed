@@ -3314,6 +3314,22 @@ impl Project {
         })
     }
 
+    pub fn open_lsp_untitled_document(
+        &self,
+        uri: lsp::Uri,
+        preferred_server_id: Option<LanguageServerId>,
+        cx: &mut App,
+    ) -> Task<Result<Entity<Buffer>>> {
+        if self.is_remote() {
+            return Task::ready(Err(anyhow!(
+                "opening LSP untitled documents is not supported for remote projects yet"
+            )));
+        }
+        self.lsp_store.update(cx, |lsp_store, cx| {
+            lsp_store.open_untitled_document(uri, preferred_server_id, cx)
+        })
+    }
+
     pub fn open_unstaged_diff(
         &mut self,
         buffer: Entity<Buffer>,
@@ -5674,6 +5690,7 @@ impl Project {
         project.update(&mut cx, |_, cx| {
             cx.emit(Event::LanguageServerShowDocument(
                 LanguageServerShowDocumentRequest {
+                    server_id: None,
                     uri,
                     external: payload.external,
                     take_focus: payload.take_focus,
