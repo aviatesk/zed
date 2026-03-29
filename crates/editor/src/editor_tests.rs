@@ -46452,6 +46452,190 @@ async fn test_lsp_show_document(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_lsp_show_document_untitled(cx: &mut TestAppContext) {
+    let mut cx = EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;
+
+    let initial_editor = cx.editor.clone();
+    let initial_item_count = cx.update_workspace(|workspace, _, cx| workspace.items(cx).count());
+    let response = cx
+        .lsp
+        .server
+        .request::<lsp::request::ShowDocument>(
+            lsp::ShowDocumentParams {
+                uri: "untitled:shown.rs".parse().expect("valid untitled URI"),
+                external: None,
+                take_focus: Some(true),
+                selection: None,
+            },
+            DEFAULT_LSP_REQUEST_TIMEOUT,
+        )
+        .await
+        .into_response()
+        .expect("show document request should not error");
+    assert_eq!(response, lsp::ShowDocumentResult { success: true });
+    cx.run_until_parked();
+
+    cx.update_workspace(|workspace, window, cx| {
+        let editor = workspace
+            .active_item_as::<Editor>(cx)
+            .expect("an editor should be opened for the untitled document");
+        assert_ne!(editor, initial_editor);
+        assert_eq!(workspace.items(cx).count(), initial_item_count + 1);
+        assert!(editor.read(cx).is_focused(window));
+        assert!(!initial_editor.read(cx).is_focused(window));
+        let buffer = editor
+            .read(cx)
+            .buffer()
+            .read(cx)
+            .as_singleton()
+            .expect("a singleton buffer should be opened");
+        assert!(buffer.read(cx).file().is_none());
+        assert_eq!(buffer.read(cx).text(), "");
+    });
+}
+
+#[gpui::test]
+async fn test_lsp_show_document_untitled_selection_focus_and_reuse(cx: &mut TestAppContext) {
+    let mut cx = EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;
+
+    let uri = "untitled:selection.rs"
+        .parse::<lsp::Uri>()
+        .expect("valid untitled URI");
+    let server_id = cx.lsp.server.server_id();
+    let buffer = cx
+        .update_workspace(|workspace, _, cx| {
+            workspace.project().update(cx, |project, cx| {
+                project.open_lsp_untitled_document(uri.clone(), Some(server_id), cx)
+            })
+        })
+        .await
+        .expect("the untitled buffer should open without displaying an editor");
+    cx.update_workspace(|_, _, cx| {
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(0..0, "a😀bc\nsecond")], None, cx);
+        });
+    });
+
+    let initial_editor = cx.editor.clone();
+    let initial_item_count = cx.update_workspace(|workspace, _, cx| workspace.items(cx).count());
+    let mut opened_editor = None;
+    for (take_focus, selection, expected_range) in [
+        (
+            None,
+            Some(lsp::Range::new(
+                lsp::Position::new(0, 2),
+                lsp::Position::new(0, 4),
+            )),
+            Point::new(0, 1)..Point::new(0, 6),
+        ),
+        (
+            Some(false),
+            Some(lsp::Range::new(
+                lsp::Position::new(0, 3),
+                lsp::Position::new(99, 99),
+            )),
+            Point::new(0, 5)..Point::new(1, 6),
+        ),
+        (Some(true), None, Point::new(0, 5)..Point::new(1, 6)),
+    ] {
+        cx.update_workspace(|workspace, window, cx| {
+            assert!(workspace.activate_item(&initial_editor, true, true, window, cx));
+        });
+        let response = cx
+            .lsp
+            .server
+            .request::<lsp::request::ShowDocument>(
+                lsp::ShowDocumentParams {
+                    uri: uri.clone(),
+                    external: None,
+                    take_focus,
+                    selection,
+                },
+                DEFAULT_LSP_REQUEST_TIMEOUT,
+            )
+            .await
+            .into_response()
+            .expect("show document request should not error");
+        assert_eq!(response, lsp::ShowDocumentResult { success: true });
+        cx.run_until_parked();
+
+        cx.update_workspace(|workspace, window, cx| {
+            let editor = workspace
+                .active_item_as::<Editor>(cx)
+                .expect("an editor should be opened for the untitled document");
+            if let Some(opened_editor) = &opened_editor {
+                assert_eq!(&editor, opened_editor, "reopening should reuse the tab");
+            } else {
+                opened_editor = Some(editor.clone());
+            }
+            assert_eq!(workspace.items(cx).count(), initial_item_count + 1);
+            assert_eq!(
+                editor.read(cx).buffer().read(cx).as_singleton(),
+                Some(buffer.clone()),
+                "show document should reuse the existing untitled buffer"
+            );
+            assert_eq!(buffer.read(cx).text(), "a😀bc\nsecond");
+            assert_eq!(
+                editor.read(cx).is_focused(window),
+                take_focus.unwrap_or(false)
+            );
+            assert_eq!(
+                initial_editor.read(cx).is_focused(window),
+                !take_focus.unwrap_or(false)
+            );
+            editor.update(cx, |editor, cx| {
+                assert_eq!(
+                    editor
+                        .selections
+                        .ranges::<Point>(&editor.display_snapshot(cx)),
+                    vec![expected_range]
+                );
+            });
+        });
+    }
+}
+
+#[gpui::test]
+async fn test_lsp_show_document_untitled_remote_project(cx: &mut TestAppContext) {
+    let mut cx = EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;
+
+    let initial_editor = cx.editor.clone();
+    let initial_item_count = cx.update_workspace(|workspace, _, cx| {
+        workspace.project().update(cx, |project, _| {
+            project.mark_as_collab_for_testing();
+            assert!(project.is_remote());
+        });
+        workspace.items(cx).count()
+    });
+    let response = cx
+        .lsp
+        .server
+        .request::<lsp::request::ShowDocument>(
+            lsp::ShowDocumentParams {
+                uri: "untitled:remote.rs".parse().expect("valid untitled URI"),
+                external: None,
+                take_focus: Some(true),
+                selection: None,
+            },
+            DEFAULT_LSP_REQUEST_TIMEOUT,
+        )
+        .await
+        .into_response()
+        .expect("show document request should not error");
+    assert_eq!(response, lsp::ShowDocumentResult { success: false });
+    cx.run_until_parked();
+
+    cx.update_workspace(|workspace, window, cx| {
+        assert_eq!(
+            workspace.active_item_as::<Editor>(cx),
+            Some(initial_editor.clone())
+        );
+        assert_eq!(workspace.items(cx).count(), initial_item_count);
+        assert!(initial_editor.read(cx).is_focused(window));
+    });
+}
+
+#[gpui::test]
 async fn test_lsp_show_document_external(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
     let mut cx = EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;
@@ -46539,7 +46723,7 @@ async fn test_lsp_show_document_unsupported_uri(cx: &mut TestAppContext) {
         .server
         .request::<lsp::request::ShowDocument>(
             lsp::ShowDocumentParams {
-                uri: "untitled:some-document".parse::<lsp::Uri>().unwrap(),
+                uri: "unsupported:some-document".parse::<lsp::Uri>().unwrap(),
                 external: None,
                 take_focus: None,
                 selection: None,

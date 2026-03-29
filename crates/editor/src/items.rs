@@ -56,7 +56,7 @@ use workspace::{
     CollaboratorId, ItemId, ItemNavHistory, OpenOptions, OpenVisible, ToolbarItemLocation, ViewId,
     Workspace, WorkspaceId,
     invalid_item_view::InvalidItemView,
-    item::{FollowableItem, Item, ItemBufferKind, ItemEvent, ProjectItem, SaveOptions},
+    item::{FollowableItem, Item, ItemBufferKind, ItemEvent, ItemHandle, ProjectItem, SaveOptions},
     searchable::{
         Direction, FilteredSearchRange, SearchEvent, SearchToken, SearchableItem,
         SearchableItemHandle,
@@ -2524,24 +2524,52 @@ pub(crate) fn handle_lsp_show_document(
         request.respond(true);
         return Task::ready(());
     }
-    let Ok(abs_path) = request.uri.to_file_path_ext(workspace.path_style(cx)) else {
-        log::error!(
-            "language server requested to show document with unsupported uri {}",
-            request.uri.as_str()
-        );
-        request.respond(false);
-        return Task::ready(());
+    let open_task: Task<Result<Box<dyn ItemHandle>>> = if request.uri.scheme() == "untitled" {
+        let buffer_task = workspace.project().update(cx, |project, cx| {
+            project.open_lsp_untitled_document(request.uri.clone(), request.server_id, cx)
+        });
+        let take_focus = request.take_focus;
+        cx.spawn_in(window, async move |workspace, cx| {
+            let buffer = buffer_task.await?;
+            workspace.update_in(cx, |workspace, window, cx| {
+                // Untitled buffers have no project path or entry ID for open_project_item to match.
+                let existing_editor = workspace.items_of_type::<Editor>(cx).find(|editor| {
+                    editor.read(cx).buffer().read(cx).as_singleton().as_ref() == Some(&buffer)
+                });
+                let editor = if let Some(editor) = existing_editor {
+                    anyhow::ensure!(
+                        workspace.activate_item(&editor, true, take_focus, window, cx),
+                        "failed to activate untitled document"
+                    );
+                    editor
+                } else {
+                    workspace.open_project_item::<Editor>(
+                        None, buffer, true, take_focus, false, false, window, cx,
+                    )
+                };
+                Ok(Box::new(editor) as Box<dyn ItemHandle>)
+            })?
+        })
+    } else {
+        let Ok(abs_path) = request.uri.to_file_path_ext(workspace.path_style(cx)) else {
+            log::error!(
+                "language server requested to show document with unsupported uri {}",
+                request.uri.as_str()
+            );
+            request.respond(false);
+            return Task::ready(());
+        };
+        workspace.open_abs_path(
+            abs_path,
+            OpenOptions {
+                visible: Some(OpenVisible::None),
+                focus: Some(request.take_focus),
+                ..OpenOptions::default()
+            },
+            window,
+            cx,
+        )
     };
-    let open_task = workspace.open_abs_path(
-        abs_path,
-        OpenOptions {
-            visible: Some(OpenVisible::None),
-            focus: Some(request.take_focus),
-            ..OpenOptions::default()
-        },
-        window,
-        cx,
-    );
     cx.spawn_in(window, async move |_, cx| {
         let success = match open_task.await {
             Ok(item) => match item.downcast::<Editor>().zip(request.selection) {
