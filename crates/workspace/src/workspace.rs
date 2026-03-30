@@ -8739,7 +8739,9 @@ impl Workspace {
 
     /// Returns the currently-visible major window regions ("parts"), in a stable
     /// cyclic order: title bar, left dock, editor, right dock, bottom dock,
-    /// status bar. Closed docks are skipped. Used by
+    /// status bar. Closed docks are skipped, and the title bar is only included
+    /// when the status bar is hidden (otherwise its items live in the status
+    /// bar). Used by
     /// [`FocusNextPart`]/[`FocusPreviousPart`] so keyboard and screen-reader
     /// users can move between regions without a mouse.
     fn focusable_parts(&self, cx: &App) -> Vec<FocusablePart> {
@@ -8760,7 +8762,7 @@ impl Workspace {
         };
 
         let mut parts = Vec::new();
-        if self.titlebar_item.is_some() {
+        if !self.status_bar_visible(cx) && self.titlebar_item.is_some() {
             // The title bar is an ARIA toolbar, so region navigation lands on
             // its first control rather than the toolbar container.
             parts.push(FocusablePart::toolbar(self.titlebar_focus_handle.clone()));
@@ -8788,11 +8790,13 @@ impl Workspace {
             &self.bottom_dock,
             &self.region_focus_handles.bottom_dock,
         ));
-        // The status bar is an ARIA toolbar, so region navigation lands on its
-        // first control rather than the toolbar container.
-        parts.push(FocusablePart::toolbar(
-            self.status_bar.read(cx).focus_handle(cx),
-        ));
+        if self.status_bar_visible(cx) {
+            // The status bar is an ARIA toolbar, so region navigation lands on
+            // its first control rather than the toolbar container.
+            parts.push(FocusablePart::toolbar(
+                self.status_bar.read(cx).focus_handle(cx),
+            ));
+        }
         parts
     }
 
@@ -9632,35 +9636,37 @@ impl Render for Workspace {
             // a tab group: region navigation lands on the first control (per
             // the ARIA toolbar pattern), Tab steps through them, and arrow keys
             // move between them once focus is inside.
-            .when_some(self.titlebar_item.clone(), |this, item| {
-                this.child(
-                    div()
-                        .id("titlebar-region")
-                        .track_focus(&self.titlebar_focus_handle)
-                        .tab_group()
-                        .role(gpui::Role::Toolbar)
-                        .aria_label("Title bar")
-                        .on_key_down(cx.listener(
-                            |workspace, event: &gpui::KeyDownEvent, window, cx| {
-                                if event.keystroke.modifiers.modified() {
-                                    return;
-                                }
-                                match event.keystroke.key.as_str() {
-                                    "right" => {
-                                        workspace.move_titlebar_item_focus(true, window, cx);
-                                        cx.stop_propagation();
+            .when(!self.status_bar_visible(cx), |this| {
+                this.when_some(self.titlebar_item.clone(), |this, item| {
+                    this.child(
+                        div()
+                            .id("titlebar-region")
+                            .track_focus(&self.titlebar_focus_handle)
+                            .tab_group()
+                            .role(gpui::Role::Toolbar)
+                            .aria_label("Title bar")
+                            .on_key_down(cx.listener(
+                                |workspace, event: &gpui::KeyDownEvent, window, cx| {
+                                    if event.keystroke.modifiers.modified() {
+                                        return;
                                     }
-                                    "left" => {
-                                        workspace.move_titlebar_item_focus(false, window, cx);
-                                        cx.stop_propagation();
+                                    match event.keystroke.key.as_str() {
+                                        "right" => {
+                                            workspace.move_titlebar_item_focus(true, window, cx);
+                                            cx.stop_propagation();
+                                        }
+                                        "left" => {
+                                            workspace.move_titlebar_item_focus(false, window, cx);
+                                            cx.stop_propagation();
+                                        }
+                                        _ => {}
                                     }
-                                    _ => {}
-                                }
-                            },
-                        ))
-                        .w_full()
-                        .child(item),
-                )
+                                },
+                            ))
+                            .w_full()
+                            .child(item),
+                    )
+                })
             })
             .on_modifiers_changed(move |_, _, cx| {
                 for &id in &notification_entities {

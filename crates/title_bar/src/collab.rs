@@ -5,8 +5,8 @@ use call::{ActiveCall, Room};
 use channel::ChannelStore;
 use client::{User, proto::PeerId};
 use gpui::{
-    AnyElement, Empty, Hsla, IntoElement, MouseButton, Path, ScreenCaptureSource, Styled, TaskExt,
-    WeakEntity, canvas, point,
+    Anchor, AnyElement, Empty, Hsla, IntoElement, MouseButton, Path, ScreenCaptureSource, Styled,
+    TaskExt, WeakEntity, canvas, point,
 };
 use gpui::{App, Task, Window};
 use icons::IconName;
@@ -335,6 +335,7 @@ impl TitleBar {
 
     pub(crate) fn render_call_controls(
         &self,
+        anchor: Anchor,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -396,6 +397,7 @@ impl TitleBar {
                     .gap_1()
                     .child(
                         IconButton::new("leave-call", IconName::Exit)
+                            .tab_index(0isize)
                             .tooltip(Tooltip::text("Leave Call"))
                             .icon_size(IconSize::Small)
                             .on_click(move |_, _window, cx| {
@@ -408,6 +410,7 @@ impl TitleBar {
             )
             .child(
                 IconButton::new("call-quality", signal_icon)
+                    .tab_index(0isize)
                     .icon_size(IconSize::Small)
                     .when_some(signal_color, |button, color| button.icon_color(color))
                     .tooltip(Tooltip::element(move |window, cx| {
@@ -464,6 +467,7 @@ impl TitleBar {
                             IconName::Mic
                         },
                     )
+                    .tab_index(0isize)
                     .tooltip(move |_window, cx| {
                         if is_muted {
                             if is_deafened {
@@ -495,6 +499,7 @@ impl TitleBar {
                         IconName::AudioOn
                     },
                 )
+                .tab_index(0isize)
                 .selected_style(ButtonStyle::Tinted(TintColor::Error))
                 .icon_size(IconSize::Small)
                 .toggle_state(is_deafened)
@@ -571,6 +576,7 @@ impl TitleBar {
 
                     this.child(
                         IconButton::new("toggle_sharing", icon)
+                            .tab_index(0isize)
                             .icon_size(IconSize::Small)
                             .selected_style(ButtonStyle::Tinted(TintColor::Accent))
                             .toggle_state(is_shared)
@@ -619,6 +625,7 @@ impl TitleBar {
                 let is_wayland = false;
 
                 let trigger = IconButton::new("screen-share", IconName::Screen)
+                    .tab_index(0isize)
                     .style(ButtonStyle::Subtle)
                     .icon_size(IconSize::Small)
                     .toggle_state(is_screen_sharing)
@@ -680,7 +687,7 @@ impl TitleBar {
                     parent.child(
                         SplitButton::new(
                             trigger.render(window, cx),
-                            self.render_screen_list().into_any_element(),
+                            self.render_screen_list(anchor).into_any_element(),
                         )
                         .style(SplitButtonStyle::Transparent),
                     )
@@ -689,11 +696,12 @@ impl TitleBar {
             .into_any_element()
     }
 
-    fn render_screen_list(&self) -> impl IntoElement {
+    fn render_screen_list(&self, anchor: Anchor) -> impl IntoElement {
         PopoverMenu::new("screen-share-screen-list")
             .with_handle(self.screen_share_popover_handle.clone())
             .trigger(
                 ui::ButtonLike::new_rounded_right("screen-share-screen-list-trigger")
+                    .tab_index(0isize)
                     .child(
                         h_flex()
                             .mx_neg_0p5()
@@ -703,6 +711,7 @@ impl TitleBar {
                     )
                     .toggle_state(self.screen_share_popover_handle.is_deployed()),
             )
+            .anchor(anchor)
             .menu(|window, cx| {
                 let screens = cx.screen_capture_sources();
                 Some(ContextMenu::build(window, cx, |context_menu, _, cx| {

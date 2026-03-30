@@ -3,8 +3,9 @@ use crate::{
     sidebar_side_context_menu,
 };
 use gpui::{
-    Anchor, AnyView, App, Context, Decorations, Entity, FocusHandle, Focusable, IntoElement,
-    ParentElement, Render, Role, SharedString, Styled, Subscription, WeakEntity, Window,
+    Anchor, AnyView, App, Context, Decorations, Entity, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, MouseButton, ParentElement, Render, Role, SharedString, Styled, Subscription,
+    WeakEntity, Window, WindowControlArea, div,
 };
 use settings::{SettingsContent, update_settings_file};
 use std::{any::TypeId, sync::Arc};
@@ -103,6 +104,7 @@ pub struct StatusBar {
     active_pane: Entity<Pane>,
     multi_workspace: Option<WeakEntity<MultiWorkspace>>,
     focus_handle: FocusHandle,
+    should_move_window: bool,
     _observe_active_pane: Subscription,
 }
 
@@ -148,10 +150,30 @@ impl Render for StatusBar {
                 }),
             )
             .w_full()
-            .justify_between()
             .gap(DynamicSpacing::Base08.rems(cx))
             .p(DynamicSpacing::Base04.rems(cx))
             .bg(cx.theme().colors().status_bar_background)
+            .on_mouse_down_out(cx.listener(|this, _, _, _| {
+                this.should_move_window = false;
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| {
+                    this.should_move_window = false;
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, _| {
+                    this.should_move_window = !window.default_prevented();
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, _, window, _| {
+                if this.should_move_window {
+                    this.should_move_window = false;
+                    window.start_window_move();
+                }
+            }))
             .map(|el| match window.window_decorations() {
                 Decorations::Server => el,
                 Decorations::Client { tiling, .. } => el
@@ -182,11 +204,20 @@ impl Render for StatusBar {
                     .border_color(cx.theme().colors().status_bar_background),
             })
             .child(self.render_left_tools(&sidebar, cx))
+            .child(Self::render_window_drag_handle())
             .child(self.render_right_tools(&sidebar, cx))
     }
 }
 
 impl StatusBar {
+    fn render_window_drag_handle() -> impl IntoElement {
+        div()
+            .id("status-bar-window-drag-handle")
+            .flex_1()
+            .self_stretch()
+            .window_control_area(WindowControlArea::Drag)
+    }
+
     fn render_left_tools(
         &self,
         sidebar: &SidebarStatus,
@@ -336,6 +367,7 @@ impl StatusBar {
             active_pane: active_pane.clone(),
             multi_workspace,
             focus_handle: cx.focus_handle(),
+            should_move_window: false,
             _observe_active_pane: cx.observe_in(active_pane, window, |this, _, window, cx| {
                 this.update_active_pane_item(window, cx)
             }),
