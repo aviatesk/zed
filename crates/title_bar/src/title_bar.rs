@@ -4,6 +4,7 @@ mod onboarding_banner;
 mod plan_chip;
 mod title_bar_settings;
 mod update_version;
+pub mod user_menu_button;
 
 use crate::application_menu::{ApplicationMenu, show_menus};
 use crate::plan_chip::PlanChip;
@@ -115,7 +116,14 @@ pub fn init(cx: &mut App) {
         };
         let multi_workspace = workspace.multi_workspace().cloned();
         let item = cx.new(|cx| TitleBar::new("title-bar", workspace, multi_workspace, window, cx));
-        workspace.set_titlebar_item(item.into(), window, cx);
+        workspace.set_titlebar_item(item.clone().into(), window, cx);
+
+        let workspace_info = cx.new(|cx| user_menu_button::WorkspaceInfo::new(item.clone(), cx));
+        let user_menu_button = cx.new(|cx| user_menu_button::UserMenuButton::new(item.clone(), cx));
+        workspace.status_bar().update(cx, |status_bar, cx| {
+            status_bar.add_left_item(workspace_info, window, cx);
+            status_bar.add_right_item(user_menu_button, window, cx);
+        });
 
         workspace.register_action(|_workspace, _: &UseClassicLayout, _window, cx| {
             set_window_layout(WindowLayout::Editor(None), cx);
@@ -224,18 +232,7 @@ pub struct TitleBar {
 
 impl Render for TitleBar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.multi_workspace.is_none() {
-            if let Some(mw) = self
-                .workspace
-                .upgrade()
-                .and_then(|ws| ws.read(cx).multi_workspace().cloned())
-            {
-                self.multi_workspace = Some(mw.clone());
-                self.platform_titlebar.update(cx, |titlebar, _cx| {
-                    titlebar.set_multi_workspace(mw);
-                });
-            }
-        }
+        self.sync_multi_workspace(cx);
 
         let title_bar_settings = *TitleBarSettings::get_global(cx);
         let button_layout = title_bar_settings.button_layout;
@@ -245,66 +242,7 @@ impl Render for TitleBar {
 
         let mut children = <ArrayVec<_, 5>>::new();
 
-        let mut project_name = None;
-        let mut repository = None;
-        let mut linked_worktree_name = None;
-        if let Some(worktree) = self.effective_active_worktree(cx) {
-            repository = self.get_repository_for_worktree(&worktree, cx);
-            let worktree_abs_path = worktree.read(cx).abs_path();
-            project_name = worktree
-                .read(cx)
-                .root_name()
-                .file_name()
-                .map(|name| SharedString::from(name.to_string()));
-            if let Some(repo) = &repository {
-                let repo = repo.read(cx);
-                let identity = repo_identity_path(&repo.common_dir_abs_path, repo.path_style);
-                let identity_fallback =
-                    repo_identity_path_if_local(&repo.common_dir_abs_path, repo.path_style);
-                linked_worktree_name = linked_worktree_name_anchor(
-                    repo.main_worktree_abs_path(),
-                    identity_fallback,
-                    repo.is_linked_worktree(),
-                )
-                .and_then(|name_anchor_path| {
-                    linked_worktree_short_name(
-                        name_anchor_path,
-                        repo.work_directory_abs_path.as_ref(),
-                    )
-                })
-                .or_else(|| {
-                    repo.is_linked_worktree()
-                        .then_some(project_name.clone())
-                        .flatten()
-                });
-
-                let display_name = if identity.extension() == Some(std::ffi::OsStr::new("git")) {
-                    identity.file_stem().and_then(|n| n.to_str())
-                } else {
-                    repo.path_style.file_name(identity)
-                };
-
-                if let Some(repo_name) = display_name {
-                    let visible_worktrees_in_repo = self.visible_worktrees_in_repository(repo, cx);
-                    let name = if visible_worktrees_in_repo == 1 {
-                        if let Ok(relative) =
-                            worktree_abs_path.strip_prefix(&*repo.work_directory_abs_path)
-                        {
-                            if relative.as_os_str().is_empty() {
-                                repo_name.to_string()
-                            } else {
-                                format!("{}/{}", repo_name, relative.display())
-                            }
-                        } else {
-                            repo_name.to_string()
-                        }
-                    } else {
-                        repo_name.to_string()
-                    };
-                    project_name = Some(SharedString::from(name));
-                }
-            }
-        }
+        let (project_name, repository, linked_worktree_name) = self.project_info(cx);
 
         children.push(
             h_flex()
@@ -332,8 +270,17 @@ impl Render for TitleBar {
                             title_bar
                                 .when(title_bar_settings.show_project_items, |title_bar| {
                                     title_bar
-                                        .children(self.render_project_host(cx))
-                                        .child(self.render_project_name(project_name, window, cx))
+                                        .children(self.render_project_host(
+                                            Anchor::TopLeft,
+                                            cx.theme().colors().title_bar_background,
+                                            cx,
+                                        ))
+                                        .child(self.render_project_name(
+                                            project_name,
+                                            Anchor::TopLeft,
+                                            window,
+                                            cx,
+                                        ))
                                 })
                                 .when_some(
                                     repository.filter(|_| is_git_enabled),
@@ -341,6 +288,7 @@ impl Render for TitleBar {
                                         title_bar.children(self.render_worktree_and_branch(
                                             repository,
                                             linked_worktree_name,
+                                            Anchor::TopLeft,
                                             cx,
                                         ))
                                     },
@@ -359,55 +307,7 @@ impl Render for TitleBar {
             }
         }
 
-        let status = self.client.status();
-        let status = &*status.borrow();
-        let user = self.user_store.read(cx).current_user();
-        let is_signing_in = user.is_none()
-            && matches!(
-                status,
-                client::Status::Authenticating
-                    | client::Status::Authenticated
-                    | client::Status::Connecting
-            );
-        let is_signed_out_or_auth_error = user.is_none()
-            && matches!(
-                status,
-                client::Status::SignedOut | client::Status::AuthenticationError
-            );
-
-        children.push(
-            h_flex()
-                .pr_1()
-                .gap_1()
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .child(self.render_call_controls(window, cx))
-                .children(self.render_connection_status(status, cx))
-                .child(self.update_version.clone())
-                .when(
-                    user.is_none()
-                        && is_signed_out_or_auth_error
-                        && TitleBarSettings::get_global(cx).show_sign_in,
-                    |this| this.child(self.render_sign_in_button(cx)),
-                )
-                .when(is_signing_in, |this| {
-                    this.child(
-                        Label::new("Signing in…")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted)
-                            .with_animation(
-                                "signing-in",
-                                Animation::new(Duration::from_secs(2))
-                                    .repeat()
-                                    .with_easing(pulsating_between(0.4, 0.8)),
-                                |label, delta| label.alpha(delta),
-                            ),
-                    )
-                })
-                .when(TitleBarSettings::get_global(cx).show_user_menu, |this| {
-                    this.child(self.render_user_menu_button(cx))
-                })
-                .into_any_element(),
-        );
+        children.push(self.render_title_bar_controls(Anchor::TopRight, window, cx));
 
         if show_menus {
             self.platform_titlebar.update(cx, |this, _| {
@@ -541,8 +441,99 @@ impl TitleBar {
         this
     }
 
+    fn sync_multi_workspace(&mut self, cx: &mut Context<Self>) {
+        if self.multi_workspace.is_some() {
+            return;
+        }
+
+        if let Some(multi_workspace) = self
+            .workspace
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).multi_workspace().cloned())
+        {
+            self.multi_workspace = Some(multi_workspace.clone());
+            self.platform_titlebar.update(cx, |title_bar, _cx| {
+                title_bar.set_multi_workspace(multi_workspace);
+            });
+        }
+    }
+
     fn worktree_count(&self, cx: &App) -> usize {
         self.project.read(cx).visible_worktrees(cx).count()
+    }
+
+    fn project_info(
+        &self,
+        cx: &App,
+    ) -> (
+        Option<SharedString>,
+        Option<Entity<project::git_store::Repository>>,
+        Option<SharedString>,
+    ) {
+        let Some(worktree) = self.effective_active_worktree(cx) else {
+            return (None, None, None);
+        };
+
+        let repository = self.get_repository_for_worktree(&worktree, cx);
+        let worktree_abs_path = worktree.read(cx).abs_path();
+        let mut project_name = worktree
+            .read(cx)
+            .root_name()
+            .file_name()
+            .map(|name| SharedString::from(name.to_string()));
+        let mut linked_worktree_name = None;
+
+        if let Some(repository) = &repository {
+            let repository = repository.read(cx);
+            let identity =
+                repo_identity_path(&repository.common_dir_abs_path, repository.path_style);
+            let identity_fallback =
+                repo_identity_path_if_local(&repository.common_dir_abs_path, repository.path_style);
+            linked_worktree_name = linked_worktree_name_anchor(
+                repository.main_worktree_abs_path(),
+                identity_fallback,
+                repository.is_linked_worktree(),
+            )
+            .and_then(|name_anchor_path| {
+                linked_worktree_short_name(
+                    name_anchor_path,
+                    repository.work_directory_abs_path.as_ref(),
+                )
+            })
+            .or_else(|| {
+                repository
+                    .is_linked_worktree()
+                    .then_some(project_name.clone())
+                    .flatten()
+            });
+            let display_name = if identity.extension() == Some(std::ffi::OsStr::new("git")) {
+                identity.file_stem().and_then(|name| name.to_str())
+            } else {
+                repository.path_style.file_name(identity)
+            };
+
+            if let Some(repository_name) = display_name {
+                let visible_worktrees = self.visible_worktrees_in_repository(&repository, cx);
+                let name = if visible_worktrees == 1 {
+                    if let Ok(relative) =
+                        worktree_abs_path.strip_prefix(&*repository.work_directory_abs_path)
+                    {
+                        if relative.as_os_str().is_empty() {
+                            repository_name.to_string()
+                        } else {
+                            format!("{}/{}", repository_name, relative.display())
+                        }
+                    } else {
+                        repository_name.to_string()
+                    }
+                } else {
+                    repository_name.to_string()
+                };
+                project_name = Some(name.into());
+            }
+        }
+
+        (project_name, repository, linked_worktree_name)
     }
 
     fn toggle_update_simulation(&mut self, cx: &mut Context<Self>) {
@@ -608,7 +599,12 @@ impl TitleBar {
             .count()
     }
 
-    fn render_remote_project_connection(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_remote_project_connection(
+        &self,
+        anchor: Anchor,
+        indicator_border_color: gpui::Hsla,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let workspace = self.workspace.clone();
 
         let options = self.project.read(cx).remote_connection_options(cx)?;
@@ -671,6 +667,7 @@ impl TitleBar {
                 })
                 .trigger_with_tooltip(
                     ButtonLike::new("remote_project")
+                        .tab_index(0isize)
                         .selected_style(ButtonStyle::Tinted(TintColor::Accent))
                         .child(
                             h_flex()
@@ -681,9 +678,7 @@ impl TitleBar {
                                         Icon::new(icon).size(IconSize::Small).color(icon_color),
                                         Some(Indicator::dot().color(indicator_color)),
                                     )
-                                    .indicator_border_color(Some(
-                                        cx.theme().colors().title_bar_background,
-                                    ))
+                                    .indicator_border_color(Some(indicator_border_color))
                                     .into_any_element(),
                                 )
                                 .child(Label::new(nickname).size(LabelSize::Small).truncate()),
@@ -697,7 +692,7 @@ impl TitleBar {
                         )
                     },
                 )
-                .anchor(gpui::Anchor::TopLeft)
+                .anchor(anchor)
                 .into_any_element(),
         )
     }
@@ -718,6 +713,7 @@ impl TitleBar {
                     .size(IconSize::Small)
                     .color(Color::Warning),
             )
+            .tab_index(0isize)
             .tooltip(|_, cx| {
                 Tooltip::with_meta(
                     "You're in Restricted Mode",
@@ -744,9 +740,14 @@ impl TitleBar {
         }
     }
 
-    pub fn render_project_host(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub fn render_project_host(
+        &self,
+        anchor: Anchor,
+        indicator_border_color: gpui::Hsla,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         if self.project.read(cx).is_via_remote_server() {
-            return self.render_remote_project_connection(cx);
+            return self.render_remote_project_connection(anchor, indicator_border_color, cx);
         }
 
         if self.project.read(cx).is_disconnected(cx) {
@@ -797,6 +798,7 @@ impl TitleBar {
     fn render_project_name(
         &self,
         name: Option<SharedString>,
+        anchor: Anchor,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -827,7 +829,7 @@ impl TitleBar {
 
         if is_sidebar_open && is_threads_list_view_active {
             return self
-                .render_recent_projects_popover(display_name, is_project_selected, cx)
+                .render_recent_projects_popover(display_name, is_project_selected, anchor, cx)
                 .into_any_element();
         }
 
@@ -871,7 +873,7 @@ impl TitleBar {
                     Tooltip::for_action("Recent Projects", &zed_actions::OpenRecent::default(), cx)
                 },
             )
-            .anchor(gpui::Anchor::TopLeft)
+            .anchor(anchor)
             .into_any_element()
     }
 
@@ -879,6 +881,7 @@ impl TitleBar {
         &self,
         display_name: String,
         is_project_selected: bool,
+        anchor: Anchor,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let workspace = self.workspace.clone();
@@ -923,13 +926,14 @@ impl TitleBar {
                     Tooltip::for_action("Recent Projects", &zed_actions::OpenRecent::default(), cx)
                 },
             )
-            .anchor(gpui::Anchor::TopLeft)
+            .anchor(anchor)
     }
 
     fn render_worktree_and_branch(
         &self,
         repository: Entity<project::git_store::Repository>,
         linked_worktree_name: Option<SharedString>,
+        anchor: Anchor,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let workspace = self.workspace.upgrade()?;
@@ -1029,7 +1033,7 @@ impl TitleBar {
                         )
                     },
                 )
-                .anchor(gpui::Anchor::TopLeft)
+                .anchor(anchor)
         });
 
         let branch_picker = branch_name.and_then(|branch_name| {
@@ -1086,7 +1090,7 @@ impl TitleBar {
                             cx,
                         )
                     })
-                    .anchor(gpui::Anchor::TopLeft)
+                    .anchor(anchor)
             })
         });
 
@@ -1111,6 +1115,52 @@ impl TitleBar {
                 .children(branch_picker)
                 .into_any_element(),
         )
+    }
+
+    pub(crate) fn render_status_bar_workspace_info(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.sync_multi_workspace(cx);
+
+        let title_bar_settings = *TitleBarSettings::get_global(cx);
+        let render_project_items =
+            title_bar_settings.show_branch_name || title_bar_settings.show_project_items;
+        let is_git_enabled = ProjectSettings::get_global(cx).git.enabled.status;
+        let (project_name, repository, linked_worktree_name) = self.project_info(cx);
+
+        h_flex()
+            .h_full()
+            .gap_0p5()
+            .children(self.render_restricted_mode(cx))
+            .when(render_project_items, |this| {
+                this.when(title_bar_settings.show_project_items, |this| {
+                    this.children(self.render_project_host(
+                        Anchor::BottomLeft,
+                        cx.theme().colors().status_bar_background,
+                        cx,
+                    ))
+                    .child(self.render_project_name(
+                        project_name,
+                        Anchor::BottomLeft,
+                        window,
+                        cx,
+                    ))
+                })
+                .when_some(
+                    repository.filter(|_| is_git_enabled),
+                    |this, repository| {
+                        this.children(self.render_worktree_and_branch(
+                            repository,
+                            linked_worktree_name,
+                            Anchor::BottomLeft,
+                            cx,
+                        ))
+                    },
+                )
+            })
+            .into_any_element()
     }
 
     fn active_call_changed(&mut self, cx: &mut Context<Self>) {
@@ -1147,6 +1197,70 @@ impl TitleBar {
             .log_err();
     }
 
+    fn render_title_bar_controls(
+        &mut self,
+        anchor: Anchor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let status = self.client.status();
+        let status = &*status.borrow();
+        let user = self.user_store.read(cx).current_user();
+        let is_signing_in = user.is_none()
+            && matches!(
+                status,
+                client::Status::Authenticating
+                    | client::Status::Authenticated
+                    | client::Status::Connecting
+            );
+        let is_signed_out_or_auth_error = user.is_none()
+            && matches!(
+                status,
+                client::Status::SignedOut | client::Status::AuthenticationError
+            );
+
+        h_flex()
+            .pr_1()
+            .gap_1()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(self.render_call_controls(anchor, window, cx))
+            .children(self.render_connection_status(status, cx))
+            .child(self.update_version.clone())
+            .when(
+                user.is_none()
+                    && is_signed_out_or_auth_error
+                    && TitleBarSettings::get_global(cx).show_sign_in,
+                |this| this.child(self.render_sign_in_button(cx)),
+            )
+            .when(is_signing_in, |this| {
+                this.child(
+                    Label::new("Signing in…")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .with_animation(
+                            "signing-in",
+                            Animation::new(Duration::from_secs(2))
+                                .repeat()
+                                .with_easing(pulsating_between(0.4, 0.8)),
+                            |label, delta| label.alpha(delta),
+                        ),
+                )
+            })
+            .when(TitleBarSettings::get_global(cx).show_user_menu, |this| {
+                this.child(self.render_user_menu_button(anchor, cx))
+            })
+            .into_any_element()
+    }
+
+    pub(crate) fn render_status_bar_controls(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.sync_multi_workspace(cx);
+        self.render_title_bar_controls(Anchor::BottomRight, window, cx)
+    }
+
     fn render_connection_status(
         &self,
         status: &client::Status,
@@ -1179,6 +1293,7 @@ impl TitleBar {
                 Some(
                     Button::new("connection-status", label)
                         .label_size(LabelSize::Small)
+                        .tab_index(0isize)
                         .on_click(|_, window, cx| {
                             if let Some(auto_updater) = auto_update::AutoUpdater::get(cx)
                                 && auto_updater.read(cx).status().is_updated()
@@ -1215,7 +1330,11 @@ impl TitleBar {
             })
     }
 
-    pub fn render_user_menu_button(&mut self, cx: &mut Context<Self>) -> impl Element {
+    pub fn render_user_menu_button(
+        &mut self,
+        anchor: Anchor,
+        cx: &mut Context<Self>,
+    ) -> impl Element {
         let show_update_button = self.update_version.read(cx).show_update_in_menu_bar();
 
         let user_store = self.user_store.clone();
@@ -1436,7 +1555,7 @@ impl TitleBar {
                 })
                 .into()
             })
-            .anchor(Anchor::TopRight)
+            .anchor(anchor)
     }
 }
 

@@ -199,6 +199,7 @@ impl RenderOnce for UpdateButton {
             .border_color(border_color)
             .child(
                 ButtonLike::new(button_id)
+                    .tab_index(0isize)
                     .child(label_row)
                     .when_some(tooltip, |this, tooltip| this.tooltip(tooltip))
                     .disabled(self.disabled)
@@ -208,6 +209,7 @@ impl RenderOnce for UpdateButton {
                 this.child(
                     div().border_l_1().border_color(border_color).child(
                         IconButton::new(dismiss_button_id, IconName::Close)
+                            .tab_index(0isize)
                             .icon_size(IconSize::Indicator)
                             .when_some(self.on_dismiss, |this, handler| this.on_click(handler))
                             .tooltip(Tooltip::text("Dismiss")),
