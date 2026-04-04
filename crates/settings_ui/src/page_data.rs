@@ -4107,7 +4107,7 @@ fn search_and_files_page() -> SettingsPage {
 }
 
 fn window_and_layout_page() -> SettingsPage {
-    fn status_bar_section() -> [SettingsPageItem; 12] {
+    fn status_bar_section() -> [SettingsPageItem; 13] {
         [
             SettingsPageItem::SectionHeader("Status Bar"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -4170,6 +4170,25 @@ fn window_and_layout_page() -> SettingsPage {
                             .status_bar
                             .get_or_insert_default()
                             .active_encoding_button = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Clock Button",
+                description: "Show the clock in the status bar.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("status_bar.clock_button"),
+                    pick: |settings_content| {
+                        settings_content.status_bar.as_ref()?.clock_button.as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .status_bar
+                            .get_or_insert_default()
+                            .clock_button = value;
                     },
                 }),
                 metadata: None,
