@@ -2489,6 +2489,7 @@ Like `extend_list_on_newline`, this can be set per language under `languages`.
     "cursor_position_button": true,
     "line_endings_button": false,
     "active_encoding_button": "non_utf8",
+    "clock_button": true,
     "pending_keystrokes_indicator": true
   }
 }
@@ -2501,6 +2502,7 @@ Like `extend_list_on_newline`, this can be set per language under `languages`.
 - `cursor_position_button`: Whether to show the cursor position button (clicking it opens the go-to-line/column input)
 - `line_endings_button`: Whether to show the active line endings button (clicking it opens the line-ending selector)
 - `active_encoding_button`: When to show the active encoding button: `"enabled"`, `"disabled"`, or `"non_utf8"` (only for encodings other than UTF-8 without BOM)
+- `clock_button`: Whether to show the clock (hovering it shows the time with seconds)
 - `pending_keystrokes_indicator`: Whether to show an indicator while multi-stroke input is pending. If the input has a timeout, a countdown is shown and hovering the indicator pauses it. Its binding preview popover is disabled when the which-key popup is enabled (see [key bindings](../key-bindings.md#precedence))
 
 There is an experimental setting that completely hides the status bar. This causes major usability problems (you will be unable to use many of Zed's features), but is provided for those who value screen real-estate above all else.
