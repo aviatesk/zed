@@ -624,7 +624,7 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             }
         });
 
-
+        let status_bar_clock = cx.new(|cx| workspace::workspace_info::StatusBarClock::new(cx));
         let cursor_position =
             cx.new(|_| go_to_line::cursor_position::CursorPosition::new(workspace));
         let line_ending_indicator =
@@ -642,6 +642,7 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             status_bar.add_left_item(activity_indicator, window, cx);
             status_bar.add_right_item(edit_prediction_ui, window, cx);
             status_bar.add_right_item(active_buffer_encoding, window, cx);
+            status_bar.add_right_item(status_bar_clock, window, cx);
             status_bar.add_right_item(active_buffer_language, window, cx);
             status_bar.add_right_item(active_toolchain_language, window, cx);
             status_bar.add_right_item(line_ending_indicator, window, cx);

@@ -27,6 +27,7 @@ mod toast_layer;
 mod toolbar;
 pub mod welcome;
 pub mod workspace_error;
+pub mod workspace_info;
 mod workspace_settings;
 
 pub use dock::Panel;
