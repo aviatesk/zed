@@ -1638,6 +1638,7 @@
       "cmd-alt-shift-backspace": "branch_picker::ForceDeleteBranch",
       "cmd-shift-i": "branch_picker::CycleBranchFilter",
       "cmd-k": "branch_picker::ToggleFilterMenu",
+      "ctrl-shift-v": "branch_picker::ShowBranchDiff",
     },
   },
   {

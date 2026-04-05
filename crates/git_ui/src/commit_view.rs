@@ -5,6 +5,7 @@ use editor::{
     Addon, Editor, EditorEvent, EditorSettings, HiddenDiffHunkRenderer, MultiBuffer,
     SplittableEditor, hover_markdown_style, multibuffer_context_lines,
 };
+use futures::channel::oneshot;
 use futures_lite::future::yield_now;
 use git::repository::{CommitDetails, RepoPath};
 use git::status::{FileStatus, StatusCode, TrackedStatus};
@@ -73,8 +74,31 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CommitViewSource {
+    Commit,
+    Branch {
+        base_ref: SharedString,
+        branch_ref: SharedString,
+        branch_name: SharedString,
+    },
+}
+
+impl CommitViewSource {
+    fn matches_item(&self, other: &Self, commit_sha: &str, other_commit_sha: &str) -> bool {
+        match (self, other) {
+            (Self::Commit, Self::Commit) => commit_sha == other_commit_sha,
+            (Self::Branch { .. }, Self::Branch { .. }) => {
+                self == other && commit_sha == other_commit_sha
+            }
+            _ => false,
+        }
+    }
+}
+
 pub struct CommitView {
     commit: CommitDetails,
+    source: CommitViewSource,
     editor: Entity<SplittableEditor>,
     message: Entity<Markdown>,
     message_expanded: bool,
@@ -211,112 +235,183 @@ impl CommitView {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let commit_diff = repo
-            .update(cx, |repo, _| {
-                repo.load_commit_diff(commit_sha.clone(), ignore_shallow_boundary)
-            })
-            .ok();
-        let commit_details = repo
-            .update(cx, |repo, _| repo.show(commit_sha.clone()))
-            .ok();
+        let workspace_for_errors = workspace.clone();
+        Self::open_commit(
+            commit_sha,
+            repo,
+            workspace,
+            stash,
+            file_filter,
+            ignore_shallow_boundary,
+            window,
+            cx,
+        )
+        .detach_and_notify_err(workspace_for_errors, window, cx);
+    }
 
-        window
-            .spawn(cx, async move |cx| {
-                let commit_diff = commit_diff?;
-                let commit_details = commit_details?;
-                let (commit_diff, commit_details) = futures::join!(commit_diff, commit_details);
-                let mut commit_diff = commit_diff.log_err()?.log_err()?;
-                let commit_details = commit_details.log_err()?.log_err()?;
+    pub fn open_branch_diff(
+        base_ref: SharedString,
+        branch_ref: SharedString,
+        branch_name: SharedString,
+        head_sha: String,
+        repo: WeakEntity<Repository>,
+        workspace: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        let commit_diff = match repo.update(cx, |repo, _| {
+            repo.load_merge_base_diff(base_ref.to_string(), head_sha.clone())
+        }) {
+            Ok(commit_diff) => commit_diff,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        Self::open_with_diff(
+            head_sha,
+            commit_diff,
+            CommitViewSource::Branch {
+                base_ref,
+                branch_ref,
+                branch_name,
+            },
+            repo,
+            workspace,
+            None,
+            None,
+            window,
+            cx,
+        )
+    }
 
-                // Filter to specific file if requested
-                if let Some(ref filter_path) = file_filter {
-                    commit_diff.files.retain(|f| &f.path == filter_path);
-                }
+    fn open_commit(
+        commit_sha: String,
+        repo: WeakEntity<Repository>,
+        workspace: WeakEntity<Workspace>,
+        stash: Option<usize>,
+        file_filter: Option<RepoPath>,
+        ignore_shallow_boundary: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        let commit_diff = match repo.update(cx, |repo, _| {
+            repo.load_commit_diff(commit_sha.clone(), ignore_shallow_boundary)
+        }) {
+            Ok(commit_diff) => commit_diff,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        Self::open_with_diff(
+            commit_sha,
+            commit_diff,
+            CommitViewSource::Commit,
+            repo,
+            workspace,
+            stash,
+            file_filter,
+            window,
+            cx,
+        )
+    }
 
-                let repo = repo.upgrade()?;
+    fn open_with_diff(
+        commit_sha: String,
+        commit_diff: oneshot::Receiver<Result<CommitDiff>>,
+        source: CommitViewSource,
+        repo: WeakEntity<Repository>,
+        workspace: WeakEntity<Workspace>,
+        stash: Option<usize>,
+        file_filter: Option<RepoPath>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        let commit_details = match repo.update(cx, |repo, _| repo.show(commit_sha.clone())) {
+            Ok(commit_details) => commit_details,
+            Err(error) => return Task::ready(Err(error)),
+        };
 
-                workspace
-                    .update_in(cx, |workspace, window, cx| {
-                        let project = workspace.project();
-                        let workspace_entity = cx.entity();
-                        let workspace_handle = cx.weak_entity();
-                        let commit_view = cx.new(|cx| {
-                            CommitView::new(
-                                commit_details,
-                                commit_diff,
-                                repo,
-                                project.clone(),
-                                workspace_entity,
-                                workspace_handle,
-                                stash,
-                                file_filter,
-                                window,
-                                cx,
-                            )
-                        });
+        window.spawn(cx, async move |cx| {
+            let (commit_diff, commit_details) = futures::join!(commit_diff, commit_details);
+            let mut commit_diff = commit_diff.context("Loading commit diff was canceled")??;
+            let commit_details =
+                commit_details.context("Loading commit details was canceled")??;
 
-                        let preview_settings = PreviewTabsSettings::get_global(cx);
-                        let allow_preview =
-                            preview_settings.enabled && preview_settings.enable_preview_from_git;
+            if let Some(ref filter_path) = file_filter {
+                commit_diff.files.retain(|file| &file.path == filter_path);
+            }
 
-                        let pane = workspace.active_pane();
-                        pane.update(cx, |pane, cx| {
-                            let ix = pane.items().position(|item| {
-                                let commit_view = item.downcast::<CommitView>();
-                                commit_view
-                                    .is_some_and(|view| view.read(cx).commit.sha == commit_sha)
-                            });
-                            if let Some(ix) = ix {
-                                let existing = pane
-                                    .items()
-                                    .filter_map(|item| item.downcast::<CommitView>())
-                                    .find(|view| view.read(cx).commit.sha == commit_sha)
-                                    .unwrap();
-                                let was_preview =
-                                    pane.preview_item_id() == Some(existing.item_id());
+            let repo = repo.upgrade().context("Repository was closed")?;
+            let repository_entity_id = repo.entity_id();
 
-                                pane.remove_item(existing.item_id(), false, false, window, cx);
-                                let new_id = commit_view.entity_id();
-                                pane.add_item(
-                                    Box::new(commit_view),
-                                    true,
-                                    true,
-                                    Some(ix),
-                                    window,
-                                    cx,
-                                );
-                                if allow_preview && was_preview {
-                                    pane.replace_preview_item_id(new_id, window, cx);
-                                }
-                            } else {
-                                let destination = if allow_preview {
-                                    pane.close_current_preview_item(window, cx)
-                                } else {
-                                    None
-                                };
-                                let new_id = commit_view.entity_id();
-                                pane.add_item(
-                                    Box::new(commit_view),
-                                    true,
-                                    true,
-                                    destination,
-                                    window,
-                                    cx,
-                                );
-                                if allow_preview {
-                                    pane.replace_preview_item_id(new_id, window, cx);
-                                }
-                            }
-                        })
-                    })
-                    .log_err()
-            })
-            .detach();
+            workspace.update_in(cx, |workspace, window, cx| {
+                let project = workspace.project();
+                let workspace_entity = cx.entity();
+                let workspace_handle = cx.weak_entity();
+                let commit_view = cx.new(|cx| {
+                    CommitView::new(
+                        commit_details,
+                        commit_diff,
+                        source.clone(),
+                        repo,
+                        project.clone(),
+                        workspace_entity,
+                        workspace_handle,
+                        stash,
+                        file_filter,
+                        window,
+                        cx,
+                    )
+                });
+
+                let preview_settings = PreviewTabsSettings::get_global(cx);
+                let allow_preview =
+                    preview_settings.enabled && preview_settings.enable_preview_from_git;
+
+                let pane = workspace.active_pane();
+                pane.update(cx, |pane, cx| {
+                    let existing = pane.items().enumerate().find_map(|(index, item)| {
+                        let view = item.downcast::<CommitView>()?;
+                        let matches = {
+                            let view = view.read(cx);
+                            view.repository.entity_id() == repository_entity_id
+                                && view.source.matches_item(
+                                    &source,
+                                    view.commit.sha.as_ref(),
+                                    &commit_sha,
+                                )
+                        };
+                        matches.then_some((index, view))
+                    });
+
+                    if let Some((index, existing)) = existing {
+                        let was_preview = pane.preview_item_id() == Some(existing.item_id());
+
+                        pane.remove_item(existing.item_id(), false, false, window, cx);
+                        let new_id = commit_view.entity_id();
+                        pane.add_item(Box::new(commit_view), true, true, Some(index), window, cx);
+                        if allow_preview && was_preview {
+                            pane.replace_preview_item_id(new_id, window, cx);
+                        }
+                    } else {
+                        let destination = if allow_preview {
+                            pane.close_current_preview_item(window, cx)
+                        } else {
+                            None
+                        };
+                        let new_id = commit_view.entity_id();
+                        pane.add_item(Box::new(commit_view), true, true, destination, window, cx);
+                        if allow_preview {
+                            pane.replace_preview_item_id(new_id, window, cx);
+                        }
+                    }
+                })
+            })?;
+
+            Ok(())
+        })
     }
 
     fn new(
         commit: CommitDetails,
         commit_diff: CommitDiff,
+        source: CommitViewSource,
         repository: Entity<Repository>,
         project: Entity<Project>,
         workspace_entity: Entity<Workspace>,
@@ -541,6 +636,7 @@ impl CommitView {
 
         Self {
             commit,
+            source,
             editor,
             message,
             message_expanded: false,
@@ -780,6 +876,14 @@ impl CommitView {
 
         let has_more = self.commit.message.trim().contains('\n');
         let is_expanded = self.message_expanded;
+        let comparison_label: Option<SharedString> = match &self.source {
+            CommitViewSource::Commit => None,
+            CommitViewSource::Branch {
+                base_ref,
+                branch_name,
+                ..
+            } => Some(format!("Changes on {branch_name} since merge base with {base_ref}").into()),
+        };
         let expand_tooltip = if is_expanded {
             "Fold Commit Description"
         } else {
@@ -792,6 +896,13 @@ impl CommitView {
             .gap_2()
             .border_b_1()
             .border_color(cx.theme().colors().border_variant)
+            .when_some(comparison_label, |this, label| {
+                this.child(
+                    h_flex()
+                        .px_2p5()
+                        .child(Label::new(label).color(Color::Muted).size(LabelSize::Small)),
+                )
+            })
             .child(
                 h_flex()
                     .pr_2p5()
@@ -1211,34 +1322,56 @@ impl Item for CommitView {
     type Event = EditorEvent;
 
     fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
-        Some(Icon::new(IconName::GitCommit).color(Color::Muted))
+        let icon = match &self.source {
+            CommitViewSource::Commit => IconName::GitCommit,
+            CommitViewSource::Branch { .. } => IconName::GitBranch,
+        };
+        Some(Icon::new(icon).color(Color::Muted))
     }
 
     fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
-        let short_sha = self.commit.sha.get(0..7).unwrap_or(&*self.commit.sha);
-        let subject = truncate_and_trailoff(self.commit.message.split('\n').next().unwrap(), 20);
-        format!("{short_sha} — {subject}").into()
+        match &self.source {
+            CommitViewSource::Commit => {
+                let short_sha = self.commit.sha.get(0..7).unwrap_or(&self.commit.sha);
+                let subject = truncate_and_trailoff(
+                    self.commit.message.split('\n').next().unwrap_or_default(),
+                    20,
+                );
+                format!("{short_sha} — {subject}").into()
+            }
+            CommitViewSource::Branch { branch_name, .. } => format!("{branch_name} changes").into(),
+        }
     }
 
     fn tab_tooltip_content(&self, _: &App) -> Option<TabTooltipContent> {
-        let short_sha = self.commit.sha.get(0..16).unwrap_or(&*self.commit.sha);
-        let subject = self.commit.message.split('\n').next().unwrap();
+        let (title, detail) = match &self.source {
+            CommitViewSource::Commit => {
+                let short_sha = self.commit.sha.get(0..16).unwrap_or(&self.commit.sha);
+                let subject = self.commit.message.split('\n').next().unwrap_or_default();
+                (subject.to_string(), short_sha.to_string())
+            }
+            CommitViewSource::Branch {
+                base_ref,
+                branch_name,
+                ..
+            } => (
+                format!("Changes on {branch_name}"),
+                format!("Since merge base with {base_ref}"),
+            ),
+        };
 
-        Some(TabTooltipContent::Custom(Box::new(Tooltip::element({
-            let subject = subject.to_string();
-            let short_sha = short_sha.to_string();
-
+        Some(TabTooltipContent::Custom(Box::new(Tooltip::element(
             move |_, _| {
                 v_flex()
-                    .child(Label::new(subject.clone()))
+                    .child(Label::new(title.clone()))
                     .child(
-                        Label::new(short_sha.clone())
+                        Label::new(detail.clone())
                             .color(Color::Muted)
                             .size(LabelSize::Small),
                     )
                     .into_any_element()
-            }
-        }))))
+            },
+        ))))
     }
 
     fn to_item_events(event: &EditorEvent, f: &mut dyn FnMut(ItemEvent)) {
@@ -1246,7 +1379,10 @@ impl Item for CommitView {
     }
 
     fn telemetry_event_text(&self) -> Option<&'static str> {
-        Some("Commit View Opened")
+        match &self.source {
+            CommitViewSource::Commit => Some("Commit View Opened"),
+            CommitViewSource::Branch { .. } => Some("Branch Comparison Opened"),
+        }
     }
 
     fn deactivated(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1393,6 +1529,7 @@ impl Item for CommitView {
                 message_scroll_handle: ScrollHandle::new(),
                 multibuffer: self.multibuffer.clone(),
                 commit: self.commit.clone(),
+                source: self.source.clone(),
                 stash: self.stash,
                 repository: self.repository.clone(),
                 project: self.project.clone(),

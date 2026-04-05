@@ -1,6 +1,8 @@
 pub use crate::commit_context_menu::{CopyCommitSha, CopyCommitTag, OpenCommitView};
 use crate::{
-    commit_context_menu::{CommitContextMenuData, CommitContextMenuSource, commit_context_menu},
+    commit_context_menu::{
+        CommitContextMenuData, CommitContextMenuRef, CommitContextMenuSource, commit_context_menu,
+    },
     commit_tooltip::CommitAvatar,
     commit_view::CommitView,
     git_status_icon,
@@ -1700,17 +1702,18 @@ impl GitGraph {
         })
     }
 
-    /// Extracts a ref name (branch, remote ref, or tag) from a decoration in
-    /// git's `%D` format, returning `None` for a detached `HEAD`.
-    fn ref_name_from_decoration(decoration: &str) -> Option<SharedString> {
-        let name = decoration
-            .strip_prefix("tag: ")
-            .or_else(|| decoration.strip_prefix("HEAD -> "))
-            .unwrap_or(decoration);
-        if name.is_empty() || name == "HEAD" {
+    /// Extracts a branch or tag from a ref decoration, returning `None` for a detached `HEAD`.
+    fn ref_name_from_decoration(decoration: &str) -> Option<CommitContextMenuRef> {
+        if let Some(tag_name) = decoration.strip_prefix("tag: ") {
+            return (!tag_name.is_empty())
+                .then(|| CommitContextMenuRef::Tag(tag_name.to_string().into()));
+        }
+
+        let branch_name = decoration.strip_prefix("HEAD -> ").unwrap_or(decoration);
+        if branch_name.is_empty() || branch_name == "HEAD" {
             return None;
         }
-        Some(SharedString::from(name.to_string()))
+        Some(CommitContextMenuRef::Branch(branch_name.to_string().into()))
     }
 
     fn render_chip(
@@ -2416,7 +2419,7 @@ impl GitGraph {
         &mut self,
         position: Point<Pixels>,
         index: usize,
-        ref_name: Option<SharedString>,
+        reference: Option<CommitContextMenuRef>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2437,7 +2440,7 @@ impl GitGraph {
                     .collect(),
             },
             CommitContextMenuSource::GitGraph,
-            ref_name,
+            reference,
             self.focus_handle.clone(),
             repository,
             self.workspace.clone(),
@@ -7459,7 +7462,7 @@ mod tests {
             git_graph.deploy_entry_context_menu(
                 point(px(20.), px(20.)),
                 0,
-                Some("feature-x".into()),
+                Some(CommitContextMenuRef::Branch("feature-x".into())),
                 window,
                 cx,
             );
@@ -7499,19 +7502,19 @@ mod tests {
     fn test_ref_name_from_decoration() {
         assert_eq!(
             GitGraph::ref_name_from_decoration("HEAD -> main"),
-            Some("main".into())
+            Some(CommitContextMenuRef::Branch("main".into()))
         );
         assert_eq!(
             GitGraph::ref_name_from_decoration("main"),
-            Some("main".into())
+            Some(CommitContextMenuRef::Branch("main".into()))
         );
         assert_eq!(
             GitGraph::ref_name_from_decoration("origin/main"),
-            Some("origin/main".into())
+            Some(CommitContextMenuRef::Branch("origin/main".into()))
         );
         assert_eq!(
             GitGraph::ref_name_from_decoration("tag: v1.0"),
-            Some("v1.0".into())
+            Some(CommitContextMenuRef::Tag("v1.0".into()))
         );
         assert_eq!(GitGraph::ref_name_from_decoration("HEAD"), None);
     }

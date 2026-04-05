@@ -27,7 +27,7 @@ use util::ResultExt;
 use workspace::notifications::DetachAndPromptErr;
 use workspace::{ModalView, Workspace};
 
-use crate::branch_picker;
+use crate::{branch_picker, commit_view::CommitView};
 use git_ui_core::notifications::show_error_toast;
 
 actions!(
@@ -46,7 +46,9 @@ actions!(
         /// Cycle through branch filters.
         CycleBranchFilter,
         /// Toggles the branch filter menu.
-        ToggleFilterMenu
+        ToggleFilterMenu,
+        /// Shows the selected branch's changes since its merge base with the default branch.
+        ShowBranchDiff,
     ]
 );
 
@@ -479,6 +481,21 @@ impl BranchList {
         let branch_filter = self.picker.read(cx).delegate.branch_filter.next();
         self.set_branch_filter(branch_filter, window, cx);
     }
+
+    pub fn handle_show_branch_diff(
+        &mut self,
+        _: &branch_picker::ShowBranchDiff,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.picker.update(cx, |picker, cx| {
+            picker
+                .delegate
+                .show_branch_diff_at(picker.delegate.selected_index, window, cx);
+        });
+
+        cx.emit(DismissEvent);
+    }
 }
 impl ModalView for BranchList {}
 impl EventEmitter<DismissEvent> for BranchList {}
@@ -527,6 +544,7 @@ impl Render for BranchList {
                     menu_handle.toggle(window, cx);
                 }),
             )
+            .on_action(cx.listener(Self::handle_show_branch_diff))
             .child(self.picker.clone())
             .when(!self.embedded, |this| {
                 this.on_mouse_down_out({
@@ -1210,6 +1228,54 @@ impl BranchListDelegate {
         })
         .detach();
     }
+
+    fn show_branch_diff_at(
+        &self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) {
+        let branch = match self.matches.get(index) {
+            Some(Entry::Branch { branch, .. }) => branch,
+            _ => return,
+        };
+        let head_sha = match branch.most_recent_commit.as_ref() {
+            Some(commit) => commit.sha.to_string(),
+            None => return,
+        };
+        let branch_ref = branch.ref_name.clone();
+        let branch_name: SharedString = branch.name().to_owned().into();
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        let default_branch = repo.update(cx, |repo, _| repo.default_branch(true));
+        let workspace = self.workspace.clone();
+
+        cx.spawn_in(window, async move |_, cx| {
+            let base_ref = default_branch
+                .await??
+                .context("Could not determine the default branch")?;
+            let open_task = cx.update(|window, cx| {
+                CommitView::open_branch_diff(
+                    base_ref,
+                    branch_ref,
+                    branch_name,
+                    head_sha,
+                    repo.downgrade(),
+                    workspace,
+                    window,
+                    cx,
+                )
+            })?;
+            open_task.await
+        })
+        .detach_and_prompt_err(
+            "Failed to view branch changes",
+            window,
+            cx,
+            |error, _, _| Some(error.to_string()),
+        );
+    }
 }
 
 fn remote_provider_icons(
@@ -1714,6 +1780,34 @@ impl PickerDelegate for BranchListDelegate {
             Entry::NewUrl { .. } | Entry::NewBranch { .. } | Entry::NewRemoteName { .. }
         );
 
+        let has_commit = entry
+            .as_branch()
+            .and_then(|b| b.most_recent_commit.as_ref())
+            .is_some();
+
+        let view_branch_button = if has_commit {
+            let focus_handle = self.focus_handle.clone();
+            Some(
+                IconButton::new(("view-branch", ix), IconName::Eye)
+                    .icon_size(IconSize::Small)
+                    .tooltip(move |_, cx| {
+                        Tooltip::for_action_in(
+                            "View Changes",
+                            &branch_picker::ShowBranchDiff,
+                            &focus_handle,
+                            cx,
+                        )
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.delegate.show_branch_diff_at(ix, window, cx);
+                        cx.emit(DismissEvent);
+                    })),
+            )
+        } else {
+            None
+        };
+
         let deleted_branch_icon = |entry_ix: usize| {
             let picker = picker.clone();
             let focus_handle = focus_handle.clone();
@@ -1922,8 +2016,13 @@ impl PickerDelegate for BranchListDelegate {
             .when(
                 !self.is_select_only() && !is_new_items && !is_head_branch,
                 |this| {
-                    this.end_slot(deleted_branch_icon(ix))
-                        .show_end_slot_on_hover()
+                    this.end_slot(
+                        h_flex()
+                            .gap_0p5()
+                            .when_some(view_branch_button, |this, button| this.child(button))
+                            .child(deleted_branch_icon(ix)),
+                    )
+                    .show_end_slot_on_hover()
                 },
             )
             .when_some(
@@ -2016,8 +2115,33 @@ impl PickerDelegate for BranchListDelegate {
                             }))
                     });
 
-                let delete_and_select_btns = h_flex()
+                let has_commit = selected_entry
+                    .and_then(|e| e.as_branch())
+                    .and_then(|b| b.most_recent_commit.as_ref())
+                    .is_some();
+
+                let action_btns = h_flex()
                     .gap_1()
+                    .when(has_commit, |this| {
+                        let focus_handle = focus_handle.clone();
+                        this.child(
+                            Button::new("view-branch", "View Changes")
+                                .key_binding(
+                                    KeyBinding::for_action_in(
+                                        &branch_picker::ShowBranchDiff,
+                                        &focus_handle,
+                                        cx,
+                                    )
+                                    .map(|kb| kb.size(rems_from_px(12_f32))),
+                                )
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(
+                                        branch_picker::ShowBranchDiff.boxed_clone(),
+                                        cx,
+                                    );
+                                }),
+                        )
+                    })
                     .when(
                         !selected_entry
                             .and_then(|entry| entry.as_branch())
@@ -2071,7 +2195,7 @@ impl PickerDelegate for BranchListDelegate {
                                         this.delegate.confirm(false, window, cx);
                                     })),
                             ),
-                            None => this.child(delete_and_select_btns),
+                            None => this.child(action_btns),
                         })
                         .into_any_element(),
                 )
