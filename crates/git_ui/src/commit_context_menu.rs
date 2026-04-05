@@ -1,11 +1,12 @@
 use crate::commit_view::CommitView;
+use anyhow::Context as _;
 use git::Oid;
 use gpui::{Action, ClipboardItem, Entity, FocusHandle, SharedString, WeakEntity, Window, actions};
 use project::{GIT_COMMAND_TASK_TAG, git_store::Repository};
 
 use task::{TaskContext, TaskVariables, VariableName};
 use ui::{Color, ContextMenu, ContextMenuEntry, IconName, IconPosition, prelude::*};
-use workspace::Workspace;
+use workspace::{Workspace, notifications::NotifyTaskExt};
 
 actions!(
     git_graph,
@@ -33,10 +34,24 @@ pub(crate) enum CommitContextMenuSource {
     GitPanel,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CommitContextMenuRef {
+    Branch(SharedString),
+    Tag(SharedString),
+}
+
+impl CommitContextMenuRef {
+    fn name(&self) -> &SharedString {
+        match self {
+            Self::Branch(name) | Self::Tag(name) => name,
+        }
+    }
+}
+
 pub(crate) fn commit_context_menu(
     commit: CommitContextMenuData,
     source: CommitContextMenuSource,
-    ref_name: Option<SharedString>,
+    reference: Option<CommitContextMenuRef>,
     focus_handle: FocusHandle,
     repository: Option<WeakEntity<Repository>>,
     workspace: WeakEntity<Workspace>,
@@ -45,6 +60,12 @@ pub(crate) fn commit_context_menu(
 ) -> Entity<ContextMenu> {
     let sha = commit.sha;
     let sha_short = sha.display_short();
+    let ref_name = reference.as_ref().map(|reference| reference.name().clone());
+    let branch_ref = reference.and_then(|reference| match reference {
+        CommitContextMenuRef::Branch(branch_ref) => Some(branch_ref),
+        CommitContextMenuRef::Tag(_) => None,
+    });
+    let is_branch_ref = branch_ref.is_some();
     let git_tasks = git_context_menu_tasks(
         git_task_context(&repository, sha, ref_name.as_deref(), cx),
         &workspace,
@@ -59,23 +80,39 @@ pub(crate) fn commit_context_menu(
         context_menu
             .context(focus_handle)
             .header(header)
-            .entry("View Diff", Some(OpenCommitView.boxed_clone()), {
+            .when_some(branch_ref, |menu, branch_ref| {
                 let repository = repository.clone();
                 let workspace = workspace.clone();
-                move |window, cx| {
-                    let Some(repository) = repository.clone() else {
-                        return;
-                    };
-                    CommitView::open(
-                        sha.to_string(),
-                        repository,
+                menu.entry("View Branch Changes", None, move |window, cx| {
+                    open_branch_changes(
+                        sha,
+                        branch_ref.clone(),
+                        repository.clone(),
                         workspace.clone(),
-                        None,
-                        None,
                         window,
                         cx,
                     );
-                }
+                })
+            })
+            .when(!is_branch_ref, |menu| {
+                menu.entry("View Diff", Some(OpenCommitView.boxed_clone()), {
+                    let repository = repository.clone();
+                    let workspace = workspace.clone();
+                    move |window, cx| {
+                        let Some(repository) = repository.clone() else {
+                            return;
+                        };
+                        CommitView::open(
+                            sha.to_string(),
+                            repository,
+                            workspace.clone(),
+                            None,
+                            None,
+                            window,
+                            cx,
+                        );
+                    }
+                })
             })
             .entry(
                 "Copy SHA",
@@ -177,6 +214,42 @@ pub(crate) fn commit_context_menu(
                 menu
             })
     })
+}
+
+fn open_branch_changes(
+    head_sha: Oid,
+    branch_ref: SharedString,
+    repository: Option<WeakEntity<Repository>>,
+    workspace: WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(repository) = repository else {
+        return;
+    };
+    let default_branch = repository.update(cx, |repository, _| repository.default_branch(true));
+    let workspace_for_errors = workspace.clone();
+
+    window
+        .spawn(cx, async move |cx| {
+            let base_ref = default_branch?
+                .await??
+                .context("Could not determine the default branch")?;
+            let open_task = cx.update(|window, cx| {
+                CommitView::open_branch_diff(
+                    base_ref,
+                    branch_ref.clone(),
+                    branch_ref,
+                    head_sha.to_string(),
+                    repository,
+                    workspace,
+                    window,
+                    cx,
+                )
+            })?;
+            open_task.await
+        })
+        .detach_and_notify_err(workspace_for_errors, window, cx);
 }
 
 fn git_task_context(

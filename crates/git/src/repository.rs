@@ -649,6 +649,74 @@ async fn is_shallow_boundary_commit(
         .any(|line| line.trim() == oid.trim()))
 }
 
+async fn load_commit_diff_from_raw(git: &GitBinary, raw_diff: &str) -> Result<CommitDiff> {
+    let changes = parse_git_diff_raw(raw_diff);
+    let mut cat_file_process = git
+        .build_command(&["cat-file", "--batch=%(objectsize)"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("starting git cat-file process")?;
+
+    let mut files = Vec::<CommitFile>::new();
+    let stdin = cat_file_process
+        .stdin
+        .take()
+        .context("git cat-file process has no stdin")?;
+    let stdout = cat_file_process
+        .stdout
+        .take()
+        .context("git cat-file process has no stdout")?;
+    let mut stdin = BufWriter::with_capacity(512, stdin);
+    let mut stdout = BufReader::new(stdout);
+    let mut info_line = String::new();
+    let mut newline = [b'\0'];
+    for change in changes {
+        let change = change?;
+        let path = change.path;
+        // Git's raw diff format uses `/`-delimited paths even on Windows.
+        let Some(rel_path) = RelPath::from_unix_str(path).log_err() else {
+            continue;
+        };
+
+        let objects = [change.new_object, change.old_object];
+        let mut has_blobs = false;
+        for object in objects.iter().flatten() {
+            if object.kind == CommitDiffObjectKind::Blob {
+                stdin.write_all(object.oid.as_bytes()).await?;
+                stdin.write_all(b"\n").await?;
+                has_blobs = true;
+            }
+        }
+        if has_blobs {
+            stdin.flush().await?;
+        }
+
+        let [new_object, old_object] = objects;
+        let new_object =
+            load_commit_object(new_object, &mut stdout, &mut info_line, &mut newline).await?;
+        let old_object =
+            load_commit_object(old_object, &mut stdout, &mut info_line, &mut newline).await?;
+        let is_binary = new_object.as_ref().is_some_and(|object| object.is_binary)
+            || old_object.as_ref().is_some_and(|object| object.is_binary);
+        let new_content = new_object.map(|object| object.content);
+        let old_content = old_object.map(|object| object.content);
+
+        files.push(CommitFile {
+            path: RepoPath(Arc::from(rel_path)),
+            old_content,
+            new_content,
+            is_binary,
+        })
+    }
+
+    Ok(CommitDiff {
+        files,
+        is_shallow_boundary: false,
+    })
+}
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct Remote {
     pub name: SharedString,
@@ -925,6 +993,12 @@ pub trait GitRepository: Send + Sync {
         &self,
         commit: String,
         ignore_shallow_boundary: bool,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<CommitDiff>>;
+    fn load_merge_base_diff(
+        &self,
+        base: String,
+        head: String,
         cx: AsyncApp,
     ) -> BoxFuture<'_, Result<CommitDiff>>;
     fn blame(
@@ -1491,74 +1565,45 @@ impl GitRepository for RealGitRepository {
             );
 
             let show_stdout = String::from_utf8_lossy(&show_output.stdout);
-            let changes = parse_git_diff_raw(&show_stdout);
+            load_commit_diff_from_raw(&git, &show_stdout).await
+        })
+        .boxed()
+    }
 
-            let mut cat_file_process = git
-                .build_command(&["cat-file", "--batch=%(objectsize)"])
-                .stdin(Stdio::piped())
+    fn load_merge_base_diff(
+        &self,
+        base: String,
+        head: String,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<CommitDiff>> {
+        let git = self.git_binary();
+        cx.background_spawn(async move {
+            let diff_output = git
+                .build_command(&[
+                    "diff-tree",
+                    "-r",
+                    "-z",
+                    "--no-renames",
+                    "--raw",
+                    "--no-abbrev",
+                    "--merge-base",
+                    &base,
+                    &head,
+                ])
+                .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
-                .spawn()
-                .context("starting git cat-file process")?;
+                .output()
+                .await
+                .context("starting git diff-tree process")?;
+            anyhow::ensure!(
+                diff_output.status.success(),
+                "git diff-tree failed: {}",
+                String::from_utf8_lossy(&diff_output.stderr)
+            );
 
-            let mut files = Vec::<CommitFile>::new();
-            let stdin = cat_file_process
-                .stdin
-                .take()
-                .context("git cat-file process has no stdin")?;
-            let stdout = cat_file_process
-                .stdout
-                .take()
-                .context("git cat-file process has no stdout")?;
-            let mut stdin = BufWriter::with_capacity(512, stdin);
-            let mut stdout = BufReader::new(stdout);
-            let mut info_line = String::new();
-            let mut newline = [b'\0'];
-            for change in changes {
-                let change = change?;
-                let path = change.path;
-                // git-show outputs `/`-delimited paths even on Windows.
-                let Some(rel_path) = RelPath::from_unix_str(path).log_err() else {
-                    continue;
-                };
-
-                let objects = [change.new_object, change.old_object];
-                let mut has_blobs = false;
-                for object in objects.iter().flatten() {
-                    if object.kind == CommitDiffObjectKind::Blob {
-                        stdin.write_all(object.oid.as_bytes()).await?;
-                        stdin.write_all(b"\n").await?;
-                        has_blobs = true;
-                    }
-                }
-                if has_blobs {
-                    stdin.flush().await?;
-                }
-
-                let [new_object, old_object] = objects;
-                let new_object =
-                    load_commit_object(new_object, &mut stdout, &mut info_line, &mut newline)
-                        .await?;
-                let old_object =
-                    load_commit_object(old_object, &mut stdout, &mut info_line, &mut newline)
-                        .await?;
-                let is_binary = new_object.as_ref().is_some_and(|object| object.is_binary)
-                    || old_object.as_ref().is_some_and(|object| object.is_binary);
-                let new_content = new_object.map(|object| object.content);
-                let old_content = old_object.map(|object| object.content);
-
-                files.push(CommitFile {
-                    path: RepoPath(Arc::from(rel_path)),
-                    old_content,
-                    new_content,
-                    is_binary,
-                })
-            }
-
-            Ok(CommitDiff {
-                files,
-                is_shallow_boundary: false,
-            })
+            let diff_stdout = String::from_utf8_lossy(&diff_output.stdout);
+            load_commit_diff_from_raw(&git, &diff_stdout).await
         })
         .boxed()
     }
@@ -4686,6 +4731,137 @@ mod tests {
                 )]),
             }
         );
+    }
+
+    #[gpui::test]
+    async fn test_load_merge_base_diff_uses_selected_tip_without_touching_worktree(
+        cx: &mut TestAppContext,
+    ) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().expect("failed to create temporary repository");
+        git_init_repo(repo_dir.path());
+        fs::write(repo_dir.path().join("common.txt"), "base\n")
+            .expect("failed to write common file");
+        fs::write(repo_dir.path().join("dirty.txt"), "clean\n")
+            .expect("failed to write dirty file");
+        fs::write(repo_dir.path().join("removed.txt"), "removed from topic\n")
+            .expect("failed to write file that topic will remove");
+        git_command(repo_dir.path(), ["add", "."]);
+        git_command(repo_dir.path(), ["commit", "-m", "base"]);
+
+        git_command(repo_dir.path(), ["switch", "-c", "topic"]);
+        fs::write(
+            repo_dir.path().join("topic-first.txt"),
+            "first topic change\n",
+        )
+        .expect("failed to write first topic file");
+        git_command(repo_dir.path(), ["add", "topic-first.txt"]);
+        git_command(repo_dir.path(), ["rm", "removed.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "first topic change"]);
+
+        fs::write(repo_dir.path().join("common.txt"), "topic\n")
+            .expect("failed to update common file on topic");
+        fs::write(
+            repo_dir.path().join("topic-second.txt"),
+            "second topic change\n",
+        )
+        .expect("failed to write second topic file");
+        git_command(repo_dir.path(), ["add", "common.txt", "topic-second.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "second topic change"]);
+        let topic_tip = git_command_output(repo_dir.path(), ["rev-parse", "HEAD"]);
+
+        git_command(repo_dir.path(), ["switch", "main"]);
+        fs::write(repo_dir.path().join("main-only.txt"), "main only\n")
+            .expect("failed to write main-only file");
+        git_command(repo_dir.path(), ["add", "main-only.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "main-only change"]);
+        let main_head = git_command_output(repo_dir.path(), ["rev-parse", "HEAD"]);
+
+        fs::write(repo_dir.path().join("dirty.txt"), "dirty worktree\n")
+            .expect("failed to dirty worktree");
+        let status_before = git_command_output(repo_dir.path(), ["status", "--porcelain"]);
+
+        let repository = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .expect("failed to open repository");
+        let diff = repository
+            .load_merge_base_diff("main".to_string(), topic_tip, cx.to_async())
+            .await
+            .expect("failed to load merge-base diff");
+        let files = diff
+            .files
+            .into_iter()
+            .map(|file| (file.path.as_unix_str().to_string(), file))
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(files.len(), 4);
+        let common = files
+            .get("common.txt")
+            .expect("common file should be modified");
+        assert_eq!(common.old_content.as_deref(), Some(b"base\n".as_slice()));
+        assert_eq!(common.new_content.as_deref(), Some(b"topic\n".as_slice()));
+
+        let first_topic = files
+            .get("topic-first.txt")
+            .expect("first topic commit should be included");
+        assert_eq!(first_topic.old_content, None);
+        assert_eq!(
+            first_topic.new_content.as_deref(),
+            Some(b"first topic change\n".as_slice())
+        );
+
+        let second_topic = files
+            .get("topic-second.txt")
+            .expect("second topic commit should be included");
+        assert_eq!(second_topic.old_content, None);
+        assert_eq!(
+            second_topic.new_content.as_deref(),
+            Some(b"second topic change\n".as_slice())
+        );
+
+        let removed = files
+            .get("removed.txt")
+            .expect("topic deletion should be included");
+        assert_eq!(
+            removed.old_content.as_deref(),
+            Some(b"removed from topic\n".as_slice())
+        );
+        assert_eq!(removed.new_content, None);
+
+        assert!(!files.contains_key("main-only.txt"));
+        assert!(!files.contains_key("dirty.txt"));
+
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["rev-parse", "HEAD"]),
+            main_head
+        );
+        assert_eq!(
+            git_command_output(repo_dir.path(), ["status", "--porcelain"]),
+            status_before
+        );
+        assert_eq!(
+            fs::read_to_string(repo_dir.path().join("common.txt"))
+                .expect("failed to read common file"),
+            "base\n"
+        );
+        assert_eq!(
+            fs::read_to_string(repo_dir.path().join("dirty.txt"))
+                .expect("failed to read dirty file"),
+            "dirty worktree\n"
+        );
+        assert_eq!(
+            fs::read_to_string(repo_dir.path().join("main-only.txt"))
+                .expect("failed to read main-only file"),
+            "main only\n"
+        );
+        assert!(!repo_dir.path().join("topic-first.txt").exists());
+        assert!(!repo_dir.path().join("topic-second.txt").exists());
     }
 
     #[gpui::test]

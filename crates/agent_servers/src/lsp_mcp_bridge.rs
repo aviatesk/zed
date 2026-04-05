@@ -886,7 +886,9 @@ async fn execute_op(
             .await
             .map(Into::into),
         LspBridgeOp::Diagnostics { path, min_severity } => {
-            diagnostics(project, path, min_severity, cx).await.map(Into::into)
+            diagnostics(project, path, min_severity, cx)
+                .await
+                .map(Into::into)
         }
         LspBridgeOp::RenameSymbol {
             file_path,
