@@ -649,6 +649,16 @@ fn format_linked_worktree_chips(worktrees: &[ThreadItemWorktreeInfo]) -> String 
     }
 }
 
+fn confirm_worktree_deletion(cx: &mut VisualTestContext) {
+    cx.run_until_parked();
+    assert!(
+        cx.has_pending_prompt(),
+        "removing a linked worktree from disk should ask for confirmation"
+    );
+    cx.simulate_prompt_answer("Delete Worktree");
+    cx.run_until_parked();
+}
+
 fn visible_entries_as_strings(
     sidebar: &Entity<Sidebar>,
     cx: &mut gpui::VisualTestContext,
@@ -2710,6 +2720,7 @@ async fn test_terminal_close_event_on_archived_linked_worktree_removes_workspace
     worktree_panel.update(cx, |panel, cx| {
         panel.emit_test_terminal_close(terminal_id, cx);
     });
+    confirm_worktree_deletion(cx);
     for _ in 0..4 {
         cx.run_until_parked();
     }
@@ -3203,6 +3214,10 @@ async fn test_archive_selected_draft_archives_linked_worktree_after_last_draft(
     for _ in 0..4 {
         cx.run_until_parked();
     }
+    assert!(
+        !cx.has_pending_prompt(),
+        "the worktree is still used by another draft, so nothing should be deleted"
+    );
 
     let first_draft_metadata_deleted = cx.update(|_, cx| {
         ThreadMetadataStore::global(cx)
@@ -3255,6 +3270,7 @@ async fn test_archive_selected_draft_archives_linked_worktree_after_last_draft(
         sidebar.selection = Some(second_draft_index);
     });
     cx.dispatch_action(ArchiveSelectedThread);
+    confirm_worktree_deletion(cx);
     for _ in 0..8 {
         cx.run_until_parked();
     }
@@ -3407,6 +3423,7 @@ async fn test_archive_selected_draft_archives_closed_linked_worktree(cx: &mut Te
         sidebar.selection = Some(draft_index);
     });
     cx.dispatch_action(ArchiveSelectedThread);
+    confirm_worktree_deletion(cx);
     for _ in 0..8 {
         cx.run_until_parked();
     }
@@ -4005,6 +4022,7 @@ async fn test_archive_selected_terminal_archives_closed_linked_worktree(cx: &mut
         sidebar.selection = Some(terminal_index);
     });
     cx.dispatch_action(ArchiveSelectedThread);
+    confirm_worktree_deletion(cx);
     for _ in 0..8 {
         cx.run_until_parked();
     }
@@ -4172,6 +4190,7 @@ async fn test_archive_selected_thread_archives_closed_linked_worktree(cx: &mut T
         sidebar.selection = Some(thread_index);
     });
     cx.dispatch_action(ArchiveSelectedThread);
+    confirm_worktree_deletion(cx);
     for _ in 0..8 {
         cx.run_until_parked();
     }
@@ -9283,6 +9302,7 @@ async fn test_archive_last_worktree_thread_removes_workspace(cx: &mut TestAppCon
     sidebar.update_in(cx, |sidebar: &mut Sidebar, window, cx| {
         sidebar.archive_thread(&wt_thread_id, window, cx);
     });
+    confirm_worktree_deletion(cx);
 
     // archive_thread spawns a multi-layered chain of tasks (workspace
     // removal → git persist → disk removal), each of which may spawn
@@ -9345,6 +9365,133 @@ async fn test_archive_last_worktree_thread_removes_workspace(cx: &mut TestAppCon
         archived_paths.paths(),
         &[PathBuf::from("/worktrees/project/feature-a/project")],
         "archived thread must retain its folder_paths for restore"
+    );
+}
+
+#[gpui::test]
+async fn test_archive_last_worktree_thread_can_keep_worktree(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+
+    fs.insert_tree(
+        "/project",
+        serde_json::json!({
+            ".git": {
+                "worktrees": {
+                    "feature-a": {
+                        "commondir": "../../",
+                        "HEAD": "ref: refs/heads/feature-a",
+                    },
+                },
+            },
+            "src": {},
+        }),
+    )
+    .await;
+    fs.insert_tree(
+        "/worktrees/project/feature-a/project",
+        serde_json::json!({
+            ".git": "gitdir: /project/.git/worktrees/feature-a",
+            "src": {},
+        }),
+    )
+    .await;
+    fs.add_linked_worktree_for_repo(
+        Path::new("/project/.git"),
+        false,
+        git::repository::Worktree {
+            path: PathBuf::from("/worktrees/project/feature-a/project"),
+            ref_name: Some("refs/heads/feature-a".into()),
+            sha: "abc".into(),
+            is_main: false,
+            is_bare: false,
+        },
+    )
+    .await;
+    agent_ui::test_support::record_zed_created_worktree(
+        fs.as_ref(),
+        Path::new("/worktrees/project/feature-a/project"),
+        None,
+        cx,
+    )
+    .await;
+
+    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+
+    let main_project = project::Project::test(fs.clone(), ["/project".as_ref()], cx).await;
+    let worktree_project = project::Project::test(
+        fs.clone(),
+        ["/worktrees/project/feature-a/project".as_ref()],
+        cx,
+    )
+    .await;
+    main_project
+        .update(cx, |p, cx| p.git_scans_complete(cx))
+        .await;
+    worktree_project
+        .update(cx, |p, cx| p.git_scans_complete(cx))
+        .await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(main_project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    multi_workspace.update_in(cx, |mw, window, cx| {
+        mw.test_add_workspace(worktree_project.clone(), window, cx)
+    });
+
+    let wt_session_id = acp::SessionId::new(Arc::from("worktree-thread"));
+    save_thread_metadata(
+        wt_session_id.clone(),
+        Some("Worktree Thread".into()),
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 0).unwrap(),
+        None,
+        None,
+        &worktree_project,
+        cx,
+    );
+    multi_workspace.update_in(cx, |_, _window, cx| cx.notify());
+    cx.run_until_parked();
+
+    let is_archived = |cx: &mut VisualTestContext| {
+        cx.update(|_window, cx| {
+            ThreadMetadataStore::global(cx)
+                .read(cx)
+                .entry_by_session(&wt_session_id)
+                .map(|metadata| metadata.archived)
+        })
+    };
+
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.archive_thread(&wt_session_id, window, cx);
+    });
+    cx.run_until_parked();
+    assert!(cx.has_pending_prompt());
+    cx.simulate_prompt_answer("Cancel");
+    cx.run_until_parked();
+    assert_eq!(
+        is_archived(cx),
+        Some(false),
+        "cancelling should leave the thread unarchived"
+    );
+
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.archive_thread(&wt_session_id, window, cx);
+    });
+    cx.run_until_parked();
+    assert!(cx.has_pending_prompt());
+    cx.simulate_prompt_answer("Keep Worktree");
+    cx.run_until_parked();
+
+    assert_eq!(is_archived(cx), Some(true));
+    assert!(
+        fs.is_dir(Path::new("/worktrees/project/feature-a/project"))
+            .await,
+        "keeping the worktree should leave it on disk"
+    );
+    assert_eq!(
+        multi_workspace.read_with(cx, |mw, _| mw.workspaces().count()),
+        2,
+        "keeping the worktree should leave its workspace open"
     );
 }
 
@@ -14665,6 +14812,7 @@ async fn test_archive_removes_worktree_even_when_workspace_paths_diverge(cx: &mu
     sidebar.update_in(cx, |sidebar, window, cx| {
         sidebar.archive_thread(&wt_thread_id, window, cx);
     });
+    confirm_worktree_deletion(cx);
 
     cx.run_until_parked();
 
@@ -14893,6 +15041,7 @@ async fn test_archive_mixed_workspace_closes_only_archived_worktree_items(cx: &m
     sidebar.update_in(cx, |sidebar, window, cx| {
         sidebar.archive_thread(&fb_session_id, window, cx);
     });
+    confirm_worktree_deletion(cx);
 
     cx.run_until_parked();
 
@@ -15096,6 +15245,7 @@ async fn test_discard_mixed_workspace_draft_closes_only_archived_worktree_items(
         sidebar.selection = Some(draft_index);
     });
     cx.dispatch_action(ArchiveSelectedThread);
+    confirm_worktree_deletion(cx);
     for _ in 0..8 {
         cx.run_until_parked();
     }
@@ -15370,6 +15520,7 @@ async fn test_remote_archive_thread_with_active_connection(
     sidebar.update_in(cx, |sidebar: &mut Sidebar, window, cx| {
         sidebar.archive_thread(&wt_thread_id, window, cx);
     });
+    confirm_worktree_deletion(cx);
     cx.run_until_parked();
     server_cx.run_until_parked();
 
