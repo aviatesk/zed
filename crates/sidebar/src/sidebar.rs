@@ -29,9 +29,9 @@ use feature_flags::{
 };
 use gpui::{
     Action as _, AnyElement, App, ClickEvent, Context, Decorations, DismissEvent, Entity, EntityId,
-    FocusHandle, Focusable, KeyContext, ListState, Modifiers, Pixels, Render, SharedString, Task,
-    TaskExt, WeakEntity, Window, WindowBackgroundAppearance, WindowHandle, linear_color_stop,
-    linear_gradient, list, prelude::*, px,
+    FocusHandle, Focusable, KeyContext, ListState, Modifiers, Pixels, PromptLevel, Render,
+    SharedString, Task, TaskExt, WeakEntity, Window, WindowBackgroundAppearance, WindowHandle,
+    linear_color_stop, linear_gradient, list, prelude::*, px,
 };
 use itertools::Itertools;
 use language_model::LanguageModelRegistry;
@@ -5628,6 +5628,99 @@ impl Sidebar {
             })
             .unwrap_or_default();
 
+        if roots_to_archive.is_empty() {
+            self.perform_archive_thread(
+                session_id,
+                thread_id,
+                thread_folder_paths,
+                roots_to_archive,
+                window,
+                cx,
+            );
+            return;
+        }
+
+        // Archiving will remove linked worktrees from disk (including any
+        // gitignored files inside them — those aren't captured by the
+        // archive checkpoint and cannot be restored on unarchive). Ask
+        // before doing anything destructive.
+        let worktree_paths: Vec<String> = roots_to_archive
+            .iter()
+            .map(|root| root.root_path.display().to_string())
+            .collect();
+        let prompt_message = if roots_to_archive.len() == 1 {
+            "Archiving this thread will delete its linked git worktree from disk.".to_string()
+        } else {
+            format!(
+                "Archiving this thread will delete {} linked git worktrees from disk.",
+                roots_to_archive.len()
+            )
+        };
+        let detail = format!(
+            "{}\n\nAny gitignored files (e.g. .env, build artifacts) inside will be lost — \
+             they are not captured by the archive checkpoint.",
+            worktree_paths.join("\n")
+        );
+
+        let session_id = session_id.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let answer = cx.update(|window, cx| {
+                window.prompt(
+                    PromptLevel::Warning,
+                    &prompt_message,
+                    Some(&detail),
+                    &["Keep Worktree", "Delete Worktree", "Cancel"],
+                    cx,
+                )
+            })?;
+            let choice = answer.await.log_err();
+            this.update_in(cx, |this, window, cx| match choice {
+                Some(0) => {
+                    this.perform_archive_thread(
+                        &session_id,
+                        thread_id,
+                        thread_folder_paths,
+                        Vec::new(),
+                        window,
+                        cx,
+                    );
+                }
+                Some(1) => {
+                    this.perform_archive_thread(
+                        &session_id,
+                        thread_id,
+                        thread_folder_paths,
+                        roots_to_archive,
+                        window,
+                        cx,
+                    );
+                }
+                _ => {}
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn perform_archive_thread(
+        &mut self,
+        session_id: &acp::SessionId,
+        thread_id: Option<agent_ui::ThreadId>,
+        thread_folder_paths: Option<PathList>,
+        roots_to_archive: Vec<thread_worktree_archive::RootPlan>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let thread_remote_connection = ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry_by_session(session_id)
+            .and_then(|m| m.remote_connection.clone());
+
+        // Find the neighbor thread in the sidebar (by display position).
+        // Look below first, then above, for the nearest thread that isn't
+        // the one being archived. We capture both the neighbor's metadata
+        // (for activation) and its workspace paths (for the workspace
+        // removal fallback).
         let current_pos = self.contents.entries.iter().position(|entry| match entry {
             ListEntry::Thread(thread) => thread_id.map_or_else(
                 || thread.metadata.session_id.as_ref() == Some(session_id),
@@ -5639,19 +5732,23 @@ impl Sidebar {
             current_pos.and_then(|position| self.neighboring_activatable_entry(position));
 
         // Check if archiving this thread would leave its worktree workspace
-        // with no threads, requiring workspace removal.
-        let workspace_to_remove = thread_folder_paths.as_ref().and_then(|folder_paths| {
-            let thread_remote_connection =
-                metadata.as_ref().and_then(|m| m.remote_connection.as_ref());
-            self.linked_worktree_workspace_to_remove(
-                folder_paths,
-                thread_remote_connection,
-                thread_id,
-                None,
-                &roots_to_archive,
-                cx,
-            )
-        });
+        // with no threads, requiring workspace removal. We only close the
+        // workspace when we're actually deleting the worktree from disk —
+        // otherwise there's no reason to tear down the user's workspace.
+        let workspace_to_remove = if roots_to_archive.is_empty() {
+            None
+        } else {
+            thread_folder_paths.as_ref().and_then(|folder_paths| {
+                self.linked_worktree_workspace_to_remove(
+                    folder_paths,
+                    thread_remote_connection.as_ref(),
+                    thread_id,
+                    None,
+                    &roots_to_archive,
+                    cx,
+                )
+            })
+        };
 
         // Also find workspaces for root plans that aren't covered by
         // workspace_to_remove. For workspaces that exclusively contain
@@ -5671,9 +5768,6 @@ impl Sidebar {
 
         let removed_workspace = !workspaces_to_remove.is_empty();
         let session_id = session_id.clone();
-        let thread_remote_connection = metadata
-            .as_ref()
-            .and_then(|metadata| metadata.remote_connection.clone());
 
         self.remove_workspaces_then(
             workspaces_to_remove,
