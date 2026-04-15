@@ -564,6 +564,50 @@ pub(crate) fn completion_chunk(
     })
 }
 
+fn toplevel_node_range(buffer: &BufferSnapshot, position: Point) -> Option<Range<Point>> {
+    let offset = position.to_offset(buffer);
+    let layer = buffer.syntax_layer_at(offset)?;
+    let root = layer.node();
+
+    let mut cursor = root.walk();
+
+    // Find the top-level child node that contains the cursor position.
+    // We iterate top-level children (depth-1 nodes) rather than descending fully,
+    // so we get the entire statement/definition block.
+    let mut target_node = None;
+    if cursor.goto_first_child() {
+        loop {
+            let node = cursor.node();
+            let node_start = node.start_byte();
+            let node_end = node.end_byte();
+            if node_start <= offset && offset <= node_end {
+                target_node = Some(node);
+                break;
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+
+    let node = target_node?;
+
+    // Skip pure whitespace/comment-only nodes
+    if !node.is_named() {
+        return None;
+    }
+
+    let start = Point::new(
+        node.start_position().row as u32,
+        node.start_position().column as u32,
+    );
+    let end = Point::new(
+        node.end_position().row as u32,
+        node.end_position().column as u32,
+    );
+    Some(start..end)
+}
+
 fn cell_range(buffer: &BufferSnapshot, start_row: u32, end_row: u32) -> Range<Point> {
     let mut snippet_end_row = end_row;
     while buffer.is_line_blank(snippet_end_row) && snippet_end_row > start_row {
@@ -652,6 +696,14 @@ fn runnable_ranges(
     let (jupytext_snippets, next_cursor) = jupytext_cells(buffer, range.clone());
     if !jupytext_snippets.is_empty() {
         return (jupytext_snippets, next_cursor);
+    }
+
+    let has_selection = range.start != range.end;
+
+    if !has_selection {
+        if let Some(node_range) = toplevel_node_range(buffer, range.start) {
+            return (vec![node_range], None);
+        }
     }
 
     let snippet_range = cell_range(buffer, range.start.row, range.end.row);
