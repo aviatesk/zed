@@ -33,8 +33,8 @@ use gpui::{
     Context, Entity, EventEmitter, Render, Subscription, Task, WeakEntity, Window, div, prelude::*,
 };
 use jupyter_protocol::{
-    ExecuteRequest, ExecutionState, InputReply, InterruptRequest, JupyterMessage,
-    JupyterMessageContent, KernelInfoRequest, ReplyStatus, ShutdownRequest,
+    CompleteRequest, ExecuteRequest, ExecutionState, InputReply, InspectRequest, InterruptRequest,
+    JupyterMessage, JupyterMessageContent, KernelInfoRequest, ReplyStatus, ShutdownRequest,
 };
 use language::Point;
 use project::Fs;
@@ -53,6 +53,10 @@ pub struct Session {
     blocks: HashMap<String, EditorBlock>,
     result_inlays: HashMap<String, (InlayId, Range<Anchor>, usize)>,
     next_inlay_id: usize,
+    pending_completion_replies:
+        HashMap<String, futures::channel::oneshot::Sender<jupyter_protocol::CompleteReply>>,
+    pending_inspect_replies:
+        HashMap<String, futures::channel::oneshot::Sender<jupyter_protocol::InspectReply>>,
 
     _subscriptions: Vec<Subscription>,
 }
@@ -257,6 +261,8 @@ impl Session {
             blocks: HashMap::default(),
             result_inlays: HashMap::default(),
             next_inlay_id: 0,
+            pending_completion_replies: HashMap::default(),
+            pending_inspect_replies: HashMap::default(),
             kernel_specification,
             _subscriptions: vec![subscription],
         };
@@ -473,6 +479,54 @@ impl Session {
         }
 
         anyhow::Ok(())
+    }
+
+    pub fn request_completions(
+        &mut self,
+        code: String,
+        cursor_pos: usize,
+        cx: &mut Context<Self>,
+    ) -> Option<futures::channel::oneshot::Receiver<jupyter_protocol::CompleteReply>> {
+        if !matches!(&self.kernel, Kernel::RunningKernel(_)) {
+            return None;
+        }
+
+        self.pending_completion_replies.clear();
+
+        let request = CompleteRequest { code, cursor_pos };
+        let message: JupyterMessage = JupyterMessageContent::CompleteRequest(request).into();
+        let msg_id = message.header.msg_id.clone();
+
+        let (tx, rx) = futures::channel::oneshot::channel();
+        self.pending_completion_replies.insert(msg_id, tx);
+        self.send(message, cx).log_err();
+
+        Some(rx)
+    }
+
+    pub fn request_inspect(
+        &mut self,
+        code: String,
+        cursor_pos: usize,
+        cx: &mut Context<Self>,
+    ) -> Option<futures::channel::oneshot::Receiver<jupyter_protocol::InspectReply>> {
+        if !matches!(&self.kernel, Kernel::RunningKernel(_)) {
+            return None;
+        }
+
+        let request = InspectRequest {
+            code,
+            cursor_pos,
+            detail_level: Some(0),
+        };
+        let message: JupyterMessage = JupyterMessageContent::InspectRequest(request).into();
+        let msg_id = message.header.msg_id.clone();
+
+        let (tx, rx) = futures::channel::oneshot::channel();
+        self.pending_inspect_replies.insert(msg_id, tx);
+        self.send(message, cx).log_err();
+
+        Some(rx)
     }
 
     fn send_stdin_reply(
@@ -987,6 +1041,18 @@ impl KernelSession for Session {
             JupyterMessageContent::KernelInfoReply(reply) => {
                 self.kernel.set_kernel_info(reply);
                 cx.notify();
+            }
+            JupyterMessageContent::CompleteReply(reply) => {
+                if let Some(tx) = self.pending_completion_replies.remove(parent_message_id) {
+                    tx.send(reply.clone()).ok();
+                }
+                return;
+            }
+            JupyterMessageContent::InspectReply(reply) => {
+                if let Some(tx) = self.pending_inspect_replies.remove(parent_message_id) {
+                    tx.send(reply.clone()).ok();
+                }
+                return;
             }
             JupyterMessageContent::UpdateDisplayData(update) => {
                 let display_id = if let Some(display_id) = update.transient.display_id.clone() {
