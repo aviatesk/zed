@@ -181,6 +181,9 @@ const CROSS_BUFFER_DIAGNOSTICS_PULL_DELAY: Duration = Duration::from_millis(100)
 const DOCUMENT_DIAGNOSTICS_RETRIGGER_LIMIT: usize = 3;
 const DOCUMENT_DIAGNOSTICS_RETRIGGER_DELAY: Duration = Duration::from_millis(100);
 const SERVER_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10);
+// Debounces `workspace/diagnostic` refreshes triggered by buffer edits so that a burst of
+// keystrokes coalesces into a single request once typing settles.
+const WORKSPACE_DIAGNOSTICS_EDIT_DEBOUNCE: Duration = Duration::from_millis(500);
 static NEXT_PROMPT_REQUEST_ID: AtomicUsize = AtomicUsize::new(0);
 
 /// Refresh messages carry a monotonic id for backwards compatibility only: older peers
@@ -365,6 +368,7 @@ pub struct LocalLspStore {
         LanguageServerId,
         HashMap<Option<SharedString>, HashMap<PathBuf, Option<SharedString>>>,
     >,
+    workspace_diagnostics_edit_debounce_tasks: HashMap<LanguageServerId, Task<()>>,
     restricted_worktrees_tasks: HashMap<WorktreeId, (Subscription, watch::Receiver<bool>)>,
     all_language_servers_stopped: bool,
     stopped_language_servers: HashSet<LanguageServerName>,
@@ -4154,6 +4158,8 @@ impl LocalLspStore {
                 .remove(server_id_to_remove);
             self.workspace_pull_diagnostics_result_ids
                 .remove(server_id_to_remove);
+            self.workspace_diagnostics_edit_debounce_tasks
+                .remove(server_id_to_remove);
             for buffer_servers in self.buffers_opened_in_servers.values_mut() {
                 buffer_servers.remove(server_id_to_remove);
             }
@@ -5047,6 +5053,7 @@ impl LspStore {
                 buffer_uris: HashMap::default(),
                 buffer_pull_diagnostics_result_ids: HashMap::default(),
                 workspace_pull_diagnostics_result_ids: HashMap::default(),
+                workspace_diagnostics_edit_debounce_tasks: HashMap::default(),
                 restricted_worktrees_tasks: HashMap::default(),
                 all_language_servers_stopped: false,
                 stopped_language_servers: HashSet::default(),
@@ -9744,7 +9751,7 @@ impl LspStore {
         };
         let next_snapshot = buffer.text_snapshot();
         let line_ending = next_snapshot.line_ending();
-
+        let mut servers_to_refresh_diagnostics = Vec::new();
         for language_server in language_servers {
             let language_server = language_server.clone();
 
@@ -9841,10 +9848,38 @@ impl LspStore {
                     },
                 )
                 .ok();
-            self.pull_workspace_diagnostics(language_server.server_id());
+            servers_to_refresh_diagnostics.push(language_server.server_id());
+        }
+        for server_id in servers_to_refresh_diagnostics {
+            self.schedule_workspace_diagnostics_pull_for_edit(server_id, cx);
         }
 
         None
+    }
+
+    // `workspace/diagnostic` is a whole-project scan and tends to be expensive on the server side,
+    // so edits coalesce via a debounce window instead of triggering a pull per keystroke. Other
+    // refresh triggers (server startup, dynamic capability registration, `workspace/diagnostic/refresh`,
+    // collab forwarding) still call `pull_workspace_diagnostics` directly since they must fire promptly.
+    fn schedule_workspace_diagnostics_pull_for_edit(
+        &mut self,
+        server_id: LanguageServerId,
+        cx: &mut Context<Self>,
+    ) {
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(WORKSPACE_DIAGNOSTICS_EDIT_DEBOUNCE)
+                .await;
+            this.update(cx, |this, _| {
+                this.pull_workspace_diagnostics(server_id);
+            })
+            .ok();
+        });
+        if let Some(local) = self.as_local_mut() {
+            local
+                .workspace_diagnostics_edit_debounce_tasks
+                .insert(server_id, task);
+        }
     }
 
     pub fn on_buffer_saved(
@@ -13175,6 +13210,9 @@ impl LspStore {
             .language_server_dynamic_registrations
             .remove(&server_id);
         local.initial_server_capabilities.remove(&server_id);
+        local
+            .workspace_diagnostics_edit_debounce_tasks
+            .remove(&server_id);
 
         let server_state = local.language_servers.remove(&server_id);
         self.cleanup_lsp_data(server_id);
