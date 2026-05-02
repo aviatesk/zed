@@ -180,6 +180,7 @@ fn assert_remote_project_integration_sidebar_state(
                     "expected the only sidebar project header to be `project`"
                 );
             }
+            ListEntry::Worktree(_) => {}
             ListEntry::Thread(thread)
                 if thread.metadata.session_id.as_ref() == Some(main_thread_id) =>
             {
@@ -649,6 +650,17 @@ fn visible_entries_as_strings(
                             "v"
                         };
                         format!("{} [{}]{}", icon, label, selected)
+                    }
+                    ListEntry::Worktree(worktree) => {
+                        let names: Vec<String> = worktree
+                            .labels
+                            .iter()
+                            .map(|label| match &label.secondary_name {
+                                Some(secondary) => format!("{}:{}", label.primary_name, secondary),
+                                None => label.primary_name.to_string(),
+                            })
+                            .collect();
+                        format!("  worktree[{}]{}", names.join("•"), selected)
                     }
                     ListEntry::Thread(thread) => {
                         let title = thread.metadata.display_title();
@@ -5155,7 +5167,9 @@ async fn test_rename_thread_from_sidebar_updates_title_override(cx: &mut TestApp
                     thread.metadata.thread_id,
                     thread.metadata.display_title(),
                 )),
-                ListEntry::ProjectHeader { .. } | ListEntry::Terminal(_) => None,
+                ListEntry::ProjectHeader { .. }
+                | ListEntry::Worktree(_)
+                | ListEntry::Terminal(_) => None,
             })
             .expect("sidebar should have a thread entry")
     });
@@ -5241,7 +5255,9 @@ async fn test_rename_thread_from_sidebar_updates_title_override(cx: &mut TestApp
             .iter()
             .find_map(|entry| match entry {
                 ListEntry::Thread(thread) => Some(thread),
-                ListEntry::ProjectHeader { .. } | ListEntry::Terminal(_) => None,
+                ListEntry::ProjectHeader { .. }
+                | ListEntry::Worktree(_)
+                | ListEntry::Terminal(_) => None,
             })
             .expect("renamed thread should match the search");
         let title = thread.metadata.display_title();
@@ -5280,7 +5296,9 @@ async fn test_rename_selected_thread_action_renames_selected_thread(cx: &mut Tes
             .enumerate()
             .find_map(|(ix, entry)| match entry {
                 ListEntry::Thread(thread) => Some((ix, thread.metadata.thread_id)),
-                ListEntry::ProjectHeader { .. } | ListEntry::Terminal(_) => None,
+                ListEntry::ProjectHeader { .. }
+                | ListEntry::Worktree(_)
+                | ListEntry::Terminal(_) => None,
             })
             .expect("sidebar should have a thread entry")
     });
@@ -6262,6 +6280,8 @@ async fn test_cmd_n_shows_new_thread_entry_in_absorbed_worktree(cx: &mut TestApp
         vec![
             //
             "v [project]",
+            "  worktree[main]",
+            "  worktree[wt-feature-a]",
             "  Hello {wt-feature-a} *",
         ]
     );
@@ -6283,6 +6303,8 @@ async fn test_cmd_n_shows_new_thread_entry_in_absorbed_worktree(cx: &mut TestApp
         vec![
             //
             "v [project]",
+            "  worktree[main]",
+            "  worktree[wt-feature-a]",
             "  New stub Thread {wt-feature-a}",
             "  Hello {wt-feature-a} *",
         ],
@@ -6554,6 +6576,8 @@ async fn test_search_matches_worktree_name(cx: &mut TestAppContext) {
         vec![
             //
             "v [project]",
+            "  worktree[main]",
+            "  worktree[rosewood]",
             "  Fix Bug {rosewood}  <== selected",
         ],
     );
@@ -6594,7 +6618,12 @@ async fn test_git_worktree_added_live_updates_sidebar(cx: &mut TestAppContext) {
     // The chip name is derived from the path even before git discovery.
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
-        vec!["v [project]", "  Worktree Thread {rosewood}"]
+        vec![
+            "v [project]",
+            "  worktree[main]",
+            "  worktree[rosewood]",
+            "  Worktree Thread {rosewood}",
+        ]
     );
 
     // Now add the worktree to the git state and trigger a rescan.
@@ -6619,8 +6648,88 @@ async fn test_git_worktree_added_live_updates_sidebar(cx: &mut TestAppContext) {
         vec![
             //
             "v [project]",
+            "  worktree[main]",
+            "  worktree[rosewood]",
             "  Worktree Thread {rosewood}",
         ]
+    );
+}
+
+/// Multiple threads pointing to the same closed worktree should
+/// produce a single deduplicated worktree row, not one per thread.
+#[gpui::test]
+async fn test_worktree_rows_deduplicated_across_threads(cx: &mut TestAppContext) {
+    let (project, _fs) = init_test_project_with_git("/project", cx).await;
+    project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    let main_paths = PathList::new(&[PathBuf::from("/project")]);
+    let wt_a_paths = PathList::new(&[PathBuf::from("/wt/feature-a")]);
+    let wt_b_paths = PathList::new(&[PathBuf::from("/wt/feature-b")]);
+
+    // Three threads in /wt/feature-a (same worktree), one in /wt/feature-b.
+    save_thread_metadata_with_main_paths(
+        "wt-a-1",
+        "WT-A 1",
+        wt_a_paths.clone(),
+        main_paths.clone(),
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 0).unwrap(),
+        cx,
+    );
+    save_thread_metadata_with_main_paths(
+        "wt-a-2",
+        "WT-A 2",
+        wt_a_paths.clone(),
+        main_paths.clone(),
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 1).unwrap(),
+        cx,
+    );
+    save_thread_metadata_with_main_paths(
+        "wt-a-3",
+        "WT-A 3",
+        wt_a_paths,
+        main_paths.clone(),
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 2).unwrap(),
+        cx,
+    );
+    save_thread_metadata_with_main_paths(
+        "wt-b-1",
+        "WT-B 1",
+        wt_b_paths,
+        main_paths,
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 3).unwrap(),
+        cx,
+    );
+
+    multi_workspace.update_in(cx, |_, _window, cx| cx.notify());
+    cx.run_until_parked();
+
+    // The two distinct worktrees (feature-a, feature-b) plus the main
+    // open workspace should produce exactly three worktree rows even
+    // though three threads share /wt/feature-a.
+    let entries = visible_entries_as_strings(&sidebar, cx);
+    let worktree_rows: Vec<&String> = entries
+        .iter()
+        .filter(|line| line.trim_start().starts_with("worktree["))
+        .collect();
+    assert_eq!(
+        worktree_rows.len(),
+        3,
+        "expected exactly one row per distinct worktree (main + feature-a + feature-b), \
+         got rows: {worktree_rows:?} in entries: {entries:?}",
+    );
+    assert_eq!(
+        worktree_rows
+            .iter()
+            .filter(|line| line.contains("feature-a"))
+            .count(),
+        1,
+        "the three threads sharing /wt/feature-a should collapse into a single row",
     );
 }
 
@@ -6710,6 +6819,8 @@ async fn test_two_worktree_workspaces_absorbed_when_main_added(cx: &mut TestAppC
         vec![
             //
             "v [project]",
+            "  worktree[wt-feature-b]",
+            "  worktree[wt-feature-a]",
             "  Thread B {wt-feature-b}",
             "  Thread A {wt-feature-a}",
         ]
@@ -6732,6 +6843,9 @@ async fn test_two_worktree_workspaces_absorbed_when_main_added(cx: &mut TestAppC
         vec![
             //
             "v [project]",
+            "  worktree[wt-feature-b]",
+            "  worktree[main]",
+            "  worktree[wt-feature-a]",
             "  Thread B {wt-feature-b}",
             "  Thread A {wt-feature-a}",
         ]
@@ -6807,7 +6921,12 @@ async fn test_threadless_workspace_shows_new_thread_with_worktree_chip(cx: &mut 
     // appears as a "New Thread" button with its worktree chip.
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
-        vec!["v [project]", "  Thread A {wt-feature-a}",]
+        vec![
+            "v [project]",
+            "  worktree[wt-feature-b]",
+            "  worktree[wt-feature-a]",
+            "  Thread A {wt-feature-a}",
+        ]
     );
 }
 
@@ -7064,7 +7183,12 @@ async fn test_absorbed_worktree_running_thread_shows_live_status(cx: &mut TestAp
     let entries = visible_entries_as_strings(&sidebar, cx);
     assert_eq!(
         entries,
-        vec!["v [project]", "  Hello {wt-feature-a} * (running)",]
+        vec![
+            "v [project]",
+            "  worktree[main]",
+            "  worktree[wt-feature-a]",
+            "  Hello {wt-feature-a} * (running)",
+        ]
     );
 }
 
@@ -7148,7 +7272,12 @@ async fn test_absorbed_worktree_completion_triggers_notification(cx: &mut TestAp
 
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
-        vec!["v [project]", "  Hello {wt-feature-a} * (running)",]
+        vec![
+            "v [project]",
+            "  worktree[main]",
+            "  worktree[wt-feature-a]",
+            "  Hello {wt-feature-a} * (running)",
+        ]
     );
 
     connection.end_turn(session_id, acp::StopReason::EndTurn);
@@ -7156,7 +7285,12 @@ async fn test_absorbed_worktree_completion_triggers_notification(cx: &mut TestAp
 
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
-        vec!["v [project]", "  Hello {wt-feature-a} * (!)",]
+        vec![
+            "v [project]",
+            "  worktree[main]",
+            "  worktree[wt-feature-a]",
+            "  Hello {wt-feature-a} * (!)",
+        ]
     );
 }
 
@@ -7216,6 +7350,8 @@ async fn test_clicking_worktree_thread_opens_workspace_when_none_exists(cx: &mut
         vec![
             //
             "v [project]",
+            "  worktree[main]",
+            "  worktree[wt-feature-a]",
             "  WT Thread {wt-feature-a}",
         ],
     );
@@ -7229,7 +7365,8 @@ async fn test_clicking_worktree_thread_opens_workspace_when_none_exists(cx: &mut
     // Focus the sidebar and select the worktree thread.
     focus_sidebar(&sidebar, cx);
     sidebar.update_in(cx, |sidebar, _window, _cx| {
-        sidebar.selection = Some(1); // index 0 is header, 1 is the thread
+        // index 0 is header, 1-2 are worktree rows, 3 is the thread
+        sidebar.selection = Some(3);
     });
 
     // Confirm to open the worktree thread.
@@ -7310,13 +7447,16 @@ async fn test_clicking_worktree_thread_does_not_briefly_render_as_separate_proje
         vec![
             //
             "v [project]",
+            "  worktree[main]",
+            "  worktree[wt-feature-a]",
             "  WT Thread {wt-feature-a}",
         ],
     );
 
     focus_sidebar(&sidebar, cx);
     sidebar.update_in(cx, |sidebar, _window, _cx| {
-        sidebar.selection = Some(1); // index 0 is header, 1 is the thread
+        // index 0 is header, 1-2 are worktree rows, 3 is the thread
+        sidebar.selection = Some(3);
     });
 
     let assert_sidebar_state = |sidebar: &mut Sidebar, _cx: &mut Context<Sidebar>| {
@@ -7351,6 +7491,7 @@ async fn test_clicking_worktree_thread_does_not_briefly_render_as_separate_proje
                         "expected the only sidebar project header to be `project`"
                     );
                 }
+                ListEntry::Worktree(_) => {}
                 ListEntry::Thread(thread)
                     if thread.metadata.title.as_ref().map(|t| t.as_ref()) == Some("WT Thread")
                         && thread
@@ -7468,8 +7609,10 @@ async fn test_clicking_absorbed_worktree_thread_activates_worktree_workspace(
 
     // The worktree workspace should be absorbed under the main repo.
     let entries = visible_entries_as_strings(&sidebar, cx);
-    assert_eq!(entries.len(), 3);
+    assert_eq!(entries.len(), 5);
     assert_eq!(entries[0], "v [project]");
+    assert!(entries.contains(&"  worktree[main]".to_string()));
+    assert!(entries.contains(&"  worktree[wt-feature-a]".to_string()));
     assert!(entries.contains(&"  Main Thread".to_string()));
     assert!(entries.contains(&"  WT Thread {wt-feature-a}".to_string()));
 
@@ -9303,6 +9446,8 @@ async fn test_linked_worktree_threads_not_duplicated_across_groups(cx: &mut Test
             //
             "v [other, project]",
             "v [project]",
+            "  worktree[main]",
+            "  worktree[wt-feature-a]",
             "  Worktree Thread {wt-feature-a}",
         ]
     );
@@ -11190,6 +11335,7 @@ async fn test_unarchive_linked_worktree_thread_into_project_group_shows_only_res
             .iter()
             .filter(|entry| !entry.starts_with("v ") && !entry.starts_with("> "))
             .filter(|entry| !entry.contains("Draft"))
+            .filter(|entry| !entry.trim_start().starts_with("worktree["))
             .count();
         assert_eq!(
             real_thread_rows, 1,
@@ -12354,6 +12500,8 @@ async fn test_worktree_add_only_regroups_threads_for_changed_workspace(cx: &mut 
         visible_entries_as_strings(&sidebar, cx),
         vec![
             "v [project]",
+            "  worktree[main]",
+            "  worktree[wt-feature]",
             "  Worktree Thread {wt-feature}",
             "  Main Thread",
         ]
