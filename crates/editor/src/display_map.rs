@@ -2565,7 +2565,11 @@ impl DisplaySnapshot {
         rows.contains(&row).then_some(rows)
     }
 
-    fn inlay_offset_to_display_point(&self, offset: InlayOffset, bias: Bias) -> DisplayPoint {
+    pub(crate) fn inlay_offset_to_display_point(
+        &self,
+        offset: InlayOffset,
+        bias: Bias,
+    ) -> DisplayPoint {
         let inlay_point = self.inlay_snapshot().to_point(offset);
         let fold_point = self.fold_snapshot().to_fold_point(inlay_point, bias);
         self.fold_point_to_display_point(fold_point)
