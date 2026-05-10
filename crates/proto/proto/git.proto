@@ -111,6 +111,12 @@ message CommitSummary {
   string subject = 2;
   int64 commit_timestamp = 3;
   string author_name = 4;
+  optional bool has_parent = 5;
+}
+
+message HeadRecentCommits {
+  // Wrapped so GitCommitDetails JSON written by older collab versions remains deserializable.
+  repeated CommitSummary commits = 1;
 }
 
 message GitBranches {
@@ -291,6 +297,7 @@ message GitCommitDetails {
   int64 commit_timestamp = 3;
   string author_email = 4;
   string author_name = 5;
+  optional HeadRecentCommits head_recent_commits = 6;
 }
 
 message LoadCommitDiff {

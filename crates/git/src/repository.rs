@@ -853,6 +853,9 @@ pub trait GitRepository: Send + Sync {
 
     fn branches(&self) -> BoxFuture<'_, Result<BranchesScanResult>>;
 
+    /// Returns the most recent commits reachable from HEAD, up to `count`.
+    fn recent_commits(&self, count: usize) -> BoxFuture<'_, Result<Vec<CommitSummary>>>;
+
     fn change_branch(&self, name: String) -> BoxFuture<'_, Result<()>>;
     fn create_branch(&self, name: String, base_branch: Option<String>)
     -> BoxFuture<'_, Result<()>>;
@@ -2193,6 +2196,58 @@ impl GitRepository for RealGitRepository {
                 }
 
                 Ok(BranchesScanResult { branches, error })
+            })
+            .boxed()
+    }
+
+    fn recent_commits(&self, count: usize) -> BoxFuture<'_, Result<Vec<CommitSummary>>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move {
+                let count_arg = count.to_string();
+                let fields = ["%H", "%P", "%ct", "%an", "%s"].join("%x00");
+                let format_arg = format!("--format={fields}");
+                let output = git
+                    .build_command(&["log", "-n", &count_arg, &format_arg, "HEAD"])
+                    .output()
+                    .await?;
+
+                if !output.status.success() {
+                    // No HEAD yet (e.g. brand new repository) — treat as no
+                    // commits rather than an error.
+                    return Ok(Vec::new());
+                }
+
+                let stdout = std::str::from_utf8(&output.stdout)?;
+                let mut commits = Vec::new();
+                for line in stdout.lines() {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let mut fields = line.split('\x00');
+                    let Some(sha) = fields.next() else { continue };
+                    let Some(parent) = fields.next() else {
+                        continue;
+                    };
+                    let Some(commit_timestamp) = fields.next().and_then(|f| f.parse::<i64>().ok())
+                    else {
+                        continue;
+                    };
+                    let Some(author_name) = fields.next() else {
+                        continue;
+                    };
+                    let Some(subject) = fields.next() else {
+                        continue;
+                    };
+                    commits.push(CommitSummary {
+                        sha: sha.to_string().into(),
+                        subject: subject.to_string().into(),
+                        commit_timestamp,
+                        author_name: author_name.to_string().into(),
+                        has_parent: !parent.is_empty(),
+                    });
+                }
+                Ok(commits)
             })
             .boxed()
     }
