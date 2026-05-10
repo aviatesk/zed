@@ -37,11 +37,11 @@ use git::{
     parse_git_remote_url,
     repository::{
         Branch, BranchesScanResult, CommitData, CommitDetails, CommitFileStatus, CommitOptions,
-        CreateWorktreeTarget, DiffStatType, DiffType, FetchOptions, FileHistoryChangedFileSets,
-        GitCommitTemplate, GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData,
-        LogOrder, LogSource, PushOptions, Remote, RemoteCommandOutput, RepoPath, ResetMode,
-        SearchCommitArgs, UpstreamTrackingStatus, Worktree as GitWorktree, delete_branch_flag,
-        is_binary_content,
+        CommitSummary, CreateWorktreeTarget, DiffStatType, DiffType, FetchOptions,
+        FileHistoryChangedFileSets, GitCommitTemplate, GitRepository, GitRepositoryCheckpoint,
+        InitialGraphCommitData, LogOrder, LogSource, PushOptions, Remote, RemoteCommandOutput,
+        RepoPath, ResetMode, SearchCommitArgs, UpstreamTrackingStatus, Worktree as GitWorktree,
+        delete_branch_flag, is_binary_content,
     },
     stash::{GitStash, StashEntry},
     status::{
@@ -593,6 +593,9 @@ pub enum CommitDataState {
     Loaded(Arc<CommitData>),
 }
 
+/// How many recent commits to keep cached for the active HEAD.
+pub const HEAD_RECENT_COMMITS_COUNT: usize = 3;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepositorySnapshot {
     pub id: RepositoryId,
@@ -616,6 +619,7 @@ pub struct RepositorySnapshot {
     pub branch_list: Arc<[Branch]>,
     pub branch_list_error: Option<SharedString>,
     pub head_commit: Option<CommitDetails>,
+    pub head_recent_commits: Arc<[CommitSummary]>,
     pub scan_id: u64,
     pub merge: MergeDetails,
     pub remote_origin_url: Option<String>,
@@ -4405,6 +4409,7 @@ impl GitStore {
             commit_timestamp: commit.commit_timestamp,
             author_email: commit.author_email.into(),
             author_name: commit.author_name.into(),
+            head_recent_commits: None,
         })
     }
 
@@ -6108,6 +6113,7 @@ impl RepositorySnapshot {
             branch_list: Arc::from([]),
             branch_list_error: None,
             head_commit: None,
+            head_recent_commits: Arc::from([]),
             scan_id: 0,
             merge: Default::default(),
             remote_origin_url: None,
@@ -6126,7 +6132,9 @@ impl RepositorySnapshot {
                 .branch_list_error
                 .as_ref()
                 .map(|error| error.to_string()),
-            head_commit_details: self.head_commit.as_ref().map(commit_details_to_proto),
+            head_commit_details: self.head_commit.as_ref().map(|head_commit| {
+                head_commit_details_to_proto(head_commit, &self.head_recent_commits)
+            }),
             updated_statuses: self
                 .statuses_by_path
                 .iter()
@@ -6217,7 +6225,9 @@ impl RepositorySnapshot {
                 .branch_list_error
                 .as_ref()
                 .map(|error| error.to_string()),
-            head_commit_details: self.head_commit.as_ref().map(commit_details_to_proto),
+            head_commit_details: self.head_commit.as_ref().map(|head_commit| {
+                head_commit_details_to_proto(head_commit, &self.head_recent_commits)
+            }),
             updated_statuses,
             removed_statuses,
             current_merge_conflicts: self
@@ -9915,11 +9925,21 @@ impl Repository {
             .head_commit_details
             .as_ref()
             .map(proto_to_commit_details);
-        if self.snapshot.branch != new_branch || self.snapshot.head_commit != new_head_commit {
+        let new_head_recent_commits = proto_to_head_recent_commits(
+            update.head_commit_details.as_ref(),
+            new_branch
+                .as_ref()
+                .and_then(|branch| branch.most_recent_commit.as_ref()),
+        );
+        if self.snapshot.branch != new_branch
+            || self.snapshot.head_commit != new_head_commit
+            || *self.snapshot.head_recent_commits != *new_head_recent_commits
+        {
             cx.emit(RepositoryEvent::HeadChanged)
         }
         self.snapshot.branch = new_branch;
         self.snapshot.head_commit = new_head_commit;
+        self.snapshot.head_recent_commits = new_head_recent_commits;
 
         if update.is_last_update {
             let new_branch_list: Arc<[Branch]> =
@@ -11210,12 +11230,7 @@ fn branch_to_proto(branch: &git::repository::Branch) -> proto::Branch {
         most_recent_commit: branch
             .most_recent_commit
             .as_ref()
-            .map(|commit| proto::CommitSummary {
-                sha: commit.sha.to_string(),
-                subject: commit.subject.to_string(),
-                commit_timestamp: commit.commit_timestamp,
-                author_name: commit.author_name.to_string(),
-            }),
+            .map(commit_summary_to_proto),
     }
 }
 
@@ -11267,15 +11282,30 @@ fn proto_to_branch(proto: &proto::Branch) -> git::repository::Branch {
                     })
                     .unwrap_or(git::repository::UpstreamTracking::Gone),
             }),
-        most_recent_commit: proto.most_recent_commit.as_ref().map(|commit| {
-            git::repository::CommitSummary {
-                sha: commit.sha.to_string().into(),
-                subject: commit.subject.to_string().into(),
-                commit_timestamp: commit.commit_timestamp,
-                author_name: commit.author_name.to_string().into(),
-                has_parent: true,
-            }
-        }),
+        most_recent_commit: proto
+            .most_recent_commit
+            .as_ref()
+            .map(proto_to_commit_summary),
+    }
+}
+
+fn commit_summary_to_proto(commit: &CommitSummary) -> proto::CommitSummary {
+    proto::CommitSummary {
+        sha: commit.sha.to_string(),
+        subject: commit.subject.to_string(),
+        commit_timestamp: commit.commit_timestamp,
+        author_name: commit.author_name.to_string(),
+        has_parent: Some(commit.has_parent),
+    }
+}
+
+fn proto_to_commit_summary(commit: &proto::CommitSummary) -> CommitSummary {
+    CommitSummary {
+        sha: commit.sha.clone().into(),
+        subject: commit.subject.clone().into(),
+        commit_timestamp: commit.commit_timestamp,
+        author_name: commit.author_name.clone().into(),
+        has_parent: commit.has_parent.unwrap_or(true),
     }
 }
 
@@ -11286,6 +11316,38 @@ fn commit_details_to_proto(commit: &CommitDetails) -> proto::GitCommitDetails {
         commit_timestamp: commit.commit_timestamp,
         author_email: commit.author_email.to_string(),
         author_name: commit.author_name.to_string(),
+        head_recent_commits: None,
+    }
+}
+
+fn head_commit_details_to_proto(
+    commit: &CommitDetails,
+    head_recent_commits: &[CommitSummary],
+) -> proto::GitCommitDetails {
+    let mut commit = commit_details_to_proto(commit);
+    commit.head_recent_commits = Some(proto::HeadRecentCommits {
+        commits: head_recent_commits
+            .iter()
+            .map(commit_summary_to_proto)
+            .collect(),
+    });
+    commit
+}
+
+fn proto_to_head_recent_commits(
+    head_commit_details: Option<&proto::GitCommitDetails>,
+    branch_most_recent_commit: Option<&CommitSummary>,
+) -> Arc<[CommitSummary]> {
+    if let Some(head_recent_commits) =
+        head_commit_details.and_then(|head_commit| head_commit.head_recent_commits.as_ref())
+    {
+        head_recent_commits
+            .commits
+            .iter()
+            .map(proto_to_commit_summary)
+            .collect()
+    } else {
+        branch_most_recent_commit.cloned().into_iter().collect()
     }
 }
 
@@ -11375,6 +11437,110 @@ mod tests {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
         });
+    }
+
+    #[test]
+    fn test_head_recent_commits_proto_backwards_compatibility() {
+        let mut commit_details: proto::GitCommitDetails = serde_json::from_value(json!({
+            "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "message": "Initial commit",
+            "commit_timestamp": 1,
+            "author_email": "zed@example.com",
+            "author_name": "Zed"
+        }))
+        .expect("legacy commit details should remain deserializable");
+        assert!(commit_details.head_recent_commits.is_none());
+
+        let commit_summary: proto::CommitSummary = serde_json::from_value(json!({
+            "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "subject": "Initial commit",
+            "commit_timestamp": 1,
+            "author_name": "Zed"
+        }))
+        .expect("legacy commit summary should remain deserializable");
+        let commit_summary = proto_to_commit_summary(&commit_summary);
+        assert!(commit_summary.has_parent);
+        assert_eq!(
+            &*proto_to_head_recent_commits(Some(&commit_details), Some(&commit_summary)),
+            std::slice::from_ref(&commit_summary)
+        );
+
+        commit_details.head_recent_commits = Some(proto::HeadRecentCommits {
+            commits: Vec::new(),
+        });
+        assert!(
+            proto_to_head_recent_commits(Some(&commit_details), Some(&commit_summary)).is_empty()
+        );
+    }
+
+    #[test]
+    fn test_repository_updates_include_head_recent_commits() {
+        let old_snapshot = RepositorySnapshot::empty(
+            RepositoryId(1),
+            Path::new("/repo").into(),
+            None,
+            None,
+            None,
+            PathStyle::local(),
+        );
+        let head_recent_commits: Arc<[CommitSummary]> = vec![
+            CommitSummary {
+                sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                subject: "Second commit".into(),
+                commit_timestamp: 2,
+                author_name: "Zed".into(),
+                has_parent: true,
+            },
+            CommitSummary {
+                sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                subject: "Initial commit".into(),
+                commit_timestamp: 1,
+                author_name: "Zed".into(),
+                has_parent: false,
+            },
+        ]
+        .into();
+        let mut snapshot = old_snapshot.clone();
+        snapshot.head_commit = Some(CommitDetails {
+            sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            message: "Second commit".into(),
+            commit_timestamp: 2,
+            author_email: "zed@example.com".into(),
+            author_name: "Zed".into(),
+        });
+        snapshot.head_recent_commits = head_recent_commits.clone();
+
+        for update in [
+            snapshot.initial_update(7),
+            snapshot.build_update(&old_snapshot, 7),
+        ] {
+            let decoded = proto_to_head_recent_commits(update.head_commit_details.as_ref(), None);
+            assert_eq!(decoded, head_recent_commits);
+        }
+
+        let mut cleared_snapshot = snapshot.clone();
+        cleared_snapshot.head_recent_commits = Arc::from([]);
+        let cleared_update = cleared_snapshot.build_update(&snapshot, 7);
+        assert!(
+            cleared_update
+                .head_commit_details
+                .as_ref()
+                .and_then(|head_commit| head_commit.head_recent_commits.as_ref())
+                .is_some()
+        );
+        assert!(
+            proto_to_head_recent_commits(
+                cleared_update.head_commit_details.as_ref(),
+                head_recent_commits.first(),
+            )
+            .is_empty()
+        );
+
+        let removed_head_update = old_snapshot.build_update(&snapshot, 7);
+        assert!(
+            proto_to_head_recent_commits(removed_head_update.head_commit_details.as_ref(), None)
+                .is_empty()
+        );
     }
 
     type TestPasswordPrompt = (
@@ -12323,9 +12489,24 @@ async fn compute_snapshot(
         let backend = backend.clone();
         async move { backend.worktrees().await.log_err().unwrap_or_default() }
     };
-    let (branches, head_commit, all_worktrees) =
-        futures::future::join3(branches_future, head_commit_future, worktrees_future).await;
-    log::debug!("fetched branches, head commit, worktrees");
+    let recent_commits_future = {
+        let backend = backend.clone();
+        async move {
+            backend
+                .recent_commits(HEAD_RECENT_COMMITS_COUNT)
+                .await
+                .log_err()
+                .unwrap_or_default()
+        }
+    };
+    let (branches, head_commit, all_worktrees, head_recent_commits) = futures::future::join4(
+        branches_future,
+        head_commit_future,
+        worktrees_future,
+        recent_commits_future,
+    )
+    .await;
+    log::debug!("fetched branches, head commit, worktrees, recent commits");
 
     let BranchesScanResult {
         branches,
@@ -12333,6 +12514,7 @@ async fn compute_snapshot(
     } = branches;
     let branch = branches.iter().find(|branch| branch.is_head).cloned();
     let branch_list: Arc<[Branch]> = branches.into();
+    let head_recent_commits: Arc<[CommitSummary]> = head_recent_commits.into();
 
     let linked_worktrees: Arc<[GitWorktree]> = all_worktrees
         .into_iter()
@@ -12359,6 +12541,7 @@ async fn compute_snapshot(
             branch_list: branch_list.clone(),
             branch_list_error,
             head_commit,
+            head_recent_commits,
             remote_origin_url,
             remote_upstream_url,
             linked_worktrees,

@@ -7,6 +7,7 @@ use crate::commit_context_menu::{
 use crate::commit_modal::CommitModal;
 use crate::commit_tooltip::{CommitAvatar, CommitTooltip};
 use crate::commit_view::CommitView;
+use crate::git_graph::Open;
 use crate::git_panel_settings::GitPanelScrollbarAccessor;
 use crate::project_diff::{DeployBranchDiff, Diff, ProjectDiff};
 use crate::remote_output::{self, RemoteAction, SuccessMessage};
@@ -6767,71 +6768,80 @@ impl GitPanel {
             )
     }
 
-    fn render_previous_commit(
+    fn render_recent_commits(
         &self,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
         let active_repository = self.active_repository.as_ref()?;
-        let branch = active_repository.read(cx).branch.as_ref()?;
-        let commit = branch.most_recent_commit.as_ref()?.clone();
+        let recent_commits = active_repository.read(cx).head_recent_commits.clone();
+        if recent_commits.is_empty() {
+            return None;
+        }
+
         let workspace = self.workspace.clone();
         let this = cx.entity();
+        let has_unstaged = self.has_unstaged_changes();
 
         Some(
-            h_flex()
-                .p_1p5()
-                .gap_1p5()
-                .justify_between()
+            v_flex()
                 .border_t_1()
                 .border_color(cx.theme().colors().border.opacity(0.8))
-                .child(
-                    div()
-                        .id("commit-msg-hover")
-                        .cursor_pointer()
-                        .px_1()
-                        .rounded_sm()
-                        .line_clamp(1)
-                        .hover(|s| s.bg(cx.theme().colors().element_hover))
-                        .child(
-                            Label::new(commit.subject.clone())
-                                .size(LabelSize::Small)
-                                .truncate(),
-                        )
-                        .on_click({
-                            let commit = commit.clone();
-                            let repo = active_repository.downgrade();
-                            move |_, window, cx| {
-                                CommitView::open(
-                                    commit.sha.to_string(),
-                                    repo.clone(),
-                                    workspace.clone(),
-                                    None,
-                                    None,
-                                    window,
-                                    cx,
-                                );
-                            }
-                        })
-                        .hoverable_tooltip({
-                            let repo = active_repository.clone();
-                            move |window, cx| {
-                                GitPanelMessageTooltip::new(
-                                    this.clone(),
-                                    commit.sha.clone(),
-                                    repo.clone(),
-                                    window,
-                                    cx,
-                                )
-                                .into()
-                            }
-                        }),
-                )
-                .child(
+                .children(recent_commits.iter().enumerate().map(|(index, commit)| {
+                    let is_head = index == 0;
+                    let commit = commit.clone();
+                    let row_id = SharedString::from(format!("recent-commit-{index}"));
                     h_flex()
-                        .gap_0p5()
-                        .when(commit.has_parent, |this| {
-                            let has_unstaged = self.has_unstaged_changes();
+                        .px_1p5()
+                        .py_0p5()
+                        .gap_1p5()
+                        .justify_between()
+                        .child(
+                            div()
+                                .id(row_id)
+                                .cursor_pointer()
+                                .px_1()
+                                .rounded_sm()
+                                .line_clamp(1)
+                                .hover(|s| s.bg(cx.theme().colors().element_hover))
+                                .child(
+                                    Label::new(commit.subject.clone())
+                                        .size(LabelSize::Small)
+                                        .truncate(),
+                                )
+                                .on_click({
+                                    let commit = commit.clone();
+                                    let repo = active_repository.downgrade();
+                                    let workspace = workspace.clone();
+                                    move |_, window, cx| {
+                                        CommitView::open(
+                                            commit.sha.to_string(),
+                                            repo.clone(),
+                                            workspace.clone(),
+                                            None,
+                                            None,
+                                            window,
+                                            cx,
+                                        );
+                                    }
+                                })
+                                .hoverable_tooltip({
+                                    let this = this.clone();
+                                    let repo = active_repository.clone();
+                                    let sha = commit.sha.clone();
+                                    move |window, cx| {
+                                        GitPanelMessageTooltip::new(
+                                            this.clone(),
+                                            sha.clone(),
+                                            repo.clone(),
+                                            window,
+                                            cx,
+                                        )
+                                        .into()
+                                    }
+                                }),
+                        )
+                        .when(is_head && commit.has_parent, |this| {
                             this.child(
                                 IconButton::new("undo", IconName::Undo)
                                     .icon_size(IconSize::Small)
@@ -6854,21 +6864,7 @@ impl GitPanel {
                                     ),
                             )
                         })
-                        .child(
-                            IconButton::new("git-graph-button", IconName::GitGraph)
-                                .icon_size(IconSize::Small)
-                                .tooltip(|_window, cx| {
-                                    Tooltip::for_action(
-                                        "Open Git Graph",
-                                        &crate::git_graph::Open,
-                                        cx,
-                                    )
-                                })
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(crate::git_graph::Open.boxed_clone(), cx)
-                                }),
-                        ),
-                ),
+                })),
         )
     }
 
@@ -9045,7 +9041,7 @@ impl Render for GitPanel {
                                 this.child(self.render_pending_amend(cx))
                             })
                             .when(!self.amend_pending, |this| {
-                                this.children(self.render_previous_commit(window, cx))
+                                this.children(self.render_recent_commits(window, cx))
                             }),
                         GitPanelTab::History => this.child(self.render_history_tab(window, cx)),
                     })
@@ -9423,13 +9419,29 @@ impl RenderOnce for PanelRepoFooter {
                             },
                         )
                     })
-                    .child(div().child(branch_selector).min_w_0()),
+                    .child(div().child(branch_selector).min_w_0())
+                    .when(self.git_panel.is_some(), |this| {
+                        this.child(
+                            IconButton::new("git-graph-button", IconName::GitGraph)
+                                .icon_size(IconSize::Small)
+                                .tooltip(|_window, cx| {
+                                    Tooltip::for_action("Open Git Graph", &Open, cx)
+                                })
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(Open.boxed_clone(), cx)
+                                }),
+                        )
+                    }),
             )
-            .children(if let Some(git_panel) = self.git_panel {
-                git_panel.update(cx, |git_panel, cx| git_panel.render_remote_button(cx))
-            } else {
-                None
-            })
+            .child(
+                h_flex()
+                    .gap_1()
+                    .children(if let Some(git_panel) = self.git_panel {
+                        git_panel.update(cx, |git_panel, cx| git_panel.render_remote_button(cx))
+                    } else {
+                        None
+                    }),
+            )
     }
 }
 

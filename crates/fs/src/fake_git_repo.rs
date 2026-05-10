@@ -12,9 +12,9 @@ use git::{
     blame::Blame,
     repository::{
         AskPassDelegate, Branch, CommitData, CommitDataReader, CommitDetails, CommitOptions,
-        CreateWorktreeTarget, FetchOptions, FileHistoryChangedFileSets, GRAPH_CHUNK_SIZE,
-        GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData, LogOrder, LogSource,
-        PushOptions, RefEdit, Remote, RepoPath, ResetMode, SearchCommitArgs, Worktree,
+        CommitSummary, CreateWorktreeTarget, FetchOptions, FileHistoryChangedFileSets,
+        GRAPH_CHUNK_SIZE, GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData, LogOrder,
+        LogSource, PushOptions, RefEdit, Remote, RepoPath, ResetMode, SearchCommitArgs, Worktree,
         commit_hash_search_query,
     },
     stash::GitStash,
@@ -551,6 +551,10 @@ impl GitRepository for FakeGitRepository {
             branches.sort_by(|a, b| a.ref_name.cmp(&b.ref_name));
             Ok(branches.into())
         })
+    }
+
+    fn recent_commits(&self, _count: usize) -> BoxFuture<'_, Result<Vec<CommitSummary>>> {
+        self.with_state_async(false, |_| Ok(Vec::new()))
     }
 
     fn worktrees(&self) -> BoxFuture<'_, Result<Vec<Worktree>>> {
