@@ -1540,6 +1540,7 @@ impl Item for TerminalView {
                         Label::new(title)
                             .single_line()
                             .color(params.text_color())
+                            .when(params.preview, |this| this.italic())
                             .when(self.is_renaming(), |this| this.alpha(0.)),
                     )
                     .when_some(self.rename_editor.clone(), |this, editor| {
