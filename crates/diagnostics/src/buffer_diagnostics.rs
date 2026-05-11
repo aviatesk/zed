@@ -833,7 +833,8 @@ impl Item for BufferDiagnosticsEditor {
                 .file_name()
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| self.project_path.path.display(path_style).to_string()),
-        );
+        )
+        .when(params.preview, |this| this.italic());
 
         h_flex()
             .gap_1()
