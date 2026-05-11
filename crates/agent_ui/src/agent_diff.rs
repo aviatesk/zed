@@ -533,6 +533,7 @@ impl Item for AgentDiffPane {
 
         Label::new(label_content)
             .when(!params.selected, |this| this.color(Color::Muted))
+            .when(params.preview, |this| this.italic())
             .into_any_element()
     }
 

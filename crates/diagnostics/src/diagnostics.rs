@@ -769,7 +769,11 @@ impl Item for ProjectDiagnosticsEditor {
                         h_flex()
                             .gap_1()
                             .child(Icon::new(IconName::Check).color(Color::Success))
-                            .child(Label::new("No problems").color(params.text_color())),
+                            .child(
+                                Label::new("No problems")
+                                    .color(params.text_color())
+                                    .when(params.preview, |this| this.italic()),
+                            ),
                     )
                 },
             )
