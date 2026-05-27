@@ -2883,6 +2883,16 @@ Sentence ending file2.rs.
         requests.next().await;
         cx.run_until_parked();
 
+        cx.assert_editor_text_highlights(
+            HighlightKey::DocumentLink,
+            indoc! {"
+            // See «LICENSE» for details
+            fn main() {
+                println!(\"hello\");
+            }ˇ
+        "},
+        );
+
         // Cmd-hover over "LICENSE" should highlight it as a link
         let screen_coord = cx.pixel_position(indoc! {"
             // See LICˇENSE for details

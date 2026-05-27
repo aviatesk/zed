@@ -1,6 +1,6 @@
 use collections::HashMap;
 use futures::future::join_all;
-use gpui::{App, Entity, Task};
+use gpui::{App, Entity, HighlightStyle, Task, UnderlineStyle, px};
 use itertools::Itertools;
 use language::{Buffer, BufferSnapshot};
 use lsp::LanguageServerId;
@@ -9,7 +9,7 @@ use settings::Settings;
 use text::BufferId;
 use ui::Context;
 
-use crate::{Editor, LSP_REQUEST_DEBOUNCE_TIMEOUT, editor_settings::EditorSettings};
+use crate::{Editor, HighlightKey, LSP_REQUEST_DEBOUNCE_TIMEOUT, editor_settings::EditorSettings};
 
 pub(super) struct LspDocumentLinks {
     pub(super) enabled: bool,
@@ -34,9 +34,11 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         if !self.lsp_data_enabled() || !self.lsp_document_links.enabled {
+            self.clear_highlights(HighlightKey::DocumentLink, cx);
             return;
         }
         let Some(project) = self.project.as_ref().map(|p| p.downgrade()) else {
+            self.clear_highlights(HighlightKey::DocumentLink, cx);
             return;
         };
 
@@ -54,6 +56,7 @@ impl Editor {
             .collect::<Vec<_>>();
         if buffers_to_query.is_empty() {
             self.lsp_document_links.refresh_task = Task::ready(());
+            self.update_document_link_highlights(cx);
             return;
         }
 
@@ -82,7 +85,7 @@ impl Editor {
 
             let new_links_for_buffers = join_all(tasks_for_buffers).await;
             editor
-                .update(cx, |editor, _| {
+                .update(cx, |editor, cx| {
                     for (buffer_id, links) in new_links_for_buffers {
                         let Some(links) = links else {
                             continue;
@@ -96,6 +99,7 @@ impl Editor {
                                 .insert(buffer_id, links);
                         }
                     }
+                    editor.update_document_link_highlights(cx);
                 })
                 .ok();
         });
@@ -196,6 +200,47 @@ impl Editor {
                 .map(|(server_id, _, link)| (server_id, link))
                 .collect()
         }))
+    }
+
+    pub(super) fn update_document_link_highlights(&mut self, cx: &mut Context<Self>) {
+        if !self.lsp_document_links.enabled || self.lsp_document_links.per_buffer.is_empty() {
+            self.clear_highlights(HighlightKey::DocumentLink, cx);
+            return;
+        }
+
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let mut ranges = self
+            .lsp_document_links
+            .per_buffer
+            .values()
+            .flat_map(|links_by_server| links_by_server.values())
+            .flat_map(|links| links.values())
+            .filter_map(|link| snapshot.buffer_anchor_range_to_anchor_range(link.range.clone()))
+            .collect::<Vec<_>>();
+
+        if ranges.is_empty() {
+            self.clear_highlights(HighlightKey::DocumentLink, cx);
+            return;
+        }
+
+        ranges.sort_by(|left, right| {
+            left.start
+                .cmp(&right.start, &snapshot)
+                .then_with(|| left.end.cmp(&right.end, &snapshot))
+        });
+
+        self.highlight_text(
+            HighlightKey::DocumentLink,
+            ranges,
+            HighlightStyle {
+                underline: Some(UnderlineStyle {
+                    thickness: px(1.),
+                    ..UnderlineStyle::default()
+                }),
+                ..HighlightStyle::default()
+            },
+            cx,
+        );
     }
 }
 
