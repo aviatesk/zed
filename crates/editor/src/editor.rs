@@ -10212,6 +10212,7 @@ impl Editor {
                         display_map.clear_lsp_folding_ranges(*buffer_id, cx);
                     });
                 }
+                self.update_document_link_highlights(cx);
 
                 self.display_map.update(cx, |display_map, cx| {
                     display_map.unfold_buffers(removed_buffer_ids.iter().copied(), cx);
@@ -10484,6 +10485,7 @@ impl Editor {
                 } else {
                     self.lsp_document_links.per_buffer.clear();
                     self.clear_lsp_data_tasks(LspDataKind::DocumentLinks);
+                    self.clear_highlights(HighlightKey::DocumentLink, cx);
                 }
             }
 
