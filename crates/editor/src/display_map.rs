@@ -172,6 +172,7 @@ pub enum HighlightKey {
     DebugStackFrameLine,
     DocumentHighlightRead,
     DocumentHighlightWrite,
+    DocumentLink,
     EditPredictionHighlight,
     Editor,
     HighlightOnYank,
