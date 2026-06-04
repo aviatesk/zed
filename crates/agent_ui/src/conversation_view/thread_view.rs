@@ -256,6 +256,13 @@ struct ParsedCatNumberedCode {
     line_count: usize,
 }
 
+struct ParsedReadBufferCode {
+    file_path: String,
+    total_lines: u32,
+    code: String,
+    is_dirty: bool,
+}
+
 fn parse_cat_numbered_markdown_code_block(markdown: &str) -> Option<ParsedCatNumberedCode> {
     let (_tag, code) = parse_single_fenced_code_block(markdown)?;
     parse_cat_numbered_code(code)
@@ -272,9 +279,44 @@ fn parse_single_fenced_code_block(markdown: &str) -> Option<(&str, &str)> {
     let tag_end = after_opening_fence.find('\n')?;
     let tag = &after_opening_fence[..tag_end];
     let after_tag = &after_opening_fence[tag_end + 1..];
-    let closing_fence = format!("\n{fence}\n");
-    let code = after_tag.strip_suffix(&closing_fence)?;
+    let closing_fence_with_newline = format!("\n{fence}\n");
+    let closing_fence_without_newline = format!("\n{fence}");
+    let code = after_tag
+        .strip_suffix(&closing_fence_with_newline)
+        .or_else(|| after_tag.strip_suffix(&closing_fence_without_newline))?;
     Some((tag, code))
+}
+
+fn parse_read_buffer_markdown_code_block(markdown: &str) -> Option<ParsedReadBufferCode> {
+    const DIRTY_NOTE: &str = "(buffer is dirty — shown content includes unsaved user edits)";
+
+    let (is_dirty, body) = if let Some(body) = markdown
+        .strip_prefix(DIRTY_NOTE)
+        .and_then(|body| body.strip_prefix('\n'))
+    {
+        (true, body)
+    } else {
+        (false, markdown)
+    };
+
+    let (header, fenced_code) = body.split_once('\n')?;
+    let (file_path, total_lines) = parse_read_buffer_header(header)?;
+    let (_tag, code) = parse_single_fenced_code_block(fenced_code)?;
+
+    Some(ParsedReadBufferCode {
+        file_path: file_path.to_string(),
+        total_lines,
+        code: code.to_string(),
+        is_dirty,
+    })
+}
+
+fn parse_read_buffer_header(header: &str) -> Option<(&str, u32)> {
+    let (file_path, line_info) = header.rsplit_once(" (")?;
+    let line_count = line_info
+        .strip_suffix(" lines)")
+        .or_else(|| line_info.strip_suffix(" line)"))?;
+    Some((file_path, line_count.parse().ok()?))
 }
 
 /// Walks `code` exactly once: for each line it validates and strips the
@@ -435,6 +477,52 @@ fn render_cat_numbered_code_block(
         .into_any_element()
 }
 
+fn render_plain_code_block(
+    code: SharedString,
+    language: Option<Arc<Language>>,
+    markdown_style: MarkdownStyle,
+    copy_button_id: String,
+) -> AnyElement {
+    let mut code_text_style = markdown_style.base_text_style.clone();
+    code_text_style.refine(&markdown_style.code_block.text);
+
+    let code_runs = highlight_code_runs(&code, language.as_ref(), code_text_style, &markdown_style);
+    let code_text = StyledText::new(code.clone()).with_runs(code_runs);
+
+    let code_block_id = format!("read-buffer-code-block-{copy_button_id}");
+    let code_scroll_id = format!("read-buffer-code-scroll-{copy_button_id}");
+    let mut container = div()
+        .id(code_block_id)
+        .group("read-buffer-code-block")
+        .relative()
+        .w_full()
+        .whitespace_nowrap();
+    container.style().refine(&markdown_style.code_block);
+
+    let mut code_scroll = div()
+        .id(code_scroll_id)
+        .flex()
+        .flex_1()
+        .min_w_0()
+        .overflow_x_scroll()
+        .child(div().flex_none().child(code_text));
+    code_scroll.style().restrict_scroll_to_axis = Some(true);
+
+    container
+        .child(code_scroll)
+        .child(
+            h_flex()
+                .w_4()
+                .absolute()
+                .top_0()
+                .right_0()
+                .justify_end()
+                .visible_on_hover("read-buffer-code-block")
+                .child(CopyButton::new(copy_button_id, code).tooltip_label("Copy Code")),
+        )
+        .into_any_element()
+}
+
 fn highlight_code_runs(
     code: &str,
     language: Option<&Arc<Language>>,
@@ -510,6 +598,35 @@ mod numbered_code_block_tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn parses_read_buffer_markdown_code_block() {
+        let parsed = parse_read_buffer_markdown_code_block(
+            "README.md (47 lines)\n```\nline one\nline two\n```\n",
+        )
+        .expect("read_buffer output should parse");
+
+        assert_eq!(parsed.file_path, "README.md");
+        assert_eq!(parsed.total_lines, 47);
+        assert_eq!(parsed.code, "line one\nline two");
+        assert!(!parsed.is_dirty);
+    }
+
+    #[test]
+    fn parses_read_buffer_dirty_output_without_trailing_newline() {
+        let parsed = parse_read_buffer_markdown_code_block(
+            "(buffer is dirty — shown content includes unsaved user edits)\ncrates/agent_ui/src/conversation_view/thread_view.rs (2 lines)\n```\nfn main() {}\n```",
+        )
+        .expect("dirty read_buffer output should parse");
+
+        assert_eq!(
+            parsed.file_path,
+            "crates/agent_ui/src/conversation_view/thread_view.rs"
+        );
+        assert_eq!(parsed.total_lines, 2);
+        assert_eq!(parsed.code, "fn main() {}");
+        assert!(parsed.is_dirty);
     }
 }
 
@@ -8184,7 +8301,10 @@ impl ThreadView {
         window: &Window,
         cx: &Context<Self>,
     ) -> Div {
-        let has_location = tool_call.locations.len() == 1;
+        // First-only file-link header: when multiple files are touched, we
+        // surface the first location as the primary jump target. Other
+        // locations remain accessible via the diff views below.
+        let has_location = !tool_call.locations.is_empty();
         let card_header_id = SharedString::from(format!("inner-tool-call-header-{entry_ix}"));
 
         let failed_or_canceled = match &tool_call.status {
@@ -9987,7 +10107,10 @@ impl ThreadView {
         window: &Window,
         cx: &Context<Self>,
     ) -> Div {
-        let has_location = tool_call.locations.len() == 1;
+        // First-only file-link header (see also `render_tool_call_card`):
+        // multi-file edits surface their first location as the primary
+        // jump target; the rest is reachable via the diff views below.
+        let has_location = !tool_call.locations.is_empty();
         let is_file = tool_call.kind == acp::ToolKind::Edit && has_location;
         let is_subagent_tool_call = tool_call.is_subagent();
 
@@ -10435,7 +10558,7 @@ impl ThreadView {
     ) -> AnyElement {
         let markdown_style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
         let output = self
-            .render_numbered_read_file_output(
+            .render_read_buffer_output(
                 markdown.clone(),
                 entry_ix,
                 context_ix,
@@ -10443,6 +10566,16 @@ impl ThreadView {
                 markdown_style.clone(),
                 cx,
             )
+            .or_else(|| {
+                self.render_numbered_read_file_output(
+                    markdown.clone(),
+                    entry_ix,
+                    context_ix,
+                    tool_call,
+                    markdown_style.clone(),
+                    cx,
+                )
+            })
             .unwrap_or_else(|| {
                 self.render_markdown(markdown, markdown_style, cx)
                     .into_any()
@@ -10467,6 +10600,85 @@ impl ThreadView {
             .text_color(cx.theme().colors().text_muted)
             .child(output)
             .into_any_element()
+    }
+
+    fn render_read_buffer_output(
+        &self,
+        markdown: Entity<Markdown>,
+        entry_ix: usize,
+        context_ix: usize,
+        tool_call: &ToolCall,
+        markdown_style: MarkdownStyle,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let is_read_buffer = tool_call
+            .tool_name
+            .as_ref()
+            .is_some_and(|tool_name| tool_name.as_ref() == "read_buffer");
+        if !is_read_buffer {
+            return None;
+        }
+
+        let (parsed, language) = {
+            let markdown = markdown.read(cx);
+            (
+                parse_read_buffer_markdown_code_block(markdown.source())?,
+                markdown.first_code_block_language(),
+            )
+        };
+
+        let header = h_flex()
+            .w_full()
+            .justify_between()
+            .items_center()
+            .gap_2()
+            .child(
+                Label::new(parsed.file_path.clone())
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
+                    .buffer_font(cx)
+                    .truncate(),
+            )
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .items_center()
+                    .child(
+                        Label::new(format!(
+                            "{} {}",
+                            parsed.total_lines,
+                            if parsed.total_lines == 1 {
+                                "line"
+                            } else {
+                                "lines"
+                            }
+                        ))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .buffer_font(cx),
+                    )
+                    .when(parsed.is_dirty, |this| {
+                        this.child(
+                            Label::new("Unsaved edits")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Warning)
+                                .buffer_font(cx),
+                        )
+                    }),
+            );
+
+        Some(
+            v_flex()
+                .gap_1()
+                .child(header)
+                .child(render_plain_code_block(
+                    parsed.code.into(),
+                    language,
+                    markdown_style,
+                    format!("copy-read-buffer-output-{entry_ix}-{context_ix}"),
+                ))
+                .into_any_element(),
+        )
     }
 
     fn render_numbered_read_file_output(

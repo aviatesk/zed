@@ -1,11 +1,12 @@
 use crate::{
     ApplyCodeActionTool, AskUserTool, CodeActionStore, ContextServerRegistry, CopyPathTool,
     CreateDirectoryTool, CreateThreadTool, DbLanguageModel, DbThread, DeletePathTool,
-    DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool, GetCodeActionsTool,
-    GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool, MovePathTool,
-    ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentTool,
+    DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool, FormatDocumentTool,
+    GetCodeActionsTool, GoToDefinitionTool, GrepTool, HoverTool, ListAgentsAndModelsTool,
+    ListDirectoryTool, ListLanguageServersTool, MovePathTool, ProjectSnapshot, ReadFileTool,
+    RenameTool, RestartLanguageServerTool, SandboxedTerminalTool, SpawnAgentTool,
     SystemPromptTemplate, Template, Templates, TerminalTool, ToolPermissionDecision, WebSearchTool,
-    WriteFileTool, decide_permission_from_settings,
+    WorkspaceSymbolTool, WriteFileTool, decide_permission_from_settings,
 };
 use acp_thread::{ClientUserMessageId, MentionUri};
 use action_log::ActionLog;
@@ -2162,7 +2163,7 @@ impl Thread {
             self.project.clone(),
             cx.weak_entity(),
             self.action_log.clone(),
-            language_registry,
+            language_registry.clone(),
         ));
         self.add_tool(FetchTool::new(self.project.read(cx).client().http_client()));
         self.add_tool(FindPathTool::new(self.project.clone()));
@@ -2189,6 +2190,10 @@ impl Thread {
 
         let code_action_store: CodeActionStore = cx.new(|_cx| None);
         self.add_tool(FindReferencesTool::new(self.project.clone()));
+        self.add_tool(FormatDocumentTool::new(
+            self.project.clone(),
+            language_registry.clone(),
+        ));
         self.add_tool(GetCodeActionsTool::new(
             self.project.clone(),
             code_action_store.clone(),
@@ -2196,9 +2201,14 @@ impl Thread {
         self.add_tool(ApplyCodeActionTool::new(
             self.project.clone(),
             code_action_store,
+            language_registry.clone(),
         ));
         self.add_tool(GoToDefinitionTool::new(self.project.clone()));
-        self.add_tool(RenameTool::new(self.project.clone()));
+        self.add_tool(HoverTool::new(self.project.clone()));
+        self.add_tool(WorkspaceSymbolTool::new(self.project.clone()));
+        self.add_tool(ListLanguageServersTool::new(self.project.clone()));
+        self.add_tool(RestartLanguageServerTool::new(self.project.clone()));
+        self.add_tool(RenameTool::new(self.project.clone(), language_registry));
 
         if self.depth() < MAX_SUBAGENT_DEPTH {
             self.add_tool(SpawnAgentTool::new(environment.clone()));

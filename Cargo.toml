@@ -6,6 +6,7 @@ members = [
     "crates/action_log",
     "crates/activity_indicator",
     "crates/agent",
+    "crates/agent_lsp",
     "crates/agent_servers",
     "crates/agent_settings",
     "crates/agent_skills",
@@ -281,6 +282,7 @@ acp_tools = { path = "crates/acp_tools" }
 action_log = { path = "crates/action_log" }
 activity_indicator = { path = "crates/activity_indicator" }
 agent = { path = "crates/agent" }
+agent_lsp = { path = "crates/agent_lsp" }
 agent_servers = { path = "crates/agent_servers" }
 agent_settings = { path = "crates/agent_settings" }
 agent_skills = { path = "crates/agent_skills" }
@@ -521,6 +523,7 @@ accesskit_windows = "0.34"
 agent-client-protocol = { version = "=2.1.0", features = ["unstable"] }
 aho-corasick = "1.1"
 alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "4c129667ce56611becdc82de6e28218c80e2e88f" }
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio"] }
 any_vec = "0.14"
 anyhow = "1.0.86"
 arc-swap = "1.9.0"

@@ -1,14 +1,13 @@
-use std::fmt::Write;
 use std::sync::Arc;
 
 use agent_client_protocol::schema::v1 as acp;
-use collections::HashSet;
 use gpui::{App, Entity, SharedString, Task};
+use language::LanguageRegistry;
 use project::Project;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::symbol_locator::SymbolLocator;
+use super::{LspEditToolOutput, symbol_locator::SymbolLocator};
 use crate::{AgentTool, ToolCallEventStream, ToolInput};
 
 /// Renames a symbol across the project using the language server.
@@ -27,17 +26,21 @@ pub struct RenameToolInput {
 
 pub struct RenameTool {
     project: Entity<Project>,
+    language_registry: Arc<LanguageRegistry>,
 }
 
 impl RenameTool {
-    pub fn new(project: Entity<Project>) -> Self {
-        Self { project }
+    pub fn new(project: Entity<Project>, language_registry: Arc<LanguageRegistry>) -> Self {
+        Self {
+            project,
+            language_registry,
+        }
     }
 }
 
 impl AgentTool for RenameTool {
     type Input = RenameToolInput;
-    type Output = String;
+    type Output = LspEditToolOutput;
 
     const NAME: &'static str = "rename_symbol";
 
@@ -64,63 +67,43 @@ impl AgentTool for RenameTool {
     fn run(
         self: Arc<Self>,
         input: ToolInput<Self::Input>,
-        _event_stream: ToolCallEventStream,
+        event_stream: ToolCallEventStream,
         cx: &mut App,
-    ) -> Task<Result<String, String>> {
+    ) -> Task<Result<Self::Output, Self::Output>> {
         let project = self.project.clone();
+        let language_registry = self.language_registry.clone();
         cx.spawn(async move |cx| {
-            let input = input
-                .recv()
-                .await
-                .map_err(|e| format!("Failed to receive tool input: {e}"))?;
+            let input = input.recv().await.map_err(|e| {
+                LspEditToolOutput::Text(format!("Failed to receive tool input: {e}"))
+            })?;
 
-            let resolved = input.symbol.resolve(&project, cx).await?;
-
-            let rename_task = project.update(cx, |project, cx| {
-                project.perform_rename(
-                    resolved.buffer.clone(),
-                    resolved.position,
-                    input.new_name.clone(),
-                    None,
-                    cx,
-                )
-            });
-
-            let transaction = rename_task
-                .await
-                .map_err(|e| format!("Rename failed: {e}"))?;
-
-            if transaction.0.is_empty() {
-                return Ok(format!(
-                    "No changes were made. The language server could not rename '{}'.",
-                    input.symbol.symbol_name
-                ));
-            }
-
-            let buffers = transaction.0.keys().cloned().collect::<HashSet<_>>();
-            project
-                .update(cx, |project, cx| project.save_buffers(buffers, cx))
-                .await
-                .map_err(|e| format!("Rename succeeded, but failed to save renamed files: {e}"))?;
-
-            let mut output = format!(
-                "Renamed `{}` to `{}` in {} file(s):\n",
-                input.symbol.symbol_name,
+            let output = agent_lsp::rename_symbol(
+                project,
+                agent_lsp::SymbolLocator::new(
+                    input.symbol.file_path,
+                    input.symbol.line,
+                    input.symbol.symbol_name,
+                ),
                 input.new_name,
-                transaction.0.len()
-            );
+                cx,
+            )
+            .await
+            .map(LspEditToolOutput::from_agent_lsp)
+            .map_err(LspEditToolOutput::Text)?;
 
-            for (buffer, _) in &transaction.0 {
-                buffer.read_with(cx, |buffer, cx| {
-                    let path = buffer
-                        .file()
-                        .map(|f| f.full_path(cx).display().to_string())
-                        .unwrap_or_else(|| "<untitled>".to_string());
-                    writeln!(output, "- {path}").ok();
-                });
-            }
-
+            cx.update(|cx| output.emit_diffs(&event_stream, language_registry, cx));
             Ok(output)
         })
+    }
+
+    fn replay(
+        &self,
+        _input: Self::Input,
+        output: Self::Output,
+        event_stream: ToolCallEventStream,
+        cx: &mut App,
+    ) -> anyhow::Result<()> {
+        output.emit_diffs(&event_stream, self.language_registry.clone(), cx);
+        Ok(())
     }
 }

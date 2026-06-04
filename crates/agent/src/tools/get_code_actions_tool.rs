@@ -1,4 +1,3 @@
-use std::fmt::Write;
 use std::sync::Arc;
 
 use agent_client_protocol::schema::v1 as acp;
@@ -7,7 +6,7 @@ use project::Project;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::symbol_locator::{CodeActionStore, PendingCodeActions, SymbolLocator};
+use super::symbol_locator::{CodeActionStore, SymbolLocator};
 use crate::{AgentTool, ToolCallEventStream, ToolInput};
 
 /// Gets the list of available code actions at a symbol location from the language server.
@@ -73,44 +72,19 @@ impl AgentTool for GetCodeActionsTool {
                 .await
                 .map_err(|e| format!("Failed to receive tool input: {e}"))?;
 
-            let resolved = input.symbol.resolve(&project, cx).await?;
-
-            let actions_task = project.update(cx, |project, cx| {
-                let range = resolved.position..resolved.position;
-                project.code_actions(&resolved.buffer, range, None, cx)
-            });
-
-            let actions = actions_task
-                .await
-                .map_err(|e| format!("Failed to get code actions: {e}"))?
-                .unwrap_or_default();
-
-            if actions.is_empty() {
-                store.update(cx, |store, _cx| *store = None);
-                return Ok(format!(
-                    "No code actions available for '{}' at this location.",
-                    input.symbol.symbol_name
-                ));
-            }
-
-            let mut output = format!("Found {} code action(s):\n", actions.len());
-            for (i, action) in actions.iter().enumerate() {
-                writeln!(output, "{}. {}", i + 1, action.lsp_action.title()).ok();
-            }
-            write!(
-                output,
-                "\nUse apply_code_action with the number of the action you want to apply."
-            )
-            .ok();
+            let symbol = agent_lsp::SymbolLocator::new(
+                input.symbol.file_path,
+                input.symbol.line,
+                input.symbol.symbol_name,
+            );
+            let output =
+                agent_lsp::get_code_actions(project, symbol, "apply_code_action", cx).await?;
 
             store.update(cx, |store, _cx| {
-                *store = Some(PendingCodeActions {
-                    actions,
-                    buffer: resolved.buffer,
-                });
+                *store = output.pending;
             });
 
-            Ok(output)
+            Ok(output.text)
         })
     }
 }

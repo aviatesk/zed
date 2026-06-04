@@ -6330,9 +6330,14 @@ async fn test_lsp_tools_gated_by_feature_flag(cx: &mut TestAppContext) {
 
     let lsp_tool_names = [
         FindReferencesTool::NAME,
+        FormatDocumentTool::NAME,
         GetCodeActionsTool::NAME,
         ApplyCodeActionTool::NAME,
         GoToDefinitionTool::NAME,
+        HoverTool::NAME,
+        WorkspaceSymbolTool::NAME,
+        ListLanguageServersTool::NAME,
+        RestartLanguageServerTool::NAME,
     ];
 
     // All LSP tools and the rename tool should be registered on the thread
