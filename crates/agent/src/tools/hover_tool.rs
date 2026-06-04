@@ -8,35 +8,33 @@ use project::Project;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Jumps to the definition of a symbol using the language server.
+/// Gets hover information (type, signature, documentation) for a symbol using the language server.
 ///
-/// Returns the file path and line number of the symbol's definition, along with a snippet of the source code at that location.
-///
-/// Before using this tool, use read_file or grep to find the exact symbol name and line number of a usage you want to navigate from.
+/// Before using this tool, use read_file or grep to find the exact symbol name and line number.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-pub struct GoToDefinitionToolInput {
-    /// The symbol to find the definition of.
+pub struct HoverToolInput {
+    /// The symbol to request hover information for.
     pub symbol: SymbolLocator,
 }
 
-pub struct GoToDefinitionTool {
+pub struct HoverTool {
     project: Entity<Project>,
 }
 
-impl GoToDefinitionTool {
+impl HoverTool {
     pub fn new(project: Entity<Project>) -> Self {
         Self { project }
     }
 }
 
-impl AgentTool for GoToDefinitionTool {
-    type Input = GoToDefinitionToolInput;
+impl AgentTool for HoverTool {
+    type Input = HoverToolInput;
     type Output = String;
 
-    const NAME: &'static str = "go_to_definition";
+    const NAME: &'static str = "hover";
 
     fn kind() -> acp::ToolKind {
-        acp::ToolKind::Search
+        acp::ToolKind::Read
     }
 
     fn initial_title(
@@ -45,9 +43,9 @@ impl AgentTool for GoToDefinitionTool {
         _cx: &mut App,
     ) -> SharedString {
         if let Ok(input) = input {
-            format!("Go to definition of `{}`", input.symbol.symbol_name).into()
+            format!("Get hover info for `{}`", input.symbol.symbol_name).into()
         } else {
-            "Go to definition".into()
+            "Get hover info".into()
         }
     }
 
@@ -56,15 +54,14 @@ impl AgentTool for GoToDefinitionTool {
         input: ToolInput<Self::Input>,
         _event_stream: ToolCallEventStream,
         cx: &mut App,
-    ) -> Task<Result<String, String>> {
+    ) -> Task<Result<Self::Output, Self::Output>> {
         let project = self.project.clone();
         cx.spawn(async move |cx| {
             let input = input
                 .recv()
                 .await
-                .map_err(|e| format!("Failed to receive tool input: {e}"))?;
-
-            agent_lsp::go_to_definition(
+                .map_err(|error| format!("Failed to receive tool input: {error}"))?;
+            agent_lsp::hover(
                 project,
                 agent_lsp::SymbolLocator::new(
                     input.symbol.file_path,

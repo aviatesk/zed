@@ -1,5 +1,6 @@
 mod acp;
 mod custom;
+mod lsp_mcp_bridge;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod e2e_tests;

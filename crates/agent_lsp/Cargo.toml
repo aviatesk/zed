@@ -1,0 +1,22 @@
+[package]
+name = "agent_lsp"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lib]
+path = "src/agent_lsp.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+collections.workspace = true
+gpui.workspace = true
+language.workspace = true
+log.workspace = true
+lsp.workspace = true
+project.workspace = true
+serde.workspace = true
+text.workspace = true
+util.workspace = true
