@@ -1,7 +1,6 @@
-use std::fmt::Write;
 use std::sync::Arc;
 
-use super::symbol_locator::{LocationDisplay, SymbolLocator};
+use super::symbol_locator::SymbolLocator;
 use crate::{AgentTool, ToolCallEventStream, ToolInput};
 use agent_client_protocol::schema::v1 as acp;
 use gpui::{App, Entity, SharedString, Task};
@@ -65,38 +64,16 @@ impl AgentTool for FindReferencesTool {
                 .await
                 .map_err(|e| format!("Failed to receive tool input: {e}"))?;
 
-            let resolved = input.symbol.resolve(&project, cx).await?;
-
-            let references_task = project.update(cx, |project, cx| {
-                project.references(&resolved.buffer, resolved.position, cx)
-            });
-
-            let references = references_task
-                .await
-                .map_err(|e| format!("Find references failed: {e}"))?
-                .unwrap_or_default();
-
-            if references.is_empty() {
-                return Ok(format!(
-                    "No references found for '{}'.",
-                    input.symbol.symbol_name
-                ));
-            }
-
-            let mut output = format!(
-                "Found {} references to `{}`:\n",
-                references.len(),
-                input.symbol.symbol_name
-            );
-
-            for location in &references {
-                let display = location
-                    .buffer
-                    .read_with(cx, |_, cx| LocationDisplay::from_location(location, cx));
-                write!(output, "\n## {display}\n").ok();
-            }
-
-            Ok(output)
+            agent_lsp::find_references(
+                project,
+                agent_lsp::SymbolLocator::new(
+                    input.symbol.file_path,
+                    input.symbol.line,
+                    input.symbol.symbol_name,
+                ),
+                cx,
+            )
+            .await
         })
     }
 }

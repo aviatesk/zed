@@ -13,20 +13,26 @@ mod evals;
 mod fetch_tool;
 mod find_path_tool;
 mod find_references_tool;
+mod format_document_tool;
 mod get_code_actions_tool;
 mod go_to_definition_tool;
 mod grep_tool;
+mod hover_tool;
 mod list_agents_and_models_tool;
 mod list_directory_tool;
+mod list_language_servers_tool;
+mod lsp_edit_output;
 mod move_path_tool;
 mod read_file_tool;
 mod rename_tool;
+mod restart_language_server_tool;
 mod skill_tool;
 mod spawn_agent_tool;
 mod symbol_locator;
 mod terminal_tool;
 mod tool_permissions;
 mod web_search_tool;
+mod workspace_symbol_tool;
 mod write_file_tool;
 
 use crate::AgentTool;
@@ -82,14 +88,19 @@ pub use edit_file_tool::*;
 pub use fetch_tool::*;
 pub use find_path_tool::*;
 pub use find_references_tool::*;
+pub use format_document_tool::*;
 pub use get_code_actions_tool::*;
 pub use go_to_definition_tool::*;
 pub use grep_tool::*;
+pub use hover_tool::*;
 pub use list_agents_and_models_tool::*;
 pub use list_directory_tool::*;
+pub use list_language_servers_tool::*;
+pub use lsp_edit_output::*;
 pub use move_path_tool::*;
 pub use read_file_tool::*;
 pub use rename_tool::*;
+pub use restart_language_server_tool::*;
 pub use skill_tool::*;
 pub use spawn_agent_tool::*;
 pub use symbol_locator::*;
@@ -97,6 +108,7 @@ pub use symbol_locator::*;
 pub use terminal_tool::*;
 pub use tool_permissions::*;
 pub use web_search_tool::*;
+pub use workspace_symbol_tool::*;
 pub use write_file_tool::*;
 
 macro_rules! tools {
@@ -208,18 +220,23 @@ tools! {
     FetchTool,
     FindPathTool,
     FindReferencesTool,
+    FormatDocumentTool,
     GetCodeActionsTool,
     GoToDefinitionTool,
     GrepTool,
+    HoverTool,
     ListAgentsAndModelsTool,
     ListDirectoryTool,
+    ListLanguageServersTool,
     MovePathTool,
     ReadFileTool,
     RenameTool,
+    RestartLanguageServerTool,
     SkillTool,
     SpawnAgentTool,
     TerminalTool,
     WebSearchTool,
+    WorkspaceSymbolTool,
     WriteFileTool,
 }
 
@@ -234,9 +251,14 @@ pub fn tool_feature_flag_enabled(tool_name: &str, cx: &App) -> bool {
     match tool_name {
         RenameTool::NAME => cx.has_flag::<RenameToolFeatureFlag>(),
         FindReferencesTool::NAME
+        | FormatDocumentTool::NAME
         | GetCodeActionsTool::NAME
         | ApplyCodeActionTool::NAME
-        | GoToDefinitionTool::NAME => cx.has_flag::<LspToolFeatureFlag>(),
+        | GoToDefinitionTool::NAME
+        | HoverTool::NAME
+        | WorkspaceSymbolTool::NAME
+        | ListLanguageServersTool::NAME
+        | RestartLanguageServerTool::NAME => cx.has_flag::<LspToolFeatureFlag>(),
         CreateThreadTool::NAME | ListAgentsAndModelsTool::NAME => {
             cx.has_flag::<CreateThreadToolFeatureFlag>()
         }
