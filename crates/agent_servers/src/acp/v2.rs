@@ -268,6 +268,7 @@ impl AcpV2Connection {
             async move {
                 Self::connect(
                     agent_id,
+                    project.downgrade(),
                     agent_server_store,
                     Lines::new(outgoing, incoming),
                     info,
@@ -314,6 +315,7 @@ impl AcpV2Connection {
 
     async fn connect(
         id: AgentId,
+        project: WeakEntity<Project>,
         agent_server_store: WeakEntity<AgentServerStore>,
         transport: impl ConnectTo<Client> + 'static,
         info: acp::Implementation,
@@ -345,6 +347,8 @@ impl AcpV2Connection {
             request_elicitations: request_elicitations.clone(),
             active_request_scopes: Some(RefCell::new(Default::default())),
             accepts_subagent_updates: true,
+            project,
+            code_action_store: Rc::new(RefCell::new(None)),
         };
         let (mut client_runtime, shutdown) = runtime::ClientRuntime::new(context, cx);
         let dispatch_tx = client_runtime.sender();
@@ -2343,6 +2347,7 @@ mod tests {
             let client = bounded(
                 AcpV2Connection::connect(
                     AgentId::new("session-test"),
+                    project.downgrade(),
                     WeakEntity::new_invalid(),
                     client_transport,
                     acp::Implementation::new("test", "1"),
@@ -7481,6 +7486,7 @@ done
                 AcpV2Connection::connect(
                     AgentId::new("auth-test"),
                     WeakEntity::new_invalid(),
+                    WeakEntity::new_invalid(),
                     client_transport,
                     acp::Implementation::new("client-test", "1"),
                     AcpDebugLog::default(),
@@ -8118,6 +8124,7 @@ done
             AcpV2Connection::connect(
                 AgentId::new("v1-only"),
                 WeakEntity::new_invalid(),
+                WeakEntity::new_invalid(),
                 client_transport,
                 acp::Implementation::new("client", "1"),
                 AcpDebugLog::default(),
@@ -8202,6 +8209,7 @@ done
         let client = bounded(
             AcpV2Connection::connect(
                 AgentId::new("terminal-test"),
+                WeakEntity::new_invalid(),
                 store,
                 client_transport,
                 acp::Implementation::new("test", "1"),
@@ -8329,6 +8337,7 @@ exec sleep 60
         let connecting = cx.spawn(async move |mut cx| {
             AcpV2Connection::connect(
                 AgentId::new("pending-shutdown"),
+                WeakEntity::new_invalid(),
                 WeakEntity::new_invalid(),
                 transport,
                 acp::Implementation::new("client", "1"),
