@@ -41,7 +41,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::to_string_pretty;
 use settings::{Settings, SettingsStore};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::fmt::{Formatter, Write};
 use std::ops::Range;
@@ -111,6 +111,21 @@ pub fn tool_name_from_meta(meta: &Option<acp_v2::Meta>) -> Option<SharedString> 
         .and_then(|meta| meta.get(TOOL_NAME_META_KEY))
         .and_then(|value| value.as_str())
         .map(|name| SharedString::from(name.to_owned()))
+}
+
+fn tool_name_from_meta_or_title(meta: &Option<acp_v1::Meta>, title: &str) -> Option<SharedString> {
+    tool_name_from_meta(meta).or_else(|| {
+        zed_lsp_bridge_tool_name_from_title(title).map(|tool_name| tool_name.to_owned().into())
+    })
+}
+
+/// Agents report the bridge's tools under their MCP name, `mcp__zed-lsp-bridge__<tool>`,
+/// while Zed's renderers know them by `<tool>`.
+fn tool_name_from_name(name: &SharedString) -> SharedString {
+    match zed_lsp_bridge_tool_name_from_title(name) {
+        Some(tool_name) => tool_name.to_owned().into(),
+        None => name.clone(),
+    }
 }
 
 /// Creates ACP metadata containing the legacy tool-name field.
@@ -324,6 +339,62 @@ pub fn subagent_session_info_from_meta(meta: &Option<acp_v2::Meta>) -> Option<Su
     meta.as_ref()
         .and_then(|m| m.get(SUBAGENT_SESSION_INFO_META_KEY))
         .and_then(|v| serde_json::from_value(v.clone()).ok())
+}
+
+/// In-process side-channel between Zed's local LSP MCP bridge and the
+/// `AcpThread` that owns the ACP connection it lives on.
+///
+/// External ACP agents (claude-acp, gemini-cli, ...) do not transparently
+/// forward MCP response `_meta` to ACP `tool_call.meta`, and they impose
+/// per-message text-size limits that the bridge's full file before/after
+/// diffs blow past. Rather than try to smuggle structured data through the
+/// agent in the response payload, we publish it locally: the bridge pushes
+/// each tool result here, and `AcpThread`'s rewriter pops the matching entry
+/// when the agent's `tool_call_update` message comes back in. The agent
+/// itself is bypassed for structured data; it sees only a small text
+/// summary in its tool result.
+pub const MAX_BRIDGE_RESULTS: usize = 16;
+
+#[derive(Debug, Clone)]
+pub struct BridgeResultEntry {
+    /// Bare tool name as the bridge sees it (e.g. "apply_text_edit"),
+    /// without the `mcp__<server>__` prefix the agent adds when it surfaces
+    /// the tool to the user.
+    pub tool: String,
+    /// Same JSON shape as the bridge's `_meta.zed_bridge` envelope —
+    /// `{version, kind, tool, ...edit-specific fields}`.
+    pub payload: serde_json::Value,
+}
+
+pub type BridgeResultQueue = Arc<std::sync::Mutex<VecDeque<BridgeResultEntry>>>;
+
+pub fn new_bridge_result_queue() -> BridgeResultQueue {
+    Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(
+        MAX_BRIDGE_RESULTS,
+    )))
+}
+
+/// Push a freshly produced bridge result onto the queue, dropping the
+/// oldest entry if we are at capacity. Returns silently on lock poisoning;
+/// the rewriter will just fall back to the plain text rendering.
+pub fn enqueue_bridge_result(queue: &BridgeResultQueue, entry: BridgeResultEntry) {
+    let Ok(mut q) = queue.lock() else { return };
+    if q.len() >= MAX_BRIDGE_RESULTS {
+        q.pop_front();
+    }
+    q.push_back(entry);
+}
+
+/// Remove and return the oldest queued result for `tool`. Used by the
+/// rewriter when it sees a `mcp__zed-lsp-bridge__<tool>` tool-call update
+/// and needs the structured payload that the agent didn't forward.
+pub fn take_bridge_result_for_tool(
+    queue: &BridgeResultQueue,
+    tool: &str,
+) -> Option<BridgeResultEntry> {
+    let mut q = queue.lock().ok()?;
+    let pos = q.iter().position(|e| e.tool == tool)?;
+    q.remove(pos)
 }
 
 #[derive(Debug)]
@@ -1471,7 +1542,10 @@ impl ToolCall {
                 stored
             }
         };
-        let tool_name = name.clone().or_else(|| tool_name_from_meta(&meta));
+        let tool_name = name
+            .as_ref()
+            .map(tool_name_from_name)
+            .or_else(|| tool_name_from_meta_or_title(&meta, title.as_deref().unwrap_or("")));
         let subagent_session_info = subagent_session_info_from_meta(&meta);
         let sandbox_authorization_details = sandbox_authorization_details_from_meta(&meta);
         let sandbox_fallback_authorization_details =
@@ -1662,12 +1736,17 @@ impl ToolCall {
             self.name = name.take().map(SharedString::from);
         }
         let old_tool_name = self.tool_name.clone();
+        let patched_title = match &title {
+            MaybeUndefined::Value(title) => title.as_str(),
+            MaybeUndefined::Null => "",
+            MaybeUndefined::Undefined => self.title.as_deref().unwrap_or(""),
+        };
         match meta {
             ToolMetadataPatch::Legacy(meta) => {
                 if name_changed {
-                    self.tool_name = self.name.clone();
+                    self.tool_name = self.name.as_ref().map(tool_name_from_name);
                 } else if self.tool_name.is_none() {
-                    self.tool_name = tool_name_from_meta(&meta);
+                    self.tool_name = tool_name_from_meta_or_title(&meta, patched_title);
                 }
                 // Legacy extension hints are sticky; omitted or malformed hints
                 // have never cleared values received in an earlier v1 update.
@@ -1701,8 +1780,9 @@ impl ToolCall {
                 if name_changed || meta_changed {
                     self.tool_name = self
                         .name
-                        .clone()
-                        .or_else(|| tool_name_from_meta(&self.meta));
+                        .as_ref()
+                        .map(tool_name_from_name)
+                        .or_else(|| tool_name_from_meta_or_title(&self.meta, patched_title));
                 }
             }
         }
@@ -3895,6 +3975,25 @@ pub struct AcpThread {
     /// reveal text gradually without changing the authoritative message.
     streaming_text_buffer: Option<StreamingTextBuffer>,
     idle_sleep_prevention: IdleSleepPrevention,
+    /// Side-channel queue populated by Zed's local LSP MCP bridge whenever it
+    /// produces a tool result. The bridge and this thread live in the same
+    /// process, so we read structured payloads directly from here rather than
+    /// trying to round-trip them through the external ACP agent (which
+    /// strips MCP `_meta` and truncates the response text).
+    bridge_result_queue: Option<BridgeResultQueue>,
+    /// Cache of the bridge payload we've applied to a given tool call. Once a
+    /// tool call has been identified as belonging to the bridge, every
+    /// subsequent `ToolCallUpdate` for the same id re-applies the cached
+    /// `kind` and `diffs` — claude-acp likes to send a follow-up update with
+    /// a plain text content block after the result, which would otherwise
+    /// overwrite the proper diff renderer with raw markdown.
+    bridge_active_calls: HashMap<acp_v1::ToolCallId, serde_json::Value>,
+    /// Mapping from `tool_call_id` to the unprefixed bridge tool name (e.g.
+    /// `apply_text_edit`), populated from the initial `ToolCall.title` which
+    /// agents typically surface as `mcp__zed-lsp-bridge__<tool>`. The
+    /// rewriter consults this on a `ToolCallUpdate` to know which queue
+    /// entry to pop, instead of relying on agent-specific meta fields.
+    bridge_tool_names: HashMap<acp_v1::ToolCallId, String>,
 }
 
 enum IdleSleepPrevention {
@@ -4242,6 +4341,9 @@ impl AcpThread {
             ui_scroll_position: None,
             streaming_text_buffer: None,
             idle_sleep_prevention: IdleSleepPrevention::Inactive,
+            bridge_result_queue: None,
+            bridge_active_calls: HashMap::default(),
+            bridge_tool_names: HashMap::default(),
         }
     }
 
@@ -4293,6 +4395,14 @@ impl AcpThread {
                 subagent.invalidate_replayed_subagent_state(cx);
             });
         }
+    }
+
+    /// Wire this thread to the in-process bridge result queue. Called by the
+    /// ACP connection right after construction; downstream agents that don't
+    /// run the LSP MCP bridge leave this as `None` and the rewriter is a
+    /// no-op for them.
+    pub fn set_bridge_result_queue(&mut self, queue: BridgeResultQueue) {
+        self.bridge_result_queue = Some(queue);
     }
 
     pub fn parent_session_id(&self) -> Option<&acp_v2::SessionId> {
@@ -5212,9 +5322,16 @@ impl AcpThread {
                 );
             }
             acp_v1::SessionUpdate::ToolCall(tool_call) => {
+                record_zed_lsp_bridge_tool_name(&tool_call, &mut self.bridge_tool_names);
                 self.upsert_tool_call(tool_call, cx)?;
             }
-            acp_v1::SessionUpdate::ToolCallUpdate(tool_call_update) => {
+            acp_v1::SessionUpdate::ToolCallUpdate(mut tool_call_update) => {
+                rewrite_zed_lsp_bridge_tool_call_update(
+                    &mut tool_call_update,
+                    self.bridge_result_queue.as_ref(),
+                    &mut self.bridge_active_calls,
+                    &self.bridge_tool_names,
+                );
                 self.update_tool_call(tool_call_update, cx)?;
             }
             acp_v1::SessionUpdate::CompactionUpdate(compaction_update) => {
@@ -6625,7 +6742,14 @@ impl AcpThread {
             }
         }
         let id = update.tool_call_id.clone();
-        let patch = ToolCallPatch::protocol(update);
+        let mut patch = ToolCallPatch::protocol(update);
+        rewrite_zed_lsp_bridge_tool_call_patch(
+            &id,
+            &mut patch,
+            self.bridge_result_queue.as_ref(),
+            &mut self.bridge_active_calls,
+            &mut self.bridge_tool_names,
+        );
         self.upsert_tool_call_patch(id, patch, ToolCallOrigin::AcpV2, cx)
     }
 
@@ -8850,6 +8974,303 @@ fn update_markdown_in_place(markdown: &Entity<Markdown>, text: &str, cx: &mut Ap
     });
 }
 
+/// Pick up the bridge tool name from an initial `ToolCall`'s title so the
+/// rewriter can correlate later `ToolCallUpdate`s back to a queued bridge
+/// result. Agents surface MCP tools under names like
+/// `mcp__<server>__<tool>`; this captures the unprefixed `<tool>` part for
+/// every call that targets our server id (`zed-lsp-bridge`).
+///
+/// Using the title here keeps the rewriter agent-agnostic — it does not
+/// depend on agent-specific meta fields like `meta.claudeCode.toolName`.
+fn record_zed_lsp_bridge_tool_name(
+    tool_call: &acp_v1::ToolCall,
+    tool_names: &mut HashMap<acp_v1::ToolCallId, String>,
+) {
+    if let Some(tool) = zed_lsp_bridge_tool_name_from_title(&tool_call.title) {
+        tool_names.insert(tool_call.tool_call_id.clone(), tool.to_string());
+    }
+}
+
+fn zed_lsp_bridge_tool_name_from_title(title: &str) -> Option<&str> {
+    title
+        .strip_prefix(BRIDGE_TOOL_PREFIX)
+        .or_else(|| title.strip_prefix(CODEX_BRIDGE_TOOL_PREFIX))
+}
+
+/// Local-only rewriter for tool-call updates emitted by Zed's downstream
+/// LSP MCP bridge (see `crates/agent_servers/src/lsp_mcp_bridge.rs`).
+///
+/// The bridge is a Zed-specific extension and external ACP agents (Claude
+/// Code, Gemini CLI, ...) treat its outputs as generic MCP tool calls. They
+/// also do not transparently forward MCP response `_meta` to ACP
+/// `tool_call.meta`, and they impose size limits on the response text that
+/// the bridge's full before/after diffs blow past. So instead of trying to
+/// smuggle structured data through the agent, the bridge publishes each
+/// result onto an in-process queue ([`BridgeResultQueue`]); this rewriter
+/// pops the matching entry when the agent's tool-call update comes in and
+/// uses it to:
+///
+/// * override `acp_v1::ToolKind` so the call lands on the matching first-class
+///   renderer (Edit / Search / Read / ...);
+/// * for edit kind, synthesise `acp_v1::ToolCallContent::Diff` entries from
+///   the structured payload so the user gets the built-in language-aware
+///   diff view, default expanded.
+///
+/// Classified payloads are cached on `AcpThread::bridge_active_calls` so
+/// follow-up updates from the agent (claude-acp sends a `ContentBlock` with
+/// the response text *after* the result update, which would otherwise
+/// overwrite the diff renderer with raw markdown) re-apply the same kind
+/// and content. Correlation between `tool_call_id` and the bridge tool name
+/// uses the initial `ToolCall.title` (see [`record_zed_lsp_bridge_tool_name`]),
+/// so the trigger does not depend on agent-specific meta fields.
+fn rewrite_zed_lsp_bridge_tool_call_update(
+    update: &mut acp_v1::ToolCallUpdate,
+    queue: Option<&BridgeResultQueue>,
+    active: &mut HashMap<acp_v1::ToolCallId, serde_json::Value>,
+    tool_names: &HashMap<acp_v1::ToolCallId, String>,
+) {
+    let Some(payload_obj) =
+        resolve_zed_bridge_payload_obj(&update.tool_call_id, queue, active, tool_names)
+    else {
+        return;
+    };
+    let Some(result) = ZedBridgeToolResult::from_payload(&payload_obj) else {
+        return;
+    };
+
+    if let Some(tool) = result.tool {
+        update
+            .meta
+            .get_or_insert_with(acp_v1::Meta::default)
+            .insert(TOOL_NAME_META_KEY.to_string(), tool.into());
+    }
+    if let Some(kind) = result.kind {
+        update.fields.kind = Some(kind);
+    }
+    if let Some(content) = result.content {
+        update.fields.content = Some(content);
+    }
+    if let Some(locations) = result.locations {
+        update.fields.locations = Some(locations);
+    }
+    if let Some(title) = result.title {
+        update.fields.title = Some(title);
+    }
+}
+
+/// The ACP v2 counterpart of [`rewrite_zed_lsp_bridge_tool_call_update`]. v2 reports a
+/// tool call and its updates with the same message, so this also records the bridge
+/// tool name that v1 takes from the initial `ToolCall`.
+///
+/// A v2 diff needs a patch, while the bridge's diffs only carry the old and new text,
+/// so they are applied as v1 content.
+fn rewrite_zed_lsp_bridge_tool_call_patch(
+    id: &acp_v2::ToolCallId,
+    patch: &mut ToolCallPatch,
+    queue: Option<&BridgeResultQueue>,
+    active: &mut HashMap<acp_v1::ToolCallId, serde_json::Value>,
+    tool_names: &mut HashMap<acp_v1::ToolCallId, String>,
+) {
+    let id = acp_v1::ToolCallId::new(id.0.clone());
+    if let Some(tool) = [patch.name.value(), patch.title.value()]
+        .into_iter()
+        .flatten()
+        .find_map(|name| zed_lsp_bridge_tool_name_from_title(name))
+    {
+        tool_names.insert(id.clone(), tool.to_string());
+    }
+    let Some(payload_obj) = resolve_zed_bridge_payload_obj(&id, queue, active, tool_names) else {
+        return;
+    };
+    let Some(result) = ZedBridgeToolResult::from_payload(&payload_obj) else {
+        return;
+    };
+
+    if let Some(kind) = result.kind.and_then(tool_kind_from_v1) {
+        patch.kind = MaybeUndefined::Value(kind);
+    }
+    if let Some(content) = result.content {
+        patch.content = MaybeUndefined::Value(ToolContentPatch::V1(content));
+    }
+    if let Some(locations) = result.locations {
+        patch.locations = MaybeUndefined::Value(locations.into_iter().map(Into::into).collect());
+    }
+    if let Some(title) = result.title {
+        patch.title = MaybeUndefined::Value(title);
+    }
+}
+
+/// What a bridge result changes on the tool call that produced it.
+struct ZedBridgeToolResult {
+    tool: Option<String>,
+    kind: Option<acp_v1::ToolKind>,
+    content: Option<Vec<acp_v1::ToolCallContent>>,
+    locations: Option<Vec<acp_v1::ToolCallLocation>>,
+    title: Option<String>,
+}
+
+impl ZedBridgeToolResult {
+    fn from_payload(payload_obj: &serde_json::Value) -> Option<Self> {
+        let payload = decode_zed_bridge_object(payload_obj)?;
+        let mut content = payload_obj
+            .get("text")
+            .and_then(|v| v.as_str())
+            .map(|text| vec![text.to_string().into()]);
+        if let Some(diffs) = payload.diffs
+            && !diffs.is_empty()
+        {
+            // Force-overwrite even when the incoming update sets a different
+            // content (claude-acp sends a follow-up `ContentBlock` after the
+            // tool result, which would otherwise replace our rich Diff with
+            // raw markdown text).
+            content = Some(
+                diffs
+                    .into_iter()
+                    .map(acp_v1::ToolCallContent::Diff)
+                    .collect(),
+            );
+        }
+        Some(Self {
+            tool: payload_obj
+                .get("tool")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            kind: payload.kind,
+            content,
+            locations: (!payload.locations.is_empty()).then_some(payload.locations),
+            // Surface the edited file path as the tool-call label so the card
+            // header reads `crates/foo.rs` instead of the raw
+            // `mcp__zed-lsp-bridge__apply_text_edit` the agent passed in.
+            title: payload.primary_path,
+        })
+    }
+}
+
+/// Resolve the structured bridge payload for `tool_call_id`. Looks first in
+/// the per-thread cache (so follow-up updates re-apply the same payload and
+/// defeat claude-acp's late `ContentBlock` overwrite); on cache miss, uses
+/// the `tool_call_id → tool_name` map populated from the initial ToolCall's
+/// title to pop the matching entry off the in-process queue published by
+/// `lsp_mcp_bridge.rs`.
+fn resolve_zed_bridge_payload_obj(
+    tool_call_id: &acp_v1::ToolCallId,
+    queue: Option<&BridgeResultQueue>,
+    active: &mut HashMap<acp_v1::ToolCallId, serde_json::Value>,
+    tool_names: &HashMap<acp_v1::ToolCallId, String>,
+) -> Option<serde_json::Value> {
+    if let Some(cached) = active.get(tool_call_id) {
+        return Some(cached.clone());
+    }
+
+    let queue = queue?;
+    let tool = tool_names.get(tool_call_id)?;
+    // A miss here is an expected transient: an early `in_progress`
+    // ToolCallUpdate often arrives before the MCP `tools/call` response
+    // reaches the bridge and enqueues a result. The follow-up completion
+    // update finds the entry and applies it.
+    let entry = take_bridge_result_for_tool(queue, tool)?;
+    active.insert(tool_call_id.clone(), entry.payload.clone());
+    Some(entry.payload)
+}
+
+struct ZedBridgePayload {
+    kind: Option<acp_v1::ToolKind>,
+    diffs: Option<Vec<acp_v1::Diff>>,
+    locations: Vec<acp_v1::ToolCallLocation>,
+    /// First diff's project-relative path, used as the tool-call label so
+    /// the card header reads the file path instead of the raw bridge tool
+    /// name. `None` when no diffs are present (non-edit tools).
+    primary_path: Option<String>,
+}
+
+const BRIDGE_TOOL_PREFIX: &str = "mcp__zed-lsp-bridge__";
+const CODEX_BRIDGE_TOOL_PREFIX: &str = "Tool: zed-lsp-bridge/";
+
+fn decode_zed_bridge_object(zb: &serde_json::Value) -> Option<ZedBridgePayload> {
+    let kind = zb.get("kind").and_then(|v| v.as_str()).and_then(|s| {
+        Some(match s {
+            "edit" => acp_v1::ToolKind::Edit,
+            "search" => acp_v1::ToolKind::Search,
+            "read" => acp_v1::ToolKind::Read,
+            "delete" => acp_v1::ToolKind::Delete,
+            "move" => acp_v1::ToolKind::Move,
+            "execute" => acp_v1::ToolKind::Execute,
+            "think" => acp_v1::ToolKind::Think,
+            "fetch" => acp_v1::ToolKind::Fetch,
+            "other" => acp_v1::ToolKind::Other,
+            _ => return None,
+        })
+    });
+
+    let mut locations = Vec::new();
+    let mut primary_path: Option<String> = None;
+    let diffs = zb.get("diffs").and_then(|v| v.as_array()).map(|entries| {
+        entries
+            .iter()
+            .filter_map(|entry| {
+                let path = entry.get("path").and_then(|v| v.as_str())?;
+                let new_text = entry.get("new_text").and_then(|v| v.as_str())?.to_string();
+                let old_text = entry
+                    .get("old_text")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let line = entry.get("line").and_then(|v| v.as_u64()).map(|n| n as u32);
+                if let Some(abs) = entry.get("abs_path").and_then(|v| v.as_str())
+                    && !abs.is_empty()
+                {
+                    let mut location = acp_v1::ToolCallLocation::new(PathBuf::from(abs));
+                    if let Some(line) = line {
+                        location = location.line(Some(line));
+                    }
+                    locations.push(location);
+                }
+                if primary_path.is_none() {
+                    primary_path = Some(match line {
+                        // 1-based for display matches what users see in tabs
+                        // and the "Go to Line" affordance.
+                        Some(row) => format!("{path}:{}", row + 1),
+                        None => path.to_string(),
+                    });
+                }
+                let mut diff = acp_v1::Diff::new(PathBuf::from(path), new_text);
+                if let Some(old) = old_text {
+                    diff = diff.old_text(old);
+                }
+                Some(diff)
+            })
+            .collect::<Vec<_>>()
+    });
+
+    // Non-edit tools (e.g. `read_buffer`) carry a single top-level
+    // `abs_path` instead of a `diffs` array. Surface it as a jump location
+    // and use the relative `path` as the tool-call label so the read card
+    // gets a clickable "Go to File" header like the built-in read_file
+    // tool, instead of showing the raw `…/read_buffer` tool name.
+    if locations.is_empty()
+        && let Some(abs) = zb.get("abs_path").and_then(|v| v.as_str())
+        && !abs.is_empty()
+    {
+        let mut location = acp_v1::ToolCallLocation::new(PathBuf::from(abs));
+        if let Some(line) = zb.get("line").and_then(|v| v.as_u64()) {
+            location = location.line(Some(line as u32));
+        }
+        locations.push(location);
+    }
+    if primary_path.is_none()
+        && let Some(path) = zb.get("path").and_then(|v| v.as_str())
+        && !path.is_empty()
+    {
+        primary_path = Some(path.to_string());
+    }
+
+    Some(ZedBridgePayload {
+        kind,
+        diffs,
+        locations,
+        primary_path,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11037,6 +11458,278 @@ mod tests {
         let details: SandboxAuthorizationDetails =
             serde_json::from_value(json!({ "network": false })).unwrap();
         assert!(!details.network_all_hosts);
+    }
+
+    #[test]
+    fn test_zed_lsp_bridge_tool_name_from_title() {
+        assert_eq!(
+            zed_lsp_bridge_tool_name_from_title("mcp__zed-lsp-bridge__apply_text_edit"),
+            Some("apply_text_edit")
+        );
+        assert_eq!(
+            zed_lsp_bridge_tool_name_from_title("Tool: zed-lsp-bridge/apply_text_edit"),
+            Some("apply_text_edit")
+        );
+        assert_eq!(
+            zed_lsp_bridge_tool_name_from_title("Tool: other-server/apply_text_edit"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_tool_name_from_meta_or_title_prefers_meta() {
+        assert_eq!(
+            tool_name_from_meta_or_title(
+                &Some(meta_with_tool_name("read_file")),
+                "Tool: zed-lsp-bridge/read_buffer",
+            )
+            .as_deref(),
+            Some("read_file")
+        );
+        assert_eq!(
+            tool_name_from_meta_or_title(&None, "Tool: zed-lsp-bridge/read_buffer").as_deref(),
+            Some("read_buffer")
+        );
+        assert_eq!(
+            tool_name_from_meta_or_title(&None, "Tool: other-server/read_buffer").as_deref(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_zed_lsp_bridge_rewriter_injects_tool_name_meta() {
+        let queue = new_bridge_result_queue();
+        enqueue_bridge_result(
+            &queue,
+            BridgeResultEntry {
+                tool: "read_buffer".to_string(),
+                payload: json!({
+                    "version": 1,
+                    "kind": "read",
+                    "tool": "read_buffer",
+                    "text": "README.md (1 line)\n```\nhello\n```",
+                    "path": "README.md",
+                    "abs_path": "/repo/README.md",
+                    "line": 0,
+                }),
+            },
+        );
+
+        let id = acp_v1::ToolCallId::new("test");
+        let mut active = HashMap::default();
+        let mut tool_names = HashMap::default();
+        tool_names.insert(id.clone(), "read_buffer".to_string());
+        let mut update = acp_v1::ToolCallUpdate::new(id, acp_v1::ToolCallUpdateFields::new());
+
+        rewrite_zed_lsp_bridge_tool_call_update(
+            &mut update,
+            Some(&queue),
+            &mut active,
+            &tool_names,
+        );
+
+        assert_eq!(update.fields.kind, Some(acp_v1::ToolKind::Read));
+        assert_eq!(
+            update
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get(TOOL_NAME_META_KEY))
+                .and_then(|value| value.as_str()),
+            Some("read_buffer")
+        );
+        assert!(matches!(
+            update.fields.content.as_deref(),
+            Some([acp_v1::ToolCallContent::Content(acp_v1::Content {
+                content: acp_v1::ContentBlock::Text(acp_v1::TextContent { text, .. }),
+                ..
+            })]) if text == "README.md (1 line)\n```\nhello\n```"
+        ));
+        let locations = update.fields.locations.as_deref().unwrap_or_default();
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0].path, PathBuf::from("/repo/README.md"));
+        assert_eq!(locations[0].line, Some(0));
+        assert_eq!(update.fields.title.as_deref(), Some("README.md"));
+    }
+
+    fn read_buffer_bridge_result() -> BridgeResultEntry {
+        BridgeResultEntry {
+            tool: "read_buffer".to_string(),
+            payload: json!({
+                "version": 1,
+                "kind": "read",
+                "tool": "read_buffer",
+                "text": "README.md (1 line)\n```\nhello\n```",
+                "path": "README.md",
+                "abs_path": "/repo/README.md",
+                "line": 0,
+            }),
+        }
+    }
+
+    fn v2_text_tool_content(text: &str) -> acp_v2::ToolCallContent {
+        acp_v2::ToolCallContent::Content(Box::new(acp_v2::Content::new(
+            acp_v2::ContentBlock::Text(acp_v2::TextContent::new(text)),
+        )))
+    }
+
+    async fn thread_with_bridge_result_queue(
+        cx: &mut TestAppContext,
+    ) -> (Entity<AcpThread>, BridgeResultQueue) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .expect("failed to create ACP thread");
+        let queue = new_bridge_result_queue();
+        thread.update(cx, |thread, _| {
+            thread.set_bridge_result_queue(queue.clone())
+        });
+        (thread, queue)
+    }
+
+    #[gpui::test]
+    async fn test_zed_lsp_bridge_results_rewrite_v1_and_v2_tool_calls(cx: &mut TestAppContext) {
+        let (thread, queue) = thread_with_bridge_result_queue(cx).await;
+        // Agents report the bridge's tools under their MCP name, as both the title
+        // and the tool name.
+        let mcp_name = "mcp__zed-lsp-bridge__read_buffer";
+
+        thread
+            .update(cx, |thread, cx| {
+                thread.handle_session_update(
+                    acp_v1::SessionUpdate::ToolCall(
+                        acp_v1::ToolCall::new("v1-call", mcp_name).name(mcp_name),
+                    ),
+                    cx,
+                )
+            })
+            .expect("v1 tool call");
+        enqueue_bridge_result(&queue, read_buffer_bridge_result());
+        thread
+            .update(cx, |thread, cx| {
+                thread.handle_session_update(
+                    acp_v1::SessionUpdate::ToolCallUpdate(acp_v1::ToolCallUpdate::new(
+                        "v1-call",
+                        acp_v1::ToolCallUpdateFields::new()
+                            .status(acp_v1::ToolCallStatus::Completed),
+                    )),
+                    cx,
+                )
+            })
+            .expect("v1 tool call update");
+
+        thread
+            .update(cx, |thread, cx| {
+                thread.upsert_wire_tool_call(
+                    acp_v2::ToolCallUpdate::new("v2-call")
+                        .name(mcp_name)
+                        .title(mcp_name),
+                    cx,
+                )
+            })
+            .expect("v2 tool call");
+        enqueue_bridge_result(&queue, read_buffer_bridge_result());
+        thread
+            .update(cx, |thread, cx| {
+                thread.upsert_wire_tool_call(
+                    acp_v2::ToolCallUpdate::new("v2-call")
+                        .status(acp_v2::ToolCallStatus::Completed)
+                        .content(vec![v2_text_tool_content("raw agent text")]),
+                    cx,
+                )
+            })
+            .expect("v2 tool call update");
+
+        thread.read_with(cx, |thread, _| {
+            for id in ["v1-call", "v2-call"] {
+                let (_, call) = thread
+                    .tool_call(&acp_v2::ToolCallId::new(id))
+                    .expect("tool call");
+                assert_eq!(call.tool_name.as_deref(), Some("read_buffer"), "{id}");
+                assert_eq!(call.kind(), &acp_v2::ToolKind::Read, "{id}");
+                assert_eq!(call.title.as_deref(), Some("README.md"), "{id}");
+                assert_eq!(
+                    call.locations
+                        .iter()
+                        .map(|location| location.path.clone())
+                        .collect::<Vec<_>>(),
+                    vec![PathBuf::from("/repo/README.md")],
+                    "{id}"
+                );
+                assert!(
+                    matches!(call.content(), [ToolCallContent::ContentBlock { .. }]),
+                    "{id}: the bridge's text should replace the agent's"
+                );
+            }
+        });
+    }
+
+    #[gpui::test]
+    async fn test_zed_lsp_bridge_edit_keeps_its_diff_on_acp_v2(cx: &mut TestAppContext) {
+        let (thread, queue) = thread_with_bridge_result_queue(cx).await;
+        let mcp_name = "mcp__zed-lsp-bridge__apply_text_edit";
+        let id = acp_v2::ToolCallId::new("edit-call");
+
+        thread
+            .update(cx, |thread, cx| {
+                thread.upsert_wire_tool_call(
+                    acp_v2::ToolCallUpdate::new(id.clone())
+                        .name(mcp_name)
+                        .title(mcp_name)
+                        .status(acp_v2::ToolCallStatus::InProgress),
+                    cx,
+                )
+            })
+            .expect("tool call");
+        enqueue_bridge_result(
+            &queue,
+            BridgeResultEntry {
+                tool: "apply_text_edit".to_string(),
+                payload: json!({
+                    "version": 1,
+                    "kind": "edit",
+                    "tool": "apply_text_edit",
+                    "text": "Applied 1 edit",
+                    "diffs": [{
+                        "path": "src/main.rs",
+                        "abs_path": "/repo/src/main.rs",
+                        "old_text": "fn main() {}\n",
+                        "new_text": "fn main() {\n}\n",
+                        "line": 0,
+                    }],
+                }),
+            },
+        );
+        for update in [
+            acp_v2::ToolCallUpdate::new(id.clone())
+                .status(acp_v2::ToolCallStatus::Completed)
+                .content(vec![v2_text_tool_content("Applied 1 edit")]),
+            // Claude's adapter follows the result with the tool's text output.
+            acp_v2::ToolCallUpdate::new(id.clone())
+                .content(vec![v2_text_tool_content("Applied 1 edit to src/main.rs")]),
+        ] {
+            thread
+                .update(cx, |thread, cx| thread.upsert_wire_tool_call(update, cx))
+                .expect("tool call update");
+        }
+
+        thread.read_with(cx, |thread, _| {
+            let (_, call) = thread.tool_call(&id).expect("tool call");
+            assert_eq!(call.tool_name.as_deref(), Some("apply_text_edit"));
+            assert_eq!(call.kind(), &acp_v2::ToolKind::Edit);
+            assert_eq!(call.title.as_deref(), Some("src/main.rs:1"));
+            let [ToolCallContent::LegacyDiff { source, .. }] = call.content() else {
+                panic!("the edit should render as a diff, got {:?}", call.content());
+            };
+            assert_eq!(source.path, PathBuf::from("src/main.rs"));
+            assert_eq!(source.old_text.as_deref(), Some("fn main() {}\n"));
+            assert_eq!(source.new_text, "fn main() {\n}\n");
+        });
     }
 
     #[gpui::test]

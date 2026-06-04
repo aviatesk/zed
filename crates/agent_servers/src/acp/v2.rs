@@ -208,6 +208,8 @@ pub struct AcpV2Connection {
     pending_session_updates: Rc<RefCell<PendingSessionUpdates>>,
     session_owners: Rc<RefCell<HashMap<acp::SessionId, SessionOwner>>>,
     runtime: Rc<RefCell<Option<ConnectionRuntime>>>,
+    lsp_bridge_url: Option<String>,
+    bridge_result_queue: acp_thread::BridgeResultQueue,
 }
 
 struct ConnectionRuntime {
@@ -216,6 +218,7 @@ struct ConnectionRuntime {
     _wait_task: Option<Task<()>>,
     _child: Option<transport::OwnedChild>,
     _quit_subscription: Option<gpui::Subscription>,
+    _lsp_bridge: Option<crate::lsp_mcp_bridge::LspMcpBridge>,
 }
 
 struct StdioStartup {
@@ -270,6 +273,7 @@ impl AcpV2Connection {
             async move {
                 Self::connect(
                     agent_id,
+                    project.downgrade(),
                     agent_server_store,
                     Lines::new(outgoing, incoming),
                     info,
@@ -316,6 +320,7 @@ impl AcpV2Connection {
 
     async fn connect(
         id: AgentId,
+        project: WeakEntity<Project>,
         agent_server_store: WeakEntity<AgentServerStore>,
         transport: impl ConnectTo<Client> + 'static,
         info: acp::Implementation,
@@ -351,6 +356,8 @@ impl AcpV2Connection {
             request_elicitations: request_elicitations.clone(),
             active_request_scopes: Some(RefCell::new(Default::default())),
             accepts_subagent_updates: true,
+            project,
+            code_action_store: Rc::new(RefCell::new(None)),
         };
         let (mut client_runtime, shutdown) = runtime::ClientRuntime::new(context, cx);
         let dispatch_tx = client_runtime.sender();
@@ -378,6 +385,7 @@ impl AcpV2Connection {
             _wait_task: None,
             _child: child,
             _quit_subscription: None,
+            _lsp_bridge: None,
         });
         let quit = cx.update(|cx| {
             cx.on_app_quit({
@@ -454,6 +462,26 @@ impl AcpV2Connection {
                 .as_ref()
                 .is_some_and(|auth| auth.status.is_some())
         });
+
+        // Failure to expose Zed's LSP tools must not prevent the agent from connecting.
+        let bridge_result_queue = acp_thread::new_bridge_result_queue();
+        let lsp_bridge = cx
+            .update(|cx| {
+                crate::lsp_mcp_bridge::LspMcpBridge::start(
+                    dispatch_tx.clone(),
+                    bridge_result_queue.clone(),
+                    cx,
+                )
+            })
+            .inspect_err(|error| log::warn!("failed to start LSP MCP bridge: {error:#}"))
+            .ok();
+        let lsp_bridge_url = lsp_bridge.as_ref().map(|bridge| bridge.url().to_string());
+        if let Some(runtime) = runtime.borrow_mut().as_mut() {
+            // The runtime owns the bridge so that shutting the connection down also
+            // stops serving its tools.
+            runtime._lsp_bridge = lsp_bridge;
+        }
+
         let result = Self {
             id,
             connection,
@@ -468,6 +496,8 @@ impl AcpV2Connection {
             pending_session_updates,
             session_owners: Rc::new(RefCell::new(HashMap::default())),
             runtime,
+            lsp_bridge_url,
+            bridge_result_queue,
         };
         cx.update(|cx| result.refresh_auth_status(cx));
         Ok(result)
@@ -700,6 +730,17 @@ impl AcpV2Connection {
                 _ => {}
             }
         }
+        if let Some(url) = &self.lsp_bridge_url
+            && capabilities
+                .mcp
+                .as_ref()
+                .is_some_and(|mcp| mcp.http.is_some())
+        {
+            servers.push(acp::McpServer::Http(acp::McpServerHttp::new(
+                crate::lsp_mcp_bridge::SERVER_NAME,
+                url.clone(),
+            )));
+        }
         Ok(SessionContext {
             cwd: cwd.into(),
             additional_directories: additional_directories.into_iter().map(Into::into).collect(),
@@ -752,7 +793,7 @@ impl AcpV2Connection {
         let project_entity_id = project.entity_id();
         let action_log = cx.new(|_| ActionLog::new(project.clone()));
         let thread = cx.new(|cx| {
-            AcpThread::new(
+            let mut thread = AcpThread::new(
                 None,
                 title,
                 Some(context.work_dirs()),
@@ -762,7 +803,9 @@ impl AcpV2Connection {
                 session_id.clone(),
                 watch::Receiver::constant(capabilities),
                 cx,
-            )
+            );
+            thread.set_bridge_result_queue(self.bridge_result_queue.clone());
+            thread
         });
         let release_subscription =
             cx.observe_release(&thread, {
@@ -2382,6 +2425,7 @@ mod tests {
             let client = bounded(
                 AcpV2Connection::connect(
                     AgentId::new("session-test"),
+                    project.downgrade(),
                     WeakEntity::new_invalid(),
                     client_transport,
                     acp::Implementation::new("test", "1"),
@@ -7265,6 +7309,94 @@ done
     }
 
     #[gpui::test]
+    async fn v2_lsp_bridge_is_offered_to_http_mcp_agents_and_rewrites_results(
+        cx: &mut TestAppContext,
+    ) {
+        use acp_thread::{BridgeResultEntry, enqueue_bridge_result};
+
+        let bridge_url = "http://127.0.0.1:1/".to_string();
+        let directories = PathList::new(&[session_path("a")]);
+        for http in [false, true] {
+            let mut mcp = acp::McpCapabilities::new();
+            if http {
+                mcp = mcp.http(acp::McpHttpCapabilities::new());
+            }
+            let mut harness = SessionHarness::new(
+                acp::AgentCapabilities::new().session(acp::SessionCapabilities::new().mcp(mcp)),
+                Vec::new(),
+                Vec::new(),
+                cx,
+            )
+            .await;
+            // The test executor can't start the bridge's server, so stand in its URL.
+            Rc::get_mut(&mut harness.client)
+                .expect("no session holds the connection yet")
+                .lsp_bridge_url = Some(bridge_url.clone());
+            let path_style = harness
+                .project
+                .read_with(cx, |project, cx| project.path_style(cx));
+            let context = harness
+                .client
+                .session_context(Vec::new(), &directories, |path| {
+                    path_style.is_absolute(path)
+                })
+                .expect("session context");
+            let expected = if http {
+                vec![acp::McpServer::Http(acp::McpServerHttp::new(
+                    "zed-lsp-bridge",
+                    bridge_url.clone(),
+                ))]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(context.mcp_servers, expected, "http: {http}");
+
+            if !http {
+                continue;
+            }
+            let thread = harness.thread(cx).await;
+            let session_id = cx.read(|cx| thread.read(cx).session_id().to_string());
+            let mcp_name = "mcp__zed-lsp-bridge__read_buffer";
+            harness.send_update(
+                &session_id,
+                acp::SessionUpdate::ToolCallUpdate(
+                    acp::ToolCallUpdate::new("bridge-call")
+                        .name(mcp_name)
+                        .title(mcp_name),
+                ),
+            );
+            cx.run_until_parked();
+            enqueue_bridge_result(
+                &harness.client.bridge_result_queue,
+                BridgeResultEntry {
+                    tool: "read_buffer".to_string(),
+                    payload: json!({
+                        "version": 1,
+                        "kind": "read",
+                        "tool": "read_buffer",
+                        "text": "README.md (1 line)",
+                        "path": "README.md",
+                    }),
+                },
+            );
+            harness.send_update(
+                &session_id,
+                acp::SessionUpdate::ToolCallUpdate(
+                    acp::ToolCallUpdate::new("bridge-call").status(acp::ToolCallStatus::Completed),
+                ),
+            );
+            cx.run_until_parked();
+            thread.read_with(cx, |thread, _| {
+                let (_, call) = thread
+                    .tool_call(&acp::ToolCallId::new("bridge-call"))
+                    .expect("bridge tool call");
+                assert_eq!(call.tool_name.as_deref(), Some("read_buffer"));
+                assert_eq!(call.kind(), &acp::ToolKind::Read);
+            });
+        }
+    }
+
+    #[gpui::test]
     async fn v2_session_sdk_gates_mcp_and_additional_roots(cx: &mut TestAppContext) {
         let configurations =
             vec![
@@ -7530,6 +7662,7 @@ done
             let client = bounded(
                 AcpV2Connection::connect(
                     AgentId::new("auth-test"),
+                    WeakEntity::new_invalid(),
                     WeakEntity::new_invalid(),
                     client_transport,
                     acp::Implementation::new("client-test", "1"),
@@ -8171,6 +8304,7 @@ done
             AcpV2Connection::connect(
                 AgentId::new("v1-only"),
                 WeakEntity::new_invalid(),
+                WeakEntity::new_invalid(),
                 client_transport,
                 acp::Implementation::new("client", "1"),
                 AcpDebugLog::default(),
@@ -8255,6 +8389,7 @@ done
         let client = bounded(
             AcpV2Connection::connect(
                 AgentId::new("terminal-test"),
+                WeakEntity::new_invalid(),
                 store,
                 client_transport,
                 acp::Implementation::new("test", "1"),
@@ -8382,6 +8517,7 @@ exec sleep 60
         let connecting = cx.spawn(async move |mut cx| {
             AcpV2Connection::connect(
                 AgentId::new("pending-shutdown"),
+                WeakEntity::new_invalid(),
                 WeakEntity::new_invalid(),
                 transport,
                 acp::Implementation::new("client", "1"),

@@ -32,6 +32,11 @@ pub fn init_from_handle(cx: &mut App, handle: tokio::runtime::Handle) {
     });
 }
 
+/// Returns whether the Tokio wrapper has been initialized via [`init`] or [`init_from_handle`].
+pub fn is_initialized(cx: &App) -> bool {
+    cx.has_global::<GlobalTokio>()
+}
+
 struct GlobalTokio {
     owned_runtime: Option<tokio::runtime::Runtime>,
     handle: tokio::runtime::Handle,
