@@ -63,6 +63,10 @@ impl FeatureFlag for LspToolFeatureFlag {
     fn enabled_for_staff() -> bool {
         false
     }
+
+    fn enabled_for_all() -> bool {
+        true
+    }
 }
 register_feature_flag!(LspToolFeatureFlag);
 
@@ -73,6 +77,10 @@ impl FeatureFlag for RenameToolFeatureFlag {
     type Value = PresenceFlag;
 
     fn enabled_for_staff() -> bool {
+        true
+    }
+
+    fn enabled_for_all() -> bool {
         true
     }
 }
