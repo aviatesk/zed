@@ -134,12 +134,14 @@ impl<T> FlattenAcpResult<T> for Result<Result<T, acp::Error>, anyhow::Error> {
 }
 
 /// Holds state needed by foreground work dispatched from background handler closures.
-struct ClientContext {
-    sessions: Rc<RefCell<HashMap<acp_v2::SessionId, AcpSession>>>,
-    session_list: Rc<RefCell<Option<Rc<AcpSessionList>>>>,
-    request_elicitations: Entity<ElicitationStore>,
+pub(crate) struct ClientContext {
+    pub(crate) sessions: Rc<RefCell<HashMap<acp_v2::SessionId, AcpSession>>>,
+    pub(crate) session_list: Rc<RefCell<Option<Rc<AcpSessionList>>>>,
+    pub(crate) request_elicitations: Entity<ElicitationStore>,
     // Legacy and ingress-only contexts do not track caller ownership of outgoing RPCs.
     active_request_scopes: Option<RefCell<HashSet<acp_v2::RequestId>>>,
+    pub(crate) project: WeakEntity<Project>,
+    pub(crate) code_action_store: Rc<RefCell<Option<agent_lsp::PendingCodeActions>>>,
 }
 
 fn dispatch_queue_closed_error() -> acp::Error {
@@ -147,12 +149,12 @@ fn dispatch_queue_closed_error() -> acp::Error {
 }
 
 /// Work items sent from `Send` handler closures to the `!Send` foreground thread.
-trait ForegroundWorkItem: Send {
+pub(crate) trait ForegroundWorkItem: Send {
     fn run(self: Box<Self>, cx: &mut AsyncApp, ctx: &ClientContext);
     fn reject(self: Box<Self>);
 }
 
-type ForegroundWork = Box<dyn ForegroundWorkItem>;
+pub(crate) type ForegroundWork = Box<dyn ForegroundWorkItem>;
 
 struct ForegroundBarrier {
     acknowledgment: futures::channel::oneshot::Sender<()>,

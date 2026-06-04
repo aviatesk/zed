@@ -193,7 +193,7 @@ mod tests {
     use acp_thread::{ElicitationStatus, ElicitationStore};
     use agent_client_protocol::schema::v2 as acp;
     use collections::HashMap;
-    use gpui::TestAppContext;
+    use gpui::{TestAppContext, WeakEntity};
     use std::{cell::RefCell, rc::Rc};
 
     #[gpui::test]
@@ -205,6 +205,8 @@ mod tests {
             session_list: Rc::new(RefCell::new(None)),
             request_elicitations: store.clone(),
             active_request_scopes: None,
+            project: WeakEntity::new_invalid(),
+            code_action_store: Rc::new(RefCell::new(None)),
         };
         let (mut runtime, shutdown) = ClientRuntime::new(context, &mut cx.to_async());
         let (transport, peer) = agent_client_protocol::Channel::duplex();
