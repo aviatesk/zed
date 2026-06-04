@@ -196,7 +196,7 @@ mod tests {
     use acp_thread::{ElicitationStatus, ElicitationStore};
     use agent_client_protocol::schema::v2 as acp;
     use collections::HashMap;
-    use gpui::TestAppContext;
+    use gpui::{TestAppContext, WeakEntity};
     use std::{cell::RefCell, rc::Rc};
 
     #[gpui::test]
@@ -210,6 +210,8 @@ mod tests {
             active_request_scopes: None,
             pending_session_updates: None,
             accepts_subagent_updates: false,
+            project: WeakEntity::new_invalid(),
+            code_action_store: Rc::new(RefCell::new(None)),
         };
         let (mut runtime, shutdown) = ClientRuntime::new(context, &mut cx.to_async());
         let retained_sender = runtime.sender();

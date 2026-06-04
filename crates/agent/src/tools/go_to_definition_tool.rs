@@ -1,7 +1,6 @@
-use std::fmt::Write;
 use std::sync::Arc;
 
-use super::symbol_locator::{LocationDisplay, SymbolLocator};
+use super::symbol_locator::SymbolLocator;
 use crate::{AgentTool, ToolCallEventStream, ToolInput};
 use agent_client_protocol::schema::v2 as acp;
 use gpui::{App, Entity, SharedString, Task};
@@ -65,47 +64,16 @@ impl AgentTool for GoToDefinitionTool {
                 .await
                 .map_err(|e| format!("Failed to receive tool input: {e}"))?;
 
-            let resolved = input.symbol.resolve(&project, cx).await?;
-
-            let definitions_task = project.update(cx, |project, cx| {
-                project.definitions(&resolved.buffer, resolved.position, cx)
-            });
-
-            let definitions = definitions_task
-                .await
-                .map_err(|e| format!("Go to definition failed: {e}"))?
-                .unwrap_or_default();
-
-            if definitions.is_empty() {
-                return Ok(format!(
-                    "No definition found for '{}'.",
-                    input.symbol.symbol_name
-                ));
-            }
-
-            let mut output = String::new();
-
-            if definitions.len() == 1 {
-                write!(output, "Definition of `{}`:\n", input.symbol.symbol_name).ok();
-            } else {
-                write!(
-                    output,
-                    "Found {} definitions of `{}`:\n",
-                    definitions.len(),
-                    input.symbol.symbol_name
-                )
-                .ok();
-            }
-
-            for link in &definitions {
-                let display = link
-                    .target
-                    .buffer
-                    .read_with(cx, |_, cx| LocationDisplay::from_location(&link.target, cx));
-                write!(output, "\n## {display}\n").ok();
-            }
-
-            Ok(output)
+            agent_lsp::go_to_definition(
+                project,
+                agent_lsp::SymbolLocator::new(
+                    input.symbol.file_path,
+                    input.symbol.line,
+                    input.symbol.symbol_name,
+                ),
+                cx,
+            )
+            .await
         })
     }
 }

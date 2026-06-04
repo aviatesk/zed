@@ -242,16 +242,18 @@ impl<T> FlattenAcpResult<T> for Result<Result<T, acp::Error>, anyhow::Error> {
 }
 
 /// Holds state needed by foreground work dispatched from background handler closures.
-struct ClientContext {
-    sessions: Rc<RefCell<HashMap<acp_v2::SessionId, AcpSession>>>,
+pub(crate) struct ClientContext {
+    pub(crate) sessions: Rc<RefCell<HashMap<acp_v2::SessionId, AcpSession>>>,
     pending_session_updates: Option<Rc<RefCell<PendingSessionUpdates>>>,
-    session_list: Rc<RefCell<Option<Rc<AcpSessionList>>>>,
-    request_elicitations: Entity<ElicitationStore>,
+    pub(crate) session_list: Rc<RefCell<Option<Rc<AcpSessionList>>>>,
+    pub(crate) request_elicitations: Entity<ElicitationStore>,
     // Legacy and ingress-only contexts do not track caller ownership of outgoing RPCs.
     active_request_scopes: Option<RefCell<HashSet<acp_v2::RequestId>>>,
     /// A v1 agent may only send `subagent_update` after Zed advertises the `subagents`
     /// client capability. v2 includes subagents in every session.
     accepts_subagent_updates: bool,
+    pub(crate) project: WeakEntity<Project>,
+    pub(crate) code_action_store: Rc<RefCell<Option<agent_lsp::PendingCodeActions>>>,
 }
 
 fn dispatch_queue_closed_error() -> acp::Error {
@@ -259,12 +261,12 @@ fn dispatch_queue_closed_error() -> acp::Error {
 }
 
 /// Work items sent from `Send` handler closures to the `!Send` foreground thread.
-trait ForegroundWorkItem: Send {
+pub(crate) trait ForegroundWorkItem: Send {
     fn run(self: Box<Self>, cx: &mut AsyncApp, ctx: &ClientContext);
     fn reject(self: Box<Self>);
 }
 
-type ForegroundWork = Box<dyn ForegroundWorkItem>;
+pub(crate) type ForegroundWork = Box<dyn ForegroundWorkItem>;
 
 struct ForegroundBarrier {
     acknowledgment: futures::channel::oneshot::Sender<()>,

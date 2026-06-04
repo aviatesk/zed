@@ -84,6 +84,9 @@ pub struct AcpConnection {
     session_list: Option<Rc<AcpSessionList>>,
     debug_log: AcpDebugLog,
     _settings_subscription: Subscription,
+    lsp_bridge_url: Option<String>,
+    _lsp_bridge: Option<crate::lsp_mcp_bridge::LspMcpBridge>,
+    bridge_result_queue: acp_thread::BridgeResultQueue,
     _runtime: runtime::ClientRuntime,
     dispatch_tx: mpsc::UnboundedSender<ForegroundWork>,
     _wait_task: Task<()>,
@@ -535,6 +538,8 @@ impl AcpConnection {
             active_request_scopes: None,
             pending_session_updates: None,
             accepts_subagent_updates: client_capabilities.subagents.is_some(),
+            project: project.downgrade(),
+            code_action_store: Rc::new(RefCell::new(None)),
         };
         let (mut runtime, shutdown) = runtime::ClientRuntime::new(dispatch_context, cx);
         let dispatch_tx = runtime.sender();
@@ -675,6 +680,25 @@ impl AcpConnection {
             move |cx| defaults.observe_settings(agent_id, cx)
         });
 
+        // Failure to expose Zed's LSP tools must not prevent the agent from connecting.
+        let bridge_result_queue = acp_thread::new_bridge_result_queue();
+        let (lsp_bridge, lsp_bridge_url) = match cx.update(|cx| {
+            crate::lsp_mcp_bridge::LspMcpBridge::start(
+                dispatch_tx.clone(),
+                bridge_result_queue.clone(),
+                cx,
+            )
+        }) {
+            Ok(bridge) => {
+                let url = bridge.url().to_string();
+                (Some(bridge), Some(url))
+            }
+            Err(error) => {
+                log::warn!("failed to start LSP MCP bridge: {error:#}");
+                (None, None)
+            }
+        };
+
         Ok(Self {
             id: agent_id,
             auth_methods,
@@ -690,6 +714,9 @@ impl AcpConnection {
             session_list,
             debug_log,
             _settings_subscription: settings_subscription,
+            lsp_bridge_url,
+            _lsp_bridge: lsp_bridge,
+            bridge_result_queue,
             _runtime: runtime,
             dispatch_tx,
             _wait_task: wait_task,
@@ -736,6 +763,9 @@ impl AcpConnection {
             session_list: None,
             debug_log: AcpDebugLog::default(),
             _settings_subscription: settings_subscription,
+            lsp_bridge_url: None,
+            _lsp_bridge: None,
+            bridge_result_queue: acp_thread::new_bridge_result_queue(),
             _runtime: runtime::ClientRuntime::from_test_tasks(
                 dispatch_tx.clone(),
                 io_task,
@@ -920,7 +950,7 @@ impl AcpConnection {
 
         let action_log = cx.new(|_| ActionLog::new(project.clone()));
         let thread = cx.new(|cx| {
-            AcpThread::new(
+            let mut thread = AcpThread::new(
                 None,
                 title,
                 Some(work_dirs),
@@ -930,7 +960,9 @@ impl AcpConnection {
                 session_id.clone(),
                 watch::Receiver::constant(self.prompt_capabilities()),
                 cx,
-            )
+            );
+            thread.set_bridge_result_queue(self.bridge_result_queue.clone());
+            thread
         });
         self.register_session(session_id.clone(), &thread, None, None, None, cx);
 
@@ -1243,7 +1275,7 @@ impl AgentConnection for AcpConnection {
             Err(error) => return Task::ready(Err(error)),
         };
         let name = self.id.0.clone();
-        let mcp_servers = mcp_servers_for_project(&project, cx);
+        let mcp_servers = mcp_servers_for_project(&project, self.lsp_bridge_url.as_deref(), cx);
 
         cx.spawn(async move |cx| {
             let (response_sender, response_received) = futures::channel::oneshot::channel();
@@ -1362,7 +1394,7 @@ impl AgentConnection for AcpConnection {
 
             let action_log = cx.new(|_| ActionLog::new(project.clone()));
             let thread: Entity<AcpThread> = cx.new(|cx| {
-                AcpThread::new(
+                let mut thread = AcpThread::new(
                     None,
                     None,
                     Some(work_dirs),
@@ -1373,7 +1405,9 @@ impl AgentConnection for AcpConnection {
                     // ACP doesn't currently support per-session prompt capabilities or changing capabilities dynamically.
                     watch::Receiver::constant(self.prompt_capabilities()),
                     cx,
-                )
+                );
+                thread.set_bridge_result_queue(self.bridge_result_queue.clone());
+                thread
             });
 
             cx.update(|cx| {
@@ -1426,7 +1460,7 @@ impl AgentConnection for AcpConnection {
             ))));
         }
 
-        let mcp_servers = mcp_servers_for_project(&project, cx);
+        let mcp_servers = mcp_servers_for_project(&project, self.lsp_bridge_url.as_deref(), cx);
         self.open_or_create_session(
             session_id,
             project,
@@ -1470,7 +1504,7 @@ impl AgentConnection for AcpConnection {
             ))));
         }
 
-        let mcp_servers = mcp_servers_for_project(&project, cx);
+        let mcp_servers = mcp_servers_for_project(&project, self.lsp_bridge_url.as_deref(), cx);
         self.open_or_create_session(
             session_id,
             project,
@@ -2184,6 +2218,8 @@ pub mod test_support {
             active_request_scopes: None,
             pending_session_updates: None,
             accepts_subagent_updates: false,
+            project: project.downgrade(),
+            code_action_store: Rc::new(RefCell::new(None)),
         };
         let dispatch_task = cx.spawn({
             let mut dispatch_rx = dispatch_rx;
@@ -7465,6 +7501,8 @@ exit 7
             active_request_scopes: None,
             pending_session_updates: None,
             accepts_subagent_updates: false,
+            project: project.downgrade(),
+            code_action_store: Rc::new(RefCell::new(None)),
         };
         // `TestAppContext::spawn` hands out an `AsyncApp` by value, whereas the
         // production path uses `Context::spawn` which hands out `&mut AsyncApp`.
@@ -7849,6 +7887,8 @@ exit 7
             active_request_scopes: None,
             pending_session_updates: None,
             accepts_subagent_updates: false,
+            project: WeakEntity::new_invalid(),
+            code_action_store: Rc::new(RefCell::new(None)),
         };
         let (dispatch_tx, mut dispatch_rx) = mpsc::unbounded::<ForegroundWork>();
         let dispatch_task = cx.spawn(move |mut cx| async move {
@@ -8003,6 +8043,8 @@ exit 7
             active_request_scopes: None,
             pending_session_updates: None,
             accepts_subagent_updates,
+            project: WeakEntity::new_invalid(),
+            code_action_store: Rc::new(RefCell::new(None)),
         };
         let parent_id = parent_session_id.0.to_string();
 
@@ -8140,6 +8182,8 @@ exit 7
             active_request_scopes: None,
             pending_session_updates: None,
             accepts_subagent_updates: false,
+            project: WeakEntity::new_invalid(),
+            code_action_store: Rc::new(RefCell::new(None)),
         };
         let (sender, mut receiver) = mpsc::unbounded::<ForegroundWork>();
         let cleanup = settle_after_disconnect(sender.clone()).boxed().shared();
@@ -9396,8 +9440,12 @@ exit 7
     }
 }
 
-fn mcp_servers_for_project(project: &Entity<Project>, cx: &App) -> Vec<acp::McpServer> {
-    mcp_configurations_for_project(project, cx)
+fn mcp_servers_for_project(
+    project: &Entity<Project>,
+    lsp_bridge_url: Option<&str>,
+    cx: &App,
+) -> Vec<acp::McpServer> {
+    let mut servers: Vec<acp::McpServer> = mcp_configurations_for_project(project, cx)
         .into_iter()
         .map(|(name, configuration)| match &*configuration {
             project::context_server_store::ContextServerConfiguration::Custom {
@@ -9431,7 +9479,16 @@ fn mcp_servers_for_project(project: &Entity<Project>, cx: &App) -> Vec<acp::McpS
                 ),
             ),
         })
-        .collect()
+        .collect();
+
+    if let Some(url) = lsp_bridge_url {
+        servers.push(acp::McpServer::Http(acp::McpServerHttp::new(
+            "zed-lsp-bridge".to_string(),
+            url.to_string(),
+        )));
+    }
+
+    servers
 }
 
 fn config_state(
