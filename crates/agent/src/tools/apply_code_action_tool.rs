@@ -1,13 +1,13 @@
-use std::fmt::Write;
 use std::sync::Arc;
 
 use agent_client_protocol::schema::v1 as acp;
 use gpui::{App, Entity, SharedString, Task};
+use language::LanguageRegistry;
 use project::Project;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::symbol_locator::CodeActionStore;
+use super::{LspEditToolOutput, symbol_locator::CodeActionStore};
 use crate::{AgentTool, ToolCallEventStream, ToolInput};
 
 /// Applies a code action previously retrieved by get_code_actions.
@@ -27,20 +27,26 @@ pub struct ApplyCodeActionToolInput {
 pub struct ApplyCodeActionTool {
     project: Entity<Project>,
     code_action_store: CodeActionStore,
+    language_registry: Arc<LanguageRegistry>,
 }
 
 impl ApplyCodeActionTool {
-    pub fn new(project: Entity<Project>, code_action_store: CodeActionStore) -> Self {
+    pub fn new(
+        project: Entity<Project>,
+        code_action_store: CodeActionStore,
+        language_registry: Arc<LanguageRegistry>,
+    ) -> Self {
         Self {
             project,
             code_action_store,
+            language_registry,
         }
     }
 }
 
 impl AgentTool for ApplyCodeActionTool {
     type Input = ApplyCodeActionToolInput;
-    type Output = String;
+    type Output = LspEditToolOutput;
 
     const NAME: &'static str = "apply_code_action";
 
@@ -75,71 +81,41 @@ impl AgentTool for ApplyCodeActionTool {
     fn run(
         self: Arc<Self>,
         input: ToolInput<Self::Input>,
-        _event_stream: ToolCallEventStream,
+        event_stream: ToolCallEventStream,
         cx: &mut App,
-    ) -> Task<Result<String, String>> {
+    ) -> Task<Result<Self::Output, Self::Output>> {
         let project = self.project.clone();
         let store = self.code_action_store.clone();
+        let language_registry = self.language_registry.clone();
         cx.spawn(async move |cx| {
-            let input = input
-                .recv()
-                .await
-                .map_err(|e| format!("Failed to receive tool input: {e}"))?;
-
-            let pending = store.update(cx, |store, _cx| store.take()).ok_or_else(|| {
-                "No code actions available. Call get_code_actions first.".to_string()
+            let input = input.recv().await.map_err(|e| {
+                LspEditToolOutput::Text(format!("Failed to receive tool input: {e}"))
             })?;
 
-            let zero_based_index = input
-                .index
-                .checked_sub(1)
-                .ok_or_else(|| "Index must be 1 or greater.".to_string())?;
+            let pending = store.update(cx, |store, _cx| store.take()).ok_or_else(|| {
+                LspEditToolOutput::Text(
+                    "No code actions available. Call get_code_actions first.".to_string(),
+                )
+            })?;
 
-            let action = pending
-                .actions
-                .get(zero_based_index as usize)
-                .cloned()
-                .ok_or_else(|| {
-                    format!(
-                        "Index {} is out of range. There were {} code action(s) available.",
-                        input.index,
-                        pending.actions.len()
-                    )
-                })?;
-
-            let title = action.lsp_action.title().to_string();
-            let buffer = pending.buffer.clone();
-
-            let apply_task = project.update(cx, |project, cx| {
-                project.apply_code_action(buffer, action, true, cx)
-            });
-
-            let transaction = apply_task
+            let output = agent_lsp::apply_code_action(project, input.index, pending, cx)
                 .await
-                .map_err(|e| format!("Failed to apply code action '{title}': {e}"))?;
+                .map(LspEditToolOutput::from_agent_lsp)
+                .map_err(LspEditToolOutput::Text)?;
 
-            if transaction.0.is_empty() {
-                return Ok(format!(
-                    "Code action '{title}' was applied but made no changes.",
-                ));
-            }
-
-            let mut output = format!(
-                "Applied code action '{title}'. Modified {} file(s):\n",
-                transaction.0.len()
-            );
-
-            for (buffer, _) in &transaction.0 {
-                buffer.read_with(cx, |buffer, cx| {
-                    let path = buffer
-                        .file()
-                        .map(|f| f.full_path(cx).display().to_string())
-                        .unwrap_or_else(|| "<untitled>".to_string());
-                    writeln!(output, "- {path}").ok();
-                });
-            }
-
+            cx.update(|cx| output.emit_diffs(&event_stream, language_registry, cx));
             Ok(output)
         })
+    }
+
+    fn replay(
+        &self,
+        _input: Self::Input,
+        output: Self::Output,
+        event_stream: ToolCallEventStream,
+        cx: &mut App,
+    ) -> anyhow::Result<()> {
+        output.emit_diffs(&event_stream, self.language_registry.clone(), cx);
+        Ok(())
     }
 }
