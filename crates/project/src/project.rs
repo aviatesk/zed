@@ -98,7 +98,7 @@ use language::{
 use lsp::{
     CodeActionKind, CompletionContext, CompletionItemKind, DocumentHighlightKind, InsertTextMode,
     LanguageServerBinary, LanguageServerId, LanguageServerName, LanguageServerSelector,
-    MessageActionItem,
+    MessageActionItem, Uri,
 };
 pub use lsp_command::EditPredictionDefinition;
 use lsp_command::*;
@@ -3327,6 +3327,17 @@ impl Project {
         }
         self.lsp_store.update(cx, |lsp_store, cx| {
             lsp_store.open_untitled_document(uri, preferred_server_id, cx)
+        })
+    }
+
+    pub fn open_lsp_text_document_content(
+        &self,
+        uri: Uri,
+        preferred_server_id: Option<LanguageServerId>,
+        cx: &mut App,
+    ) -> Task<Result<Entity<Buffer>>> {
+        self.lsp_store.update(cx, |lsp_store, cx| {
+            lsp_store.open_text_document_content(uri, preferred_server_id, cx)
         })
     }
 

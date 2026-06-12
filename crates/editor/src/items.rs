@@ -2524,22 +2524,28 @@ pub(crate) fn handle_lsp_show_document(
         request.respond(true);
         return Task::ready(());
     }
-    let open_task: Task<Result<Box<dyn ItemHandle>>> = if request.uri.scheme() == "untitled" {
-        let buffer_task = workspace.project().update(cx, |project, cx| {
+    let buffer_task = match request.uri.scheme() {
+        "file" | "http" | "https" => None,
+        "untitled" => Some(workspace.project().update(cx, |project, cx| {
             project.open_lsp_untitled_document(request.uri.clone(), request.server_id, cx)
-        });
+        })),
+        _ => Some(workspace.project().update(cx, |project, cx| {
+            project.open_lsp_text_document_content(request.uri.clone(), request.server_id, cx)
+        })),
+    };
+    let open_task: Task<Result<Box<dyn ItemHandle>>> = if let Some(buffer_task) = buffer_task {
         let take_focus = request.take_focus;
         cx.spawn_in(window, async move |workspace, cx| {
             let buffer = buffer_task.await?;
             workspace.update_in(cx, |workspace, window, cx| {
-                // Untitled buffers have no project path or entry ID for open_project_item to match.
+                // File-less buffers have no project path or entry ID for open_project_item to match.
                 let existing_editor = workspace.items_of_type::<Editor>(cx).find(|editor| {
                     editor.read(cx).buffer().read(cx).as_singleton().as_ref() == Some(&buffer)
                 });
                 let editor = if let Some(editor) = existing_editor {
                     anyhow::ensure!(
                         workspace.activate_item(&editor, true, take_focus, window, cx),
-                        "failed to activate untitled document"
+                        "failed to activate language server document"
                     );
                     editor
                 } else {

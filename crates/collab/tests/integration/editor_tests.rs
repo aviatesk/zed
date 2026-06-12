@@ -7421,28 +7421,29 @@ async fn run_guest_semantic_tokens_document_selector_test(
     let fake_language_server = fake_language_servers.next().await.unwrap();
     executor.run_until_parked();
 
-    let semantic_tokens_registration =
-        |scheme: &str, full: lsp::SemanticTokensFullOptions, token_type: &str| {
-            serde_json::to_value(lsp::SemanticTokensRegistrationOptions {
-                text_document_registration_options: lsp::TextDocumentRegistrationOptions {
-                    document_selector: Some(vec![lsp::DocumentFilter {
-                        language: Some("rust".to_string()),
-                        scheme: Some(scheme.to_string()),
-                        pattern: None,
-                    }]),
+    let semantic_tokens_registration = |scheme: &str,
+                                        full: lsp::SemanticTokensFullOptions,
+                                        token_type: &str| {
+        serde_json::to_value(lsp::SemanticTokensRegistrationOptions {
+            text_document_registration_options: lsp::TextDocumentRegistrationOptions {
+                document_selector: Some(vec![lsp::DocumentFilter::Text(lsp::TextDocumentFilter {
+                    language: Some("rust".to_string()),
+                    scheme: Some(scheme.to_string()),
+                    pattern: None,
+                })]),
+            },
+            semantic_tokens_options: lsp::SemanticTokensOptions {
+                legend: lsp::SemanticTokensLegend {
+                    token_types: vec![token_type.to_owned().into()],
+                    token_modifiers: Vec::new(),
                 },
-                semantic_tokens_options: lsp::SemanticTokensOptions {
-                    legend: lsp::SemanticTokensLegend {
-                        token_types: vec![token_type.to_owned().into()],
-                        token_modifiers: Vec::new(),
-                    },
-                    full: Some(full),
-                    ..lsp::SemanticTokensOptions::default()
-                },
-                static_registration_options: lsp::StaticRegistrationOptions::default(),
-            })
-            .ok()
-        };
+                full: Some(full),
+                ..lsp::SemanticTokensOptions::default()
+            },
+            static_registration_options: lsp::StaticRegistrationOptions::default(),
+        })
+        .ok()
+    };
     let mut registrations = Vec::new();
     if include_matching_registration {
         registrations.push(lsp::Registration {
