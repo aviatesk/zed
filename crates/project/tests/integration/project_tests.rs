@@ -6983,11 +6983,13 @@ async fn test_dynamic_completion_registration_honors_document_selector(
                     method: "textDocument/completion".to_string(),
                     register_options: serde_json::to_value(lsp::CompletionRegistrationOptions {
                         text_document_registration_options: lsp::TextDocumentRegistrationOptions {
-                            document_selector: Some(vec![lsp::DocumentFilter {
-                                language: Some("rust".to_string()),
-                                scheme: Some("untitled".to_string()),
-                                pattern: None,
-                            }]),
+                            document_selector: Some(vec![lsp::DocumentFilter::Text(
+                                lsp::TextDocumentFilter {
+                                    language: Some("rust".to_string()),
+                                    scheme: Some("untitled".to_string()),
+                                    pattern: None,
+                                },
+                            )]),
                         },
                         completion_options: lsp::CompletionOptions {
                             trigger_characters: Some(vec![".".to_string()]),
@@ -7039,11 +7041,13 @@ async fn test_dynamic_completion_registration_honors_document_selector(
                     method: "textDocument/completion".to_string(),
                     register_options: serde_json::to_value(lsp::CompletionRegistrationOptions {
                         text_document_registration_options: lsp::TextDocumentRegistrationOptions {
-                            document_selector: Some(vec![lsp::DocumentFilter {
-                                language: Some("rust".to_string()),
-                                scheme: Some("file".to_string()),
-                                pattern: None,
-                            }]),
+                            document_selector: Some(vec![lsp::DocumentFilter::Text(
+                                lsp::TextDocumentFilter {
+                                    language: Some("rust".to_string()),
+                                    scheme: Some("file".to_string()),
+                                    pattern: None,
+                                },
+                            )]),
                         },
                         completion_options: lsp::CompletionOptions {
                             trigger_characters: Some(vec![":".to_string()]),
@@ -7087,11 +7091,13 @@ async fn test_dynamic_completion_registration_honors_document_selector(
                     method: "textDocument/completion".to_string(),
                     register_options: serde_json::to_value(lsp::CompletionRegistrationOptions {
                         text_document_registration_options: lsp::TextDocumentRegistrationOptions {
-                            document_selector: Some(vec![lsp::DocumentFilter {
-                                language: Some("rust".to_string()),
-                                scheme: Some("file".to_string()),
-                                pattern: None,
-                            }]),
+                            document_selector: Some(vec![lsp::DocumentFilter::Text(
+                                lsp::TextDocumentFilter {
+                                    language: Some("rust".to_string()),
+                                    scheme: Some("file".to_string()),
+                                    pattern: None,
+                                },
+                            )]),
                         },
                         completion_options: lsp::CompletionOptions {
                             trigger_characters: Some(vec!["!".to_string()]),
@@ -7242,11 +7248,11 @@ async fn test_dynamic_diagnostic_registrations_honor_their_own_document_selector
     let diagnostic_registration = |identifier: &str, scheme: &str| {
         serde_json::to_value(lsp::DiagnosticRegistrationOptions {
             text_document_registration_options: lsp::TextDocumentRegistrationOptions {
-                document_selector: Some(vec![lsp::DocumentFilter {
+                document_selector: Some(vec![lsp::DocumentFilter::Text(lsp::TextDocumentFilter {
                     language: Some("rust".to_string()),
                     scheme: Some(scheme.to_string()),
                     pattern: None,
-                }]),
+                })]),
             },
             diagnostic_options: lsp::DiagnosticOptions {
                 identifier: Some(identifier.to_string()),
@@ -7333,11 +7339,13 @@ async fn test_unregistering_dynamic_completion_preserves_static_capability(
                     method: "textDocument/completion".to_string(),
                     register_options: serde_json::to_value(lsp::CompletionRegistrationOptions {
                         text_document_registration_options: lsp::TextDocumentRegistrationOptions {
-                            document_selector: Some(vec![lsp::DocumentFilter {
-                                language: Some("rust".to_string()),
-                                scheme: Some("file".to_string()),
-                                pattern: None,
-                            }]),
+                            document_selector: Some(vec![lsp::DocumentFilter::Text(
+                                lsp::TextDocumentFilter {
+                                    language: Some("rust".to_string()),
+                                    scheme: Some("file".to_string()),
+                                    pattern: None,
+                                },
+                            )]),
                         },
                         completion_options: lsp::CompletionOptions {
                             trigger_characters: Some(vec![":".to_string()]),
@@ -8757,6 +8765,296 @@ async fn test_open_lsp_untitled_document_without_worktree(cx: &mut gpui::TestApp
         })
         .await;
     assert!(result.is_err());
+}
+
+#[gpui::test]
+async fn test_lsp_text_document_content_buffer_lifecycle(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "a.rs": "fn main() {}" }))
+        .await;
+    let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    language_registry.add(rust_lang());
+    let mut fake_servers = language_registry.register_fake_lsp(
+        "Rust",
+        FakeLspAdapter {
+            capabilities: lsp::ServerCapabilities {
+                workspace: Some(lsp::WorkspaceServerCapabilities {
+                    text_document_content: Some(
+                        lsp::TextDocumentContentOptions {
+                            schemes: vec!["test".to_string()],
+                        }
+                        .into(),
+                    ),
+                    ..Default::default()
+                }),
+                text_document_sync: Some(lsp::TextDocumentSyncCapability::Kind(
+                    lsp::TextDocumentSyncKind::FULL,
+                )),
+                ..lsp::LanguageServer::full_capabilities()
+            },
+            ..Default::default()
+        },
+    );
+
+    let (_file_buffer, _file_handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/a.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let mut fake_server = fake_servers.next().await.unwrap();
+    fake_server
+        .receive_notification::<lsp::notification::DidOpenTextDocument>()
+        .await;
+
+    let server_id = fake_server.server.server_id();
+    let text_document_content = Arc::new(Mutex::new("initial content".to_string()));
+    let requested_uris = Arc::new(Mutex::new(Vec::new()));
+    let _text_document_content_requests = fake_server
+        .set_request_handler::<lsp::TextDocumentContentRequest, _, _>({
+            let text_document_content = text_document_content.clone();
+            let requested_uris = requested_uris.clone();
+            move |params, _| {
+                requested_uris.lock().push(params.uri);
+                let text = text_document_content.lock().clone();
+                future::ready(Ok(lsp::TextDocumentContentResult { text }))
+            }
+        });
+
+    let uri = Uri::from_str("test:/virtual/document.rs").unwrap();
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_lsp_text_document_content(uri.clone(), Some(server_id), cx)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        buffer.read_with(cx, |buffer, _| buffer.text()),
+        "initial content"
+    );
+    assert_eq!(requested_uris.lock().as_slice(), std::slice::from_ref(&uri));
+
+    let same_buffer = project
+        .update(cx, |project, cx| {
+            project.open_lsp_text_document_content(uri.clone(), Some(server_id), cx)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        same_buffer.read_with(cx, |buffer, _| buffer.remote_id()),
+        buffer.read_with(cx, |buffer, _| buffer.remote_id())
+    );
+    assert_eq!(requested_uris.lock().len(), 1);
+
+    let buffer_id = buffer.read_with(cx, |buffer, _| buffer.remote_id());
+    assert!(project.read_with(cx, |project, cx| {
+        project.lsp_store().read(cx).has_buffer_uri(buffer_id)
+    }));
+
+    let handle = project.update(cx, |project, cx| {
+        project.register_buffer_with_language_servers(&buffer, cx)
+    });
+    let open = fake_server
+        .receive_notification::<lsp::notification::DidOpenTextDocument>()
+        .await;
+    assert_eq!(open.text_document.uri, uri);
+    assert_eq!(open.text_document.text, "initial content");
+    assert_eq!(open.text_document.language_id, "rust");
+
+    *text_document_content.lock() = "refreshed content".to_string();
+    fake_server
+        .request::<lsp::TextDocumentContentRefreshRequest>(
+            lsp::TextDocumentContentRefreshParams { uri: uri.clone() },
+            DEFAULT_LSP_REQUEST_TIMEOUT,
+        )
+        .await
+        .into_response()
+        .unwrap();
+    assert_eq!(requested_uris.lock().len(), 2);
+    assert_eq!(
+        buffer.read_with(cx, |buffer, _| buffer.text()),
+        "refreshed content"
+    );
+
+    let change = fake_server
+        .receive_notification::<lsp::notification::DidChangeTextDocument>()
+        .await;
+    assert_eq!(change.text_document.uri, uri);
+    assert_eq!(change.text_document.version, 1);
+    assert_eq!(change.content_changes.len(), 1);
+    assert_eq!(change.content_changes[0].text, "refreshed content");
+
+    cx.update(|_| drop(handle));
+    cx.executor().run_until_parked();
+    let close = fake_server
+        .receive_notification::<lsp::notification::DidCloseTextDocument>()
+        .await;
+    assert_eq!(close.text_document.uri, uri);
+    assert!(!project.read_with(cx, |project, cx| {
+        project.lsp_store().read(cx).has_buffer_uri(buffer_id)
+    }));
+}
+
+#[gpui::test]
+async fn test_lsp_text_document_content_buffer_honors_dynamic_document_selectors(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "a.rs": "fn main() {}" }))
+        .await;
+    let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    language_registry.add(rust_lang());
+    let mut fake_servers = language_registry.register_fake_lsp(
+        "Rust",
+        FakeLspAdapter {
+            capabilities: lsp::ServerCapabilities {
+                workspace: Some(lsp::WorkspaceServerCapabilities {
+                    text_document_content: Some(
+                        lsp::TextDocumentContentOptions {
+                            schemes: vec!["test".to_string()],
+                        }
+                        .into(),
+                    ),
+                    ..Default::default()
+                }),
+                text_document_sync: Some(lsp::TextDocumentSyncCapability::Kind(
+                    lsp::TextDocumentSyncKind::FULL,
+                )),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+
+    let (_file_buffer, _file_handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/a.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let mut fake_server = fake_servers.next().await.unwrap();
+    fake_server
+        .receive_notification::<lsp::notification::DidOpenTextDocument>()
+        .await;
+
+    let server_id = fake_server.server.server_id();
+    let _text_document_content_requests = fake_server
+        .set_request_handler::<lsp::TextDocumentContentRequest, _, _>(|_, _| {
+            future::ready(Ok(lsp::TextDocumentContentResult {
+                text: "virtual content".to_string(),
+            }))
+        });
+
+    let uri = Uri::from_str("test:/virtual/document.rs").unwrap();
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_lsp_text_document_content(uri.clone(), Some(server_id), cx)
+        })
+        .await
+        .unwrap();
+    let handle = project.update(cx, |project, cx| {
+        project.register_buffer_with_language_servers(&buffer, cx)
+    });
+    let open = fake_server
+        .receive_notification::<lsp::notification::DidOpenTextDocument>()
+        .await;
+    assert_eq!(open.text_document.uri, uri);
+    assert_eq!(open.text_document.language_id, "rust");
+
+    fake_server
+        .request::<lsp::request::RegisterCapability>(
+            lsp::RegistrationParams {
+                registrations: vec![lsp::Registration {
+                    id: "untitled-hover".to_string(),
+                    method: "textDocument/hover".to_string(),
+                    register_options: Some(json!({
+                        "documentSelector": [{ "language": "rust", "scheme": "untitled" }],
+                    })),
+                }],
+            },
+            DEFAULT_LSP_REQUEST_TIMEOUT,
+        )
+        .await
+        .into_response()
+        .unwrap();
+    cx.executor().run_until_parked();
+
+    let hover_request_count = Arc::new(atomic::AtomicUsize::new(0));
+    let _hover_requests = fake_server.set_request_handler::<lsp::request::HoverRequest, _, _>({
+        let hover_request_count = hover_request_count.clone();
+        let expected_uri = uri.clone();
+        move |params, _| {
+            hover_request_count.fetch_add(1, atomic::Ordering::SeqCst);
+            let expected_uri = expected_uri.clone();
+            async move {
+                assert_eq!(
+                    params.text_document_position_params.text_document.uri,
+                    expected_uri
+                );
+                Ok(Some(lsp::Hover {
+                    contents: lsp::HoverContents::Scalar(lsp::MarkedString::String(
+                        "hover".to_string(),
+                    )),
+                    range: None,
+                }))
+            }
+        }
+    });
+
+    let hovers = project
+        .update(cx, |project, cx| {
+            project.hover(&buffer, Point::new(0, 0), cx)
+        })
+        .await;
+    assert!(hovers.is_some_and(|hovers| hovers.is_empty()));
+    assert_eq!(
+        hover_request_count.load(atomic::Ordering::SeqCst),
+        0,
+        "the untitled selector must not match a custom URI scheme",
+    );
+
+    fake_server
+        .request::<lsp::request::RegisterCapability>(
+            lsp::RegistrationParams {
+                registrations: vec![lsp::Registration {
+                    id: "test-hover".to_string(),
+                    method: "textDocument/hover".to_string(),
+                    register_options: Some(json!({
+                        "documentSelector": [{ "language": "rust", "scheme": "test" }],
+                    })),
+                }],
+            },
+            DEFAULT_LSP_REQUEST_TIMEOUT,
+        )
+        .await
+        .into_response()
+        .unwrap();
+    cx.executor().run_until_parked();
+
+    let hovers = project
+        .update(cx, |project, cx| {
+            project.hover(&buffer, Point::new(0, 0), cx)
+        })
+        .await;
+    assert_eq!(
+        hover_request_count.load(atomic::Ordering::SeqCst),
+        1,
+        "the custom-scheme selector should route the hover request",
+    );
+    assert_eq!(hovers.map(|hovers| hovers.len()), Some(1));
+
+    cx.update(|_| drop(handle));
+    cx.executor().run_until_parked();
+    let close = fake_server
+        .receive_notification::<lsp::notification::DidCloseTextDocument>()
+        .await;
+    assert_eq!(close.text_document.uri, uri);
 }
 
 #[gpui::test(iterations = 30)]
@@ -10395,6 +10693,7 @@ async fn test_lsp_rename_notifications(cx: &mut gpui::TestAppContext) {
                         will_rename: Some(watched_paths),
                         ..lsp::WorkspaceFileOperationsServerCapabilities::default()
                     }),
+                    ..lsp::WorkspaceServerCapabilities::default()
                 }),
                 ..lsp::ServerCapabilities::default()
             },

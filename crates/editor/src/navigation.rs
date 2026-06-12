@@ -1,4 +1,26 @@
 use super::*;
+use crate::hover_links::ResolvedFileTarget;
+
+enum NonLocationHoverLink {
+    Url(String),
+    File(ResolvedFileTarget),
+    LspTextDocumentContent {
+        uri: lsp::Uri,
+        server_id: LanguageServerId,
+        fallback_url: String,
+    },
+}
+
+fn lsp_text_document_content_title(uri: &lsp::Uri) -> String {
+    uri.path_segments()
+        .and_then(|segments| {
+            segments
+                .rev()
+                .find(|segment| !segment.is_empty())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| uri.as_str().to_string())
+}
 
 impl Editor {
     pub fn move_left(&mut self, _: &MoveLeft, window: &mut Window, cx: &mut Context<Self>) {
@@ -1710,8 +1732,8 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Editor>,
     ) -> Task<Result<Navigated>> {
-        // Separate out url and file links, we can only handle one of them at most or an arbitrary number of locations
-        let mut first_url_or_file = None;
+        // Separate out non-location links, we can only handle one of them at most or an arbitrary number of locations
+        let mut first_non_location_link = None;
         let definitions: Vec<_> = definitions
             .into_iter()
             .filter_map(|def| match def {
@@ -1722,17 +1744,30 @@ impl Editor {
                     Some(cx.background_spawn(computation))
                 }
                 HoverLink::Url(url) => {
-                    first_url_or_file = Some(Either::Left(url));
+                    first_non_location_link = Some(NonLocationHoverLink::Url(url));
                     None
                 }
                 HoverLink::File(file_target) => {
-                    first_url_or_file = Some(Either::Right(file_target));
+                    first_non_location_link = Some(NonLocationHoverLink::File(file_target));
+                    None
+                }
+                HoverLink::LspTextDocumentContent {
+                    uri,
+                    server_id,
+                    fallback_url,
+                } => {
+                    first_non_location_link = Some(NonLocationHoverLink::LspTextDocumentContent {
+                        uri,
+                        server_id,
+                        fallback_url,
+                    });
                     None
                 }
             })
             .collect();
 
         let workspace = self.workspace();
+        let project = self.project().cloned();
 
         let excerpt_context_lines = multi_buffer::excerpt_context_lines(cx);
         cx.spawn_in(window, async move |editor, cx| {
@@ -1848,8 +1883,8 @@ impl Editor {
                 anyhow::Ok(Navigated::from_bool(opened))
             } else if num_locations == 0 {
                 // If there is one url or file, open it directly
-                match first_url_or_file {
-                    Some(Either::Left(url)) => {
+                match first_non_location_link {
+                    Some(NonLocationHoverLink::Url(url)) => {
                         cx.update(|window, cx| {
                             if parse_zed_link(&url, cx).is_some() {
                                 window.dispatch_action(
@@ -1862,7 +1897,66 @@ impl Editor {
                         })?;
                         Ok(Navigated::Yes)
                     }
-                    Some(Either::Right(file_target)) => {
+                    Some(NonLocationHoverLink::LspTextDocumentContent {
+                        uri,
+                        server_id,
+                        fallback_url,
+                    }) => {
+                        let Some(workspace) = workspace else {
+                            cx.update(|_, cx| cx.open_url(&fallback_url))?;
+                            return Ok(Navigated::Yes);
+                        };
+                        let Some(project) = project else {
+                            cx.update(|_, cx| cx.open_url(&fallback_url))?;
+                            return Ok(Navigated::Yes);
+                        };
+                        let buffer = match project
+                            .update(cx, |project, cx| {
+                                project.open_lsp_text_document_content(
+                                    uri.clone(),
+                                    Some(server_id),
+                                    cx,
+                                )
+                            })
+                            .await
+                        {
+                            Ok(buffer) => buffer,
+                            Err(error) => {
+                                log::warn!(
+                                    "failed to open LSP text document content for {uri}: {error:#}"
+                                );
+                                cx.update(|_, cx| cx.open_url(&fallback_url))?;
+                                return Ok(Navigated::Yes);
+                            }
+                        };
+                        workspace.update_in(cx, |workspace, window, cx| {
+                            let editor = cx.new(|cx| {
+                                let mut editor = Editor::for_buffer(
+                                    buffer.clone(),
+                                    Some(project.clone()),
+                                    window,
+                                    cx,
+                                );
+                                editor.set_read_only(true);
+                                editor.buffer().update(cx, |buffer, cx| {
+                                    buffer.set_title(lsp_text_document_content_title(&uri), cx)
+                                });
+                                editor
+                            });
+                            let pane = workspace.active_pane().clone();
+                            workspace.add_item(
+                                pane,
+                                Box::new(editor),
+                                None,
+                                true,
+                                true,
+                                window,
+                                cx,
+                            );
+                        })?;
+                        Ok(Navigated::Yes)
+                    }
+                    Some(NonLocationHoverLink::File(file_target)) => {
                         // TODO(andrew): respect preview tab settings
                         //               `enable_keep_preview_on_code_navigation` and
                         //               `enable_preview_file_from_code_navigation`

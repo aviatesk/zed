@@ -46636,6 +46636,263 @@ async fn test_lsp_show_document_untitled_remote_project(cx: &mut TestAppContext)
 }
 
 #[gpui::test]
+async fn test_lsp_show_document_text_document_content(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "main.rs": "fn main() {}" }))
+        .await;
+    let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    language_registry.add(rust_lang());
+    let [mut first_servers, mut second_servers] =
+        ["first-provider", "second-provider"].map(|name| {
+            language_registry.register_fake_lsp(
+                "Rust",
+                FakeLspAdapter {
+                    name,
+                    capabilities: text_document_content_capabilities(&["test"]),
+                    ..Default::default()
+                },
+            )
+        });
+
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+        .expect("workspace window should be open");
+    let mut cx = VisualTestContext::from_window(*window, cx);
+    let initial_editor = workspace
+        .update_in(&mut cx, |workspace, window, cx| {
+            workspace.open_abs_path(
+                path!("/dir/main.rs").into(),
+                OpenOptions::default(),
+                window,
+                cx,
+            )
+        })
+        .await
+        .expect("the initial file should open")
+        .downcast::<Editor>()
+        .expect("the initial file should open in an editor");
+    let servers = [
+        first_servers
+            .next()
+            .await
+            .expect("first provider should start"),
+        second_servers
+            .next()
+            .await
+            .expect("second provider should start"),
+    ];
+    cx.run_until_parked();
+
+    let requested_uris = Arc::new(Mutex::new(Vec::new()));
+    for (index, server) in servers.iter().enumerate() {
+        let server_id = server.server.server_id();
+        let _content_requests = server
+            .set_request_handler::<lsp::TextDocumentContentRequest, _, _>({
+                let requested_uris = requested_uris.clone();
+                move |params, _| {
+                    requested_uris.lock().push((server_id, params.uri));
+                    async move {
+                        Ok(lsp::TextDocumentContentResult {
+                            text: format!("a😀bc\nprovider {index}"),
+                        })
+                    }
+                }
+            });
+    }
+
+    let initial_item_count = workspace.read_with(&cx, |workspace, cx| workspace.items(cx).count());
+    let mut expected_requests = Vec::new();
+    for (index, server) in servers.iter().enumerate() {
+        let uri = format!("test:/virtual/document-{index}.rs")
+            .parse::<lsp::Uri>()
+            .expect("valid custom URI");
+        let mut opened_document = None;
+        for take_focus in [None, Some(false), Some(true)] {
+            workspace.update_in(&mut cx, |workspace, window, cx| {
+                assert!(workspace.activate_item(&initial_editor, true, true, window, cx));
+            });
+            let response = server
+                .request::<lsp::request::ShowDocument>(
+                    lsp::ShowDocumentParams {
+                        uri: uri.clone(),
+                        external: None,
+                        take_focus,
+                        selection: (take_focus != Some(true)).then_some(lsp::Range::new(
+                            lsp::Position::new(0, 1),
+                            lsp::Position::new(0, 3),
+                        )),
+                    },
+                    DEFAULT_LSP_REQUEST_TIMEOUT,
+                )
+                .await
+                .into_response()
+                .expect("show document request should not error");
+            assert_eq!(response, lsp::ShowDocumentResult { success: true });
+            cx.run_until_parked();
+
+            workspace.update_in(&mut cx, |workspace, window, cx| {
+                let editor = workspace
+                    .active_item_as::<Editor>(cx)
+                    .expect("the content document should be displayed");
+                let buffer = editor
+                    .read(cx)
+                    .buffer()
+                    .read(cx)
+                    .as_singleton()
+                    .expect("a singleton buffer should be opened");
+                let document = (editor.clone(), buffer.clone());
+                if let Some(opened_document) = &opened_document {
+                    assert_eq!(
+                        &document, opened_document,
+                        "reopening should reuse the buffer and tab"
+                    );
+                } else {
+                    opened_document = Some(document);
+                }
+                assert_eq!(workspace.items(cx).count(), initial_item_count + index + 1);
+                assert!(buffer.read(cx).file().is_none());
+                assert_eq!(buffer.read(cx).text(), format!("a😀bc\nprovider {index}"));
+                assert_eq!(buffer.read(cx).capability(), ReadOnly);
+                assert_eq!(editor.read(cx).capability(cx), ReadOnly);
+                assert_eq!(
+                    editor.read(cx).is_focused(window),
+                    take_focus.unwrap_or(false)
+                );
+                assert_eq!(
+                    initial_editor.read(cx).is_focused(window),
+                    !take_focus.unwrap_or(false)
+                );
+                editor.update(cx, |editor, cx| {
+                    assert_eq!(
+                        editor
+                            .selections
+                            .ranges::<Point>(&editor.display_snapshot(cx)),
+                        vec![Point::new(0, 1)..Point::new(0, 5)]
+                    );
+                });
+            });
+        }
+        expected_requests.push((server.server.server_id(), uri));
+    }
+    assert_eq!(
+        *requested_uris.lock(),
+        expected_requests,
+        "each document should be fetched once from the requesting server"
+    );
+}
+
+#[gpui::test]
+async fn test_lsp_show_document_text_document_content_error(cx: &mut TestAppContext) {
+    let mut cx =
+        EditorLspTestContext::new_rust(text_document_content_capabilities(&["test"]), cx).await;
+    let requested_uris = Arc::new(Mutex::new(Vec::new()));
+    let _content_requests = cx
+        .lsp
+        .set_request_handler::<lsp::TextDocumentContentRequest, _, _>({
+            let requested_uris = requested_uris.clone();
+            move |params, _| {
+                requested_uris.lock().push(params.uri);
+                async move { Err(anyhow::anyhow!("content provider failed")) }
+            }
+        });
+    let uri = "test:/virtual/error.rs"
+        .parse::<lsp::Uri>()
+        .expect("valid custom URI");
+    let initial_editor = cx.editor.clone();
+    let initial_item_count = cx.update_workspace(|workspace, _, cx| workspace.items(cx).count());
+    let response = cx
+        .lsp
+        .request::<lsp::request::ShowDocument>(
+            lsp::ShowDocumentParams {
+                uri: uri.clone(),
+                external: None,
+                take_focus: Some(true),
+                selection: None,
+            },
+            DEFAULT_LSP_REQUEST_TIMEOUT,
+        )
+        .await
+        .into_response()
+        .expect("provider failures should be reported as unsuccessful show document responses");
+    assert_eq!(response, lsp::ShowDocumentResult { success: false });
+    cx.run_until_parked();
+    assert_eq!(*requested_uris.lock(), vec![uri]);
+    cx.update_workspace(|workspace, window, cx| {
+        assert_eq!(
+            workspace.active_item_as::<Editor>(cx),
+            Some(initial_editor.clone())
+        );
+        assert_eq!(workspace.items(cx).count(), initial_item_count);
+        assert!(initial_editor.read(cx).is_focused(window));
+    });
+}
+
+#[gpui::test]
+async fn test_lsp_show_document_http_does_not_use_content_provider(cx: &mut TestAppContext) {
+    let mut cx =
+        EditorLspTestContext::new_rust(text_document_content_capabilities(&["http", "https"]), cx)
+            .await;
+    let requested_uris = Arc::new(Mutex::new(Vec::new()));
+    let _content_requests = cx
+        .lsp
+        .set_request_handler::<lsp::TextDocumentContentRequest, _, _>({
+            let requested_uris = requested_uris.clone();
+            move |params, _| {
+                requested_uris.lock().push(params.uri);
+                async move {
+                    Ok(lsp::TextDocumentContentResult {
+                        text: "web content".into(),
+                    })
+                }
+            }
+        });
+    let initial_editor = cx.editor.clone();
+    let initial_item_count = cx.update_workspace(|workspace, _, cx| workspace.items(cx).count());
+    for uri in ["http://zed.dev/docs", "https://zed.dev/docs"] {
+        let response = cx
+            .lsp
+            .request::<lsp::request::ShowDocument>(
+                lsp::ShowDocumentParams {
+                    uri: uri.parse().expect("valid HTTP URI"),
+                    external: None,
+                    take_focus: Some(true),
+                    selection: None,
+                },
+                DEFAULT_LSP_REQUEST_TIMEOUT,
+            )
+            .await
+            .into_response()
+            .expect("show document request should not error");
+        assert_eq!(response, lsp::ShowDocumentResult { success: false });
+    }
+    cx.run_until_parked();
+    assert!(requested_uris.lock().is_empty());
+    assert_eq!(cx.opened_url(), None);
+    cx.update_workspace(|workspace, _, cx| {
+        assert_eq!(workspace.active_item_as::<Editor>(cx), Some(initial_editor));
+        assert_eq!(workspace.items(cx).count(), initial_item_count);
+    });
+}
+
+fn text_document_content_capabilities(schemes: &[&str]) -> lsp::ServerCapabilities {
+    lsp::ServerCapabilities {
+        workspace: Some(lsp::WorkspaceServerCapabilities {
+            text_document_content: Some(
+                lsp::TextDocumentContentOptions {
+                    schemes: schemes.iter().map(|scheme| (*scheme).to_string()).collect(),
+                }
+                .into(),
+            ),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+#[gpui::test]
 async fn test_lsp_show_document_external(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
     let mut cx = EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;

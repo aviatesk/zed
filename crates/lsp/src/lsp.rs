@@ -122,6 +122,7 @@ pub struct LanguageServer {
     process_name: Arc<str>,
     binary: LanguageServerBinary,
     capabilities: RwLock<ServerCapabilities>,
+    text_document_content_providers: RwLock<BTreeMap<Option<String>, TextDocumentContentOptions>>,
     /// Configuration sent to the server, stored for display in the language server logs
     /// buffer. This is represented as the message sent to the LSP in order to avoid cloning it (can
     /// be large in cases like sending schemas to the json server).
@@ -707,6 +708,7 @@ impl LanguageServer {
                 .unwrap_or_default(),
             binary,
             capabilities: Default::default(),
+            text_document_content_providers: Default::default(),
             configuration,
             code_action_kinds,
             next_id: Default::default(),
@@ -938,6 +940,9 @@ impl LanguageServer {
                     }),
                     semantic_tokens: Some(SemanticTokensWorkspaceClientCapabilities {
                         refresh_support: Some(true),
+                    }),
+                    text_document_content: Some(TextDocumentContentClientCapabilities {
+                        dynamic_registration: Some(true),
                     }),
                     ..WorkspaceClientCapabilities::default()
                 }),
@@ -1183,11 +1188,30 @@ impl LanguageServer {
                         self.server_id()
                     )
                 })?;
+            let text_document_content_provider = response
+                .capabilities
+                .workspace
+                .as_ref()
+                .and_then(|workspace| workspace.text_document_content.clone());
             if let Some(info) = response.server_info {
                 self.version = info.version.map(SharedString::from);
                 self.process_name = info.name.into();
             }
             self.capabilities = RwLock::new(response.capabilities);
+            if let Some(provider) = text_document_content_provider {
+                let (registration_id, options) = match provider {
+                    TextDocumentContentServerCapabilities::RegistrationOptions(
+                        registration_options,
+                    ) => (
+                        registration_options.static_registration_options.id,
+                        registration_options.text_document_content_options,
+                    ),
+                    TextDocumentContentServerCapabilities::Options(options) => (None, options),
+                };
+                self.text_document_content_providers
+                    .write()
+                    .insert(registration_id, options);
+            }
             self.configuration = configuration;
 
             self.notify::<notification::Initialized>(InitializedParams {})?;
@@ -1461,6 +1485,37 @@ impl LanguageServer {
     /// Update the capabilities of the running language server.
     pub fn update_capabilities(&self, update: impl FnOnce(&mut ServerCapabilities)) {
         update(self.capabilities.write().deref_mut());
+    }
+
+    pub fn update_text_document_content_provider(
+        &self,
+        registration_id: Option<String>,
+        options: TextDocumentContentOptions,
+    ) {
+        self.text_document_content_providers
+            .write()
+            .insert(registration_id, options);
+    }
+
+    pub fn remove_text_document_content_provider(&self, registration_id: Option<&str>) {
+        let key = registration_id.map(ToOwned::to_owned);
+        self.text_document_content_providers.write().remove(&key);
+    }
+
+    pub fn text_document_content_options_for_scheme(
+        &self,
+        scheme: &str,
+    ) -> Option<TextDocumentContentOptions> {
+        self.text_document_content_providers
+            .read()
+            .values()
+            .find(|options| {
+                options
+                    .schemes
+                    .iter()
+                    .any(|provider_scheme| provider_scheme == scheme)
+            })
+            .cloned()
     }
 
     /// Get the individual configuration settings for the running language server.

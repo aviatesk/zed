@@ -81,29 +81,48 @@ pub enum HoverLink {
     /// Used by inlay-hint hover, code-lens references, and document-link
     /// targets that point inside a workspace file (e.g. `file:///foo#9,16`).
     LspLocation(lsp::Location, LanguageServerId),
+    LspTextDocumentContent {
+        uri: lsp::Uri,
+        server_id: LanguageServerId,
+        fallback_url: String,
+    },
 }
 
 /// Convert a `documentLink` target URI into a [`HoverLink`], reusing the
 /// existing navigation paths: `file://` URIs go through the LSP location
-/// pipeline (so an optional `#line[,column]` fragment is honored), while
-/// any other scheme is opened as a regular URL.
+/// pipeline (so an optional `#line[,column]` fragment is honored), HTTP(S)
+/// URLs are opened externally, and other URI schemes may be backed by the
+/// server's `workspace/textDocumentContent` provider.
 pub fn document_link_target_to_hover_link(target: &str, server_id: LanguageServerId) -> HoverLink {
-    if let Ok(url) = url::Url::parse(target)
-        && url.scheme() == "file"
-        && let Ok(uri) = lsp::Uri::from_str(target)
-    {
-        let position = url
-            .fragment()
-            .and_then(source_position_from_fragment)
-            .map(|(line, character)| lsp::Position { line, character })
-            .unwrap_or_default();
-        return HoverLink::LspLocation(
-            lsp::Location {
-                uri,
-                range: lsp::Range::new(position, position),
-            },
-            server_id,
-        );
+    if let Ok(url) = url::Url::parse(target) {
+        match url.scheme() {
+            "file" => {
+                if let Ok(uri) = lsp::Uri::from_str(target) {
+                    let position = url
+                        .fragment()
+                        .and_then(source_position_from_fragment)
+                        .map(|(line, character)| lsp::Position { line, character })
+                        .unwrap_or_default();
+                    return HoverLink::LspLocation(
+                        lsp::Location {
+                            uri,
+                            range: lsp::Range::new(position, position),
+                        },
+                        server_id,
+                    );
+                }
+            }
+            "http" | "https" => {}
+            _ => {
+                if let Ok(uri) = lsp::Uri::from_str(target) {
+                    return HoverLink::LspTextDocumentContent {
+                        uri,
+                        server_id,
+                        fallback_url: target.to_string(),
+                    };
+                }
+            }
+        }
     }
     HoverLink::Url(target.to_string())
 }
@@ -378,10 +397,14 @@ pub fn show_link_definition(
         return;
     };
     let same_kind = hovered_link_state.preferred_kind == preferred_kind
-        || hovered_link_state
-            .links
-            .first()
-            .is_some_and(|d| matches!(d, HoverLink::Url(_) | HoverLink::LspLocation(_, _)));
+        || hovered_link_state.links.first().is_some_and(|d| {
+            matches!(
+                d,
+                HoverLink::Url(_)
+                    | HoverLink::LspLocation(_, _)
+                    | HoverLink::LspTextDocumentContent { .. }
+            )
+        });
 
     if same_kind {
         if is_cached && (hovered_link_state.last_trigger_point == trigger_point)
@@ -1121,6 +1144,24 @@ mod tests {
         match document_link_target_to_hover_link(target, server_id) {
             HoverLink::Url(url) => assert_eq!(url, target),
             other => panic!("expected Url variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_document_link_target_to_hover_link_text_document_content_uri() {
+        let server_id = LanguageServerId(0);
+        let target = "test:/virtual/document.rs";
+        match document_link_target_to_hover_link(target, server_id) {
+            HoverLink::LspTextDocumentContent {
+                uri,
+                server_id: returned_id,
+                fallback_url,
+            } => {
+                assert_eq!(uri.as_str(), target);
+                assert_eq!(returned_id, server_id);
+                assert_eq!(fallback_url, target);
+            }
+            other => panic!("expected LspTextDocumentContent variant, got {other:?}"),
         }
     }
 

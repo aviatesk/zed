@@ -309,17 +309,21 @@ pub struct DocumentDiagnostics {
 #[derive(Clone, Debug)]
 struct DocumentSelectorContext {
     language_id: String,
-    scheme: &'static str,
+    scheme: String,
+}
+#[derive(Debug, Clone)]
+pub(crate) struct BufferUriState {
+    pub(crate) uri: lsp::Uri,
+    pub(crate) host_worktree: WorktreeId,
+    text_document_content_provider: Option<LanguageServerId>,
 }
 
-/// Per-untitled-buffer LSP state. File-backed buffers don't need this — their
-/// URI and worktree are derivable from `file.abs_path()` / `file.worktree_id()`.
 #[derive(Debug, Clone)]
-pub(crate) struct UntitledBufferState {
-    pub(crate) uri: lsp::Uri,
-    /// Tracks the host worktree so removing it also drops the URI registration.
-    pub(crate) host_worktree: WorktreeId,
+struct TextDocumentContentBufferState {
+    buffer_id: BufferId,
+    server_id: LanguageServerId,
 }
+
 pub struct LocalLspStore {
     weak: WeakEntity<LspStore>,
     pub worktree_store: Entity<WorktreeStore>,
@@ -359,7 +363,9 @@ pub struct LocalLspStore {
     lsp_tree: LanguageServerTree,
     registered_buffers: HashMap<BufferId, usize>,
     buffers_opened_in_servers: HashMap<BufferId, HashSet<LanguageServerId>>,
-    pub(crate) buffer_uris: HashMap<BufferId, UntitledBufferState>,
+    pub(crate) buffer_uris: HashMap<BufferId, BufferUriState>,
+    text_document_content_buffers_by_uri: HashMap<lsp::Uri, TextDocumentContentBufferState>,
+    text_document_content_uri_by_buffer_id: HashMap<BufferId, lsp::Uri>,
     buffer_pull_diagnostics_result_ids: HashMap<
         LanguageServerId,
         HashMap<Option<SharedString>, HashMap<PathBuf, Option<SharedString>>>,
@@ -396,6 +402,26 @@ impl LocalLspStore {
         self.language_server_ids
             .iter()
             .find_map(|(seed, state)| (state.id == server_id).then_some(seed.worktree_id))
+    }
+
+    fn remove_text_document_content_buffer_for_buffer(&mut self, buffer_id: BufferId) {
+        if let Some(uri) = self
+            .text_document_content_uri_by_buffer_id
+            .remove(&buffer_id)
+            && self
+                .text_document_content_buffers_by_uri
+                .get(&uri)
+                .is_some_and(|state| state.buffer_id == buffer_id)
+        {
+            self.text_document_content_buffers_by_uri.remove(&uri);
+        }
+    }
+
+    fn remove_text_document_content_buffer_for_uri(&mut self, uri: &lsp::Uri) -> Option<BufferId> {
+        let state = self.text_document_content_buffers_by_uri.remove(uri)?;
+        self.text_document_content_uri_by_buffer_id
+            .remove(&state.buffer_id);
+        Some(state.buffer_id)
     }
 
     fn get_or_insert_language_server(
@@ -1174,6 +1200,22 @@ impl LocalLspStore {
                             lsp_store.refresh_semantic_tokens(server_id, cx);
                         })?;
                         Ok(())
+                    }
+                }
+            })
+            .detach();
+
+        language_server
+            .on_request::<lsp::TextDocumentContentRefreshRequest, _, _>({
+                let this = lsp_store.clone();
+                move |params, cx| {
+                    let this = this.clone();
+                    let mut cx = cx.clone();
+                    async move {
+                        this.update(&mut cx, |lsp_store, cx| {
+                            lsp_store.refresh_text_document_content(params.uri, server_id, cx)
+                        })?
+                        .await
                     }
                 }
             })
@@ -3167,6 +3209,11 @@ impl LocalLspStore {
         {
             let buffer_display_name = file
                 .map(|file| file.abs_path(cx).to_string_lossy().into_owned())
+                .or_else(|| {
+                    self.buffer_uris
+                        .get(&buffer_id)
+                        .map(|state| state.uri.to_string())
+                })
                 .unwrap_or_else(|| untitled_buffer_uri(buffer_id).to_string());
             log::debug!(
                 "not registering {} with language servers because its longest line has {} characters, exceeding the configured limit of {}",
@@ -3177,7 +3224,15 @@ impl LocalLspStore {
             return;
         }
 
-        let (uri, uri_display, initial_snapshot, worktree_id, path, worktree);
+        let (
+            uri,
+            uri_display,
+            initial_snapshot,
+            worktree_id,
+            path,
+            worktree,
+            text_document_content_provider,
+        );
         if let Some(file) = file {
             let abs_path = file.abs_path(cx);
             let Some(file_uri) = file_path_to_lsp_url(&abs_path).log_err() else {
@@ -3200,6 +3255,7 @@ impl LocalLspStore {
                 return;
             };
             worktree = wt;
+            text_document_content_provider = None;
         } else if let Some(state) = self.buffer_uris.get(&buffer_id).cloned() {
             uri = state.uri;
             uri_display = uri.to_string();
@@ -3214,6 +3270,7 @@ impl LocalLspStore {
             };
             worktree = host_worktree;
             path = Arc::from(RelPath::empty());
+            text_document_content_provider = state.text_document_content_provider;
         } else {
             uri = untitled_buffer_uri(buffer_id);
             uri_display = uri.to_string();
@@ -3227,94 +3284,119 @@ impl LocalLspStore {
             worktree = wt;
             worktree_id = worktree.read(cx).id();
             path = Arc::from(RelPath::empty());
-            // Only untitled buffers need stored state, file-backed buffers can
-            // derive their URI/worktree from `file.abs_path()` / `file.worktree_id()`.
             self.buffer_uris.insert(
                 buffer_id,
-                UntitledBufferState {
+                BufferUriState {
                     uri: uri.clone(),
                     host_worktree: worktree_id,
+                    text_document_content_provider: None,
                 },
             );
+            text_document_content_provider = None;
         };
         let language_name = language.name();
-        let (reused, delegate, servers) = self
-            .reuse_existing_language_server(&self.lsp_tree, &worktree, &language_name, cx)
-            .map(|(delegate, apply)| (true, delegate, apply(&mut self.lsp_tree)))
-            .unwrap_or_else(|| {
-                let lsp_delegate = LocalLspAdapterDelegate::from_local_lsp(self, &worktree, cx);
-                let delegate: Arc<dyn ManifestDelegate> =
-                    Arc::new(ManifestQueryDelegate::new(worktree.read(cx).snapshot()));
-
-                let servers = self
-                    .lsp_tree
-                    .walk(
-                        ProjectPath { worktree_id, path },
-                        language.name(),
-                        language.manifest(),
-                        &delegate,
-                        cx,
-                    )
-                    .collect::<Vec<_>>();
-                (false, lsp_delegate, servers)
-            });
-        let servers_and_adapters = servers
-            .into_iter()
-            .filter_map(|server_node| {
-                if reused && server_node.server_id().is_none() {
-                    return None;
-                }
-                if let Some(name) = server_node.name()
-                    && self.stopped_language_servers.contains(&name)
-                {
-                    return None;
-                }
-                if !only_register_servers.is_empty() {
-                    if let Some(server_id) = server_node.server_id()
-                        && !only_register_servers.contains(&LanguageServerSelector::Id(server_id))
+        let servers_and_adapters = if let Some(provider_server_id) = text_document_content_provider
+        {
+            self.language_servers
+                .get(&provider_server_id)
+                .and_then(|server_state| {
+                    let LanguageServerState::Running {
+                        server, adapter, ..
+                    } = server_state
+                    else {
+                        return None;
+                    };
+                    if !only_register_servers.is_empty()
+                        && !only_register_servers
+                            .contains(&LanguageServerSelector::Id(provider_server_id))
+                        && !only_register_servers
+                            .contains(&LanguageServerSelector::Name(server.name()))
                     {
+                        return None;
+                    }
+                    Some(vec![(server.clone(), adapter.clone())])
+                })
+                .unwrap_or_default()
+        } else {
+            let (reused, delegate, servers) = self
+                .reuse_existing_language_server(&self.lsp_tree, &worktree, &language_name, cx)
+                .map(|(delegate, apply)| (true, delegate, apply(&mut self.lsp_tree)))
+                .unwrap_or_else(|| {
+                    let lsp_delegate = LocalLspAdapterDelegate::from_local_lsp(self, &worktree, cx);
+                    let delegate: Arc<dyn ManifestDelegate> =
+                        Arc::new(ManifestQueryDelegate::new(worktree.read(cx).snapshot()));
+
+                    let servers = self
+                        .lsp_tree
+                        .walk(
+                            ProjectPath { worktree_id, path },
+                            language.name(),
+                            language.manifest(),
+                            &delegate,
+                            cx,
+                        )
+                        .collect::<Vec<_>>();
+                    (false, lsp_delegate, servers)
+                });
+            servers
+                .into_iter()
+                .filter_map(|server_node| {
+                    if reused && server_node.server_id().is_none() {
                         return None;
                     }
                     if let Some(name) = server_node.name()
-                        && !only_register_servers.contains(&LanguageServerSelector::Name(name))
+                        && self.stopped_language_servers.contains(&name)
                     {
                         return None;
                     }
-                }
-
-                let server_id = server_node.server_id_or_init(|disposition| {
-                    let path = &disposition.path;
-
-                    {
-                        let uri = Uri::from_file_path(worktree.read(cx).absolutize(&path.path));
-
-                        let server_id = self.get_or_insert_language_server(
-                            &worktree,
-                            delegate.clone(),
-                            disposition,
-                            &language_name,
-                            cx,
-                        );
-
-                        if let Some(state) = self.language_servers.get(&server_id)
-                            && let Ok(uri) = uri
+                    if !only_register_servers.is_empty() {
+                        if let Some(server_id) = server_node.server_id()
+                            && !only_register_servers
+                                .contains(&LanguageServerSelector::Id(server_id))
                         {
-                            state.add_workspace_folder(uri);
-                        };
-                        server_id
+                            return None;
+                        }
+                        if let Some(name) = server_node.name()
+                            && !only_register_servers.contains(&LanguageServerSelector::Name(name))
+                        {
+                            return None;
+                        }
                     }
-                })?;
-                let server_state = self.language_servers.get(&server_id)?;
-                if let LanguageServerState::Running {
-                    server, adapter, ..
-                } = server_state
-                {
-                    Some((server.clone(), adapter.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
+
+                    let server_id = server_node.server_id_or_init(|disposition| {
+                        let path = &disposition.path;
+
+                        {
+                            let uri = Uri::from_file_path(worktree.read(cx).absolutize(&path.path));
+
+                            let server_id = self.get_or_insert_language_server(
+                                &worktree,
+                                delegate.clone(),
+                                disposition,
+                                &language_name,
+                                cx,
+                            );
+
+                            if let Some(state) = self.language_servers.get(&server_id)
+                                && let Ok(uri) = uri
+                            {
+                                state.add_workspace_folder(uri);
+                            };
+                            server_id
+                        }
+                    })?;
+                    let server_state = self.language_servers.get(&server_id)?;
+                    if let LanguageServerState::Running {
+                        server, adapter, ..
+                    } = server_state
+                    {
+                        Some((server.clone(), adapter.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
         for (server, adapter) in servers_and_adapters {
             buffer_handle.update(cx, |buffer, cx| {
                 buffer.set_completion_triggers(
@@ -4166,12 +4248,21 @@ impl LocalLspStore {
             cx.emit(LspStoreEvent::LanguageServerRemoved(*server_id_to_remove));
         }
 
-        // Untitled buffers anchored to the removed worktree have no remaining
-        // host: drop their `buffer_uris` entry so `is_lsp_relevant` stops
-        // returning true for them. The associated language servers were already
-        // removed above, so there's nothing to unregister at the LSP level.
-        self.buffer_uris
-            .retain(|_, state| state.host_worktree != id_to_remove);
+        let buffer_uris_to_remove = self
+            .buffer_uris
+            .iter()
+            .filter_map(|(buffer_id, state)| {
+                (state.host_worktree == id_to_remove
+                    || state
+                        .text_document_content_provider
+                        .is_some_and(|server_id| servers_to_remove.contains(&server_id)))
+                .then_some(*buffer_id)
+            })
+            .collect::<Vec<_>>();
+        for buffer_id in buffer_uris_to_remove {
+            self.buffer_uris.remove(&buffer_id);
+            self.remove_text_document_content_buffer_for_buffer(buffer_id);
+        }
 
         servers_to_remove.into_iter().collect()
     }
@@ -5051,6 +5142,8 @@ impl LspStore {
                 registered_buffers: HashMap::default(),
                 buffers_opened_in_servers: HashMap::default(),
                 buffer_uris: HashMap::default(),
+                text_document_content_buffers_by_uri: HashMap::default(),
+                text_document_content_uri_by_buffer_id: HashMap::default(),
                 buffer_pull_diagnostics_result_ids: HashMap::default(),
                 workspace_pull_diagnostics_result_ids: HashMap::default(),
                 workspace_diagnostics_edit_debounce_tasks: HashMap::default(),
@@ -5164,10 +5257,11 @@ impl LspStore {
                         if local.registered_buffers.contains_key(&buffer_id) {
                             local.unregister_old_buffer_from_language_servers(buffer, old_file, cx);
                         }
-                    } else if local.registered_buffers.contains_key(&buffer_id) {
-                        if let Some(state) = local.buffer_uris.remove(&buffer_id) {
-                            local.unregister_buffer_from_language_servers(buffer, &state.uri, cx);
-                        }
+                    } else if local.registered_buffers.contains_key(&buffer_id)
+                        && let Some(state) = local.buffer_uris.remove(&buffer_id)
+                    {
+                        local.unregister_buffer_from_language_servers(buffer, &state.uri, cx);
+                        local.remove_text_document_content_buffer_for_buffer(buffer_id);
                     }
                 }
 
@@ -5179,7 +5273,12 @@ impl LspStore {
                     }
                 }
             }
-            _ => {}
+            BufferStoreEvent::BufferDropped(buffer_id) => {
+                if let Some(local) = self.as_local_mut() {
+                    local.remove_text_document_content_buffer_for_buffer(*buffer_id);
+                }
+            }
+            BufferStoreEvent::SharedBufferClosed(..) => {}
         }
     }
 
@@ -5434,10 +5533,10 @@ impl LspStore {
                 *refcount += 1;
             }
 
-            if let Some(file) = File::from_dyn(buffer.read(cx).file()) {
-                if !file.is_local() {
-                    return handle;
-                }
+            if let Some(file) = File::from_dyn(buffer.read(cx).file())
+                && !file.is_local()
+            {
+                return handle;
             }
 
             if ignore_refcounts || *refcount == 1 {
@@ -5500,6 +5599,7 @@ impl LspStore {
                         } else if let Some(state) = local.buffer_uris.remove(&buffer_id) {
                             local
                                 .unregister_buffer_from_language_servers(&buffer.0, &state.uri, cx);
+                            local.remove_text_document_content_buffer_for_buffer(buffer_id);
                         }
                         lsp_store
                             .as_local_mut()
@@ -6107,7 +6207,7 @@ impl LspStore {
             .map(|adapter| adapter.language_id(language))?;
         Some(DocumentSelectorContext {
             language_id,
-            scheme: "file",
+            scheme: "file".to_string(),
         })
     }
 
@@ -8785,6 +8885,7 @@ impl LspStore {
                         {
                             for (registration_id, registration) in diagnostic_registrations {
                                 if !dynamic_text_document_registration_allows_buffer(
+                                    local,
                                     registration,
                                     buffer.read(cx),
                                     &adapter,
@@ -10688,9 +10789,14 @@ impl LspStore {
                 let local = lsp_store
                     .as_local_mut()
                     .context("opening LSP untitled documents requires a local LSP store")?;
-                local
-                    .buffer_uris
-                    .insert(buffer_id, UntitledBufferState { uri, host_worktree });
+                local.buffer_uris.insert(
+                    buffer_id,
+                    BufferUriState {
+                        uri,
+                        host_worktree,
+                        text_document_content_provider: None,
+                    },
+                );
                 anyhow::Ok(())
             })??;
             Ok(buffer)
@@ -13984,9 +14090,8 @@ impl LspStore {
                     if !worktrees_using_server.contains(&file.worktree.read(cx).id()) {
                         continue;
                     }
-                    let file = match file.as_local() {
-                        Some(file) => file,
-                        None => continue,
+                    let Some(file) = file.as_local() else {
+                        continue;
                     };
                     let abs_path = file.abs_path(cx);
                     uri = match lsp::Uri::from_file_path(&abs_path) {
@@ -13998,11 +14103,16 @@ impl LspStore {
                     };
                     uri_display = abs_path.to_string_lossy().into_owned();
                 } else {
-                    let Some(stored_uri) = local.buffer_uris.get(&buffer_id).map(|s| s.uri.clone())
-                    else {
+                    let Some(state) = local.buffer_uris.get(&buffer_id) else {
                         continue;
                     };
-                    uri = stored_uri;
+                    if state
+                        .text_document_content_provider
+                        .is_some_and(|provider_server_id| provider_server_id != server_id)
+                    {
+                        continue;
+                    }
+                    uri = state.uri.clone();
                     uri_display = uri.to_string();
                 }
 
@@ -14906,6 +15016,194 @@ impl LspStore {
         }
     }
 
+    pub fn open_text_document_content(
+        &mut self,
+        uri: lsp::Uri,
+        preferred_server_id: Option<LanguageServerId>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Buffer>>> {
+        if self.upstream_client().is_some() {
+            return Task::ready(Err(anyhow!(
+                "opening LSP text document content is not supported for remote projects yet"
+            )));
+        }
+
+        if let Some(state) = self
+            .as_local()
+            .and_then(|local| local.text_document_content_buffers_by_uri.get(&uri))
+        {
+            if let Some(buffer) = self.buffer_store.read(cx).get(state.buffer_id) {
+                return Task::ready(Ok(buffer));
+            }
+        }
+        if let Some(local) = self.as_local_mut()
+            && let Some(buffer_id) = local.remove_text_document_content_buffer_for_uri(&uri)
+        {
+            local.buffer_uris.remove(&buffer_id);
+        }
+
+        let scheme = uri.scheme().to_string();
+        let Some(server) = self.text_document_content_server(&scheme, preferred_server_id) else {
+            return Task::ready(Err(anyhow!(
+                "no language server provides text document content for URI scheme {scheme:?}"
+            )));
+        };
+        let server_id = server.server_id();
+
+        let timeout = ProjectSettings::get_global(cx)
+            .global_lsp_settings
+            .get_request_timeout();
+        let Some(local) = self.as_local() else {
+            return Task::ready(Err(anyhow!(
+                "opening LSP text document content requires a local LSP store"
+            )));
+        };
+        let Some(host_worktree) = local
+            .worktree_id_for_language_server(server_id)
+            .or_else(|| {
+                local
+                    .worktree_store
+                    .read(cx)
+                    .visible_worktrees(cx)
+                    .next()
+                    .map(|worktree| worktree.read(cx).id())
+            })
+        else {
+            return Task::ready(Err(anyhow!(
+                "opening LSP text document content requires a visible worktree"
+            )));
+        };
+        let languages = local.languages.clone();
+        let buffer = self.buffer_store.update(cx, |buffer_store, cx| {
+            buffer_store.create_buffer(None, false, cx)
+        });
+        cx.spawn(async move |lsp_store, cx| {
+            let response = server
+                .request::<lsp::TextDocumentContentRequest>(
+                    lsp::TextDocumentContentParams { uri: uri.clone() },
+                    timeout,
+                )
+                .await
+                .into_response()?;
+            let buffer = buffer.await?;
+            buffer.update(cx, |buffer, cx| {
+                buffer.set_text(response.text, cx);
+                buffer.set_capability(Capability::ReadOnly, cx);
+            });
+            let language_path = PathBuf::from(uri.path());
+            if let Ok(language) = languages.load_language_for_file_path(&language_path).await {
+                buffer.update(cx, |buffer, cx| buffer.set_language(Some(language), cx));
+            }
+            let buffer_id = buffer.update(cx, |buffer, _cx| buffer.remote_id());
+            lsp_store.update(cx, |lsp_store, _cx| {
+                let Some(local) = lsp_store.as_local_mut() else {
+                    return;
+                };
+                local.buffer_uris.insert(
+                    buffer_id,
+                    BufferUriState {
+                        uri: uri.clone(),
+                        host_worktree,
+                        text_document_content_provider: Some(server_id),
+                    },
+                );
+                local.text_document_content_buffers_by_uri.insert(
+                    uri.clone(),
+                    TextDocumentContentBufferState {
+                        buffer_id,
+                        server_id,
+                    },
+                );
+                local
+                    .text_document_content_uri_by_buffer_id
+                    .insert(buffer_id, uri.clone());
+            })?;
+            Ok(buffer)
+        })
+    }
+
+    fn refresh_text_document_content(
+        &mut self,
+        uri: lsp::Uri,
+        server_id: LanguageServerId,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let Some(state) = self.as_local().and_then(|local| {
+            local
+                .text_document_content_buffers_by_uri
+                .get(&uri)
+                .cloned()
+        }) else {
+            return Task::ready(Ok(()));
+        };
+        if state.server_id != server_id {
+            return Task::ready(Ok(()));
+        }
+        let Some(buffer) = self.buffer_store.read(cx).get(state.buffer_id) else {
+            if let Some(local) = self.as_local_mut() {
+                local.remove_text_document_content_buffer_for_uri(&uri);
+            }
+            return Task::ready(Ok(()));
+        };
+        let Some(server) = self.as_local().and_then(|local| {
+            let LanguageServerState::Running { server, .. } =
+                local.language_servers.get(&server_id)?
+            else {
+                return None;
+            };
+            Some(server.clone())
+        }) else {
+            return Task::ready(Ok(()));
+        };
+        let timeout = ProjectSettings::get_global(cx)
+            .global_lsp_settings
+            .get_request_timeout();
+        cx.spawn(async move |_, cx| {
+            let response = server
+                .request::<lsp::TextDocumentContentRequest>(
+                    lsp::TextDocumentContentParams { uri },
+                    timeout,
+                )
+                .await
+                .into_response()?;
+            buffer.update(cx, |buffer, cx| {
+                if buffer.text() != response.text {
+                    buffer.set_text(response.text, cx);
+                }
+            });
+            Ok(())
+        })
+    }
+
+    fn text_document_content_server(
+        &self,
+        scheme: &str,
+        preferred_server_id: Option<LanguageServerId>,
+    ) -> Option<Arc<LanguageServer>> {
+        let local = self.as_local()?;
+        if let Some(server_id) = preferred_server_id {
+            let LanguageServerState::Running { server, .. } =
+                local.language_servers.get(&server_id)?
+            else {
+                return None;
+            };
+            return server
+                .text_document_content_options_for_scheme(scheme)
+                .is_some()
+                .then(|| server.clone());
+        }
+
+        local.language_servers.values().find_map(|state| {
+            let LanguageServerState::Running { server, .. } = state else {
+                return None;
+            };
+            server
+                .text_document_content_options_for_scheme(scheme)
+                .is_some()
+                .then(|| server.clone())
+        })
+    }
+
     fn clear_unregistered_diagnostics(
         &mut self,
         server_id: LanguageServerId,
@@ -15263,17 +15561,23 @@ impl LspStore {
 }
 
 fn document_selector_context_for_buffer(
+    local: &LocalLspStore,
     buffer: &Buffer,
     adapter: &CachedLspAdapter,
 ) -> Option<DocumentSelectorContext> {
     let language = buffer.language()?;
+    let scheme = if buffer.file().is_some() {
+        "file"
+    } else {
+        local
+            .buffer_uris
+            .get(&buffer.remote_id())
+            .map(|state| state.uri.scheme())
+            .unwrap_or("untitled")
+    };
     Some(DocumentSelectorContext {
         language_id: adapter.language_id(&language.name()),
-        scheme: if buffer.file().is_some() {
-            "file"
-        } else {
-            "untitled"
-        },
+        scheme: scheme.to_string(),
     })
 }
 
@@ -15283,7 +15587,7 @@ fn document_selector_context_for_language(
 ) -> DocumentSelectorContext {
     DocumentSelectorContext {
         language_id: adapter.language_id(language),
-        scheme: "file",
+        scheme: "file".to_string(),
     }
 }
 
@@ -15296,6 +15600,10 @@ fn document_selector_matches(
     };
 
     document_selector.iter().any(|filter| {
+        let lsp::DocumentFilter::Text(filter) = filter else {
+            return false;
+        };
+
         if let Some(language) = &filter.language
             && language != &context.language_id
         {
@@ -15303,7 +15611,7 @@ fn document_selector_matches(
         }
 
         if let Some(scheme) = &filter.scheme
-            && !scheme.eq_ignore_ascii_case(context.scheme)
+            && !scheme.eq_ignore_ascii_case(&context.scheme)
         {
             return false;
         }
@@ -15351,11 +15659,12 @@ fn remote_text_document_capabilities_match(
 }
 
 fn dynamic_text_document_registration_allows_buffer(
+    local: &LocalLspStore,
     registration: &dynamic_registration::DynamicTextDocumentRegistration,
     buffer: &Buffer,
     adapter: &CachedLspAdapter,
 ) -> bool {
-    let Some(context) = document_selector_context_for_buffer(buffer, adapter) else {
+    let Some(context) = document_selector_context_for_buffer(local, buffer, adapter) else {
         return true;
     };
 
@@ -15397,7 +15706,7 @@ fn text_document_capabilities_for_buffer<'a>(
         .into_iter()
         .flat_map(|registrations| registrations.values())
         .filter(move |registration| {
-            dynamic_text_document_registration_allows_buffer(registration, buffer, adapter)
+            dynamic_text_document_registration_allows_buffer(local, registration, buffer, adapter)
         })
         .map(move |registration| AdapterServerCapabilities {
             server_capabilities: &registration.server_capabilities,
@@ -15498,11 +15807,15 @@ fn completion_trigger_characters_for_buffer(
         .and_then(|registrations| registrations.text_documents.get("textDocument/completion"))
     {
         for registration in registrations.values() {
-            if dynamic_text_document_registration_allows_buffer(registration, buffer, adapter)
-                && let Some(options) = registration
-                    .server_capabilities
-                    .completion_provider
-                    .as_ref()
+            if dynamic_text_document_registration_allows_buffer(
+                local,
+                registration,
+                buffer,
+                adapter,
+            ) && let Some(options) = registration
+                .server_capabilities
+                .completion_provider
+                .as_ref()
             {
                 extend_triggers(&mut triggers, options);
             }
@@ -17296,11 +17609,13 @@ mod tests {
                 collections::IndexMap::from_iter([(
                     "file-completion".to_string(),
                     dynamic_registration::DynamicTextDocumentRegistration {
-                        document_selector: Some(vec![lsp::DocumentFilter {
-                            language: Some("rust".to_string()),
-                            scheme: Some("file".to_string()),
-                            pattern: None,
-                        }]),
+                        document_selector: Some(vec![lsp::DocumentFilter::Text(
+                            lsp::TextDocumentFilter {
+                                language: Some("rust".to_string()),
+                                scheme: Some("file".to_string()),
+                                pattern: None,
+                            },
+                        )]),
                         server_capabilities: lsp::ServerCapabilities {
                             completion_provider: Some(lsp::CompletionOptions {
                                 trigger_characters: Some(vec![".".to_string()]),
@@ -17434,7 +17749,7 @@ mod tests {
     fn rust_file_context() -> DocumentSelectorContext {
         DocumentSelectorContext {
             language_id: "rust".to_string(),
-            scheme: "file",
+            scheme: "file".to_string(),
         }
     }
 
@@ -17444,11 +17759,11 @@ mod tests {
         collections::IndexMap::from_iter([(
             "rename-registration".to_string(),
             dynamic_registration::DynamicTextDocumentRegistration {
-                document_selector: Some(vec![lsp::DocumentFilter {
+                document_selector: Some(vec![lsp::DocumentFilter::Text(lsp::TextDocumentFilter {
                     language: Some(language.to_string()),
                     scheme: Some("file".to_string()),
                     pattern: None,
-                }]),
+                })]),
                 server_capabilities: rename_capabilities(),
             },
         )])
