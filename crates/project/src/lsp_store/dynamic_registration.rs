@@ -472,6 +472,17 @@ impl LspStore {
                         )?;
                     }
                 }
+                "workspace/textDocumentContent" => {
+                    if let Some(options) = reg.register_options {
+                        let options: lsp::TextDocumentContentRegistrationOptions =
+                            serde_json::from_value(options)?;
+                        server.update_text_document_content_provider(
+                            Some(reg.id),
+                            options.text_document_content_options,
+                        );
+                        self.notify_server_capabilities_updated(&server, cx);
+                    }
+                }
                 "textDocument/rangeFormatting" => {
                     let document_selector =
                         parse_text_document_registration(reg.register_options.as_ref())?;
@@ -1006,6 +1017,10 @@ impl LspStore {
                         |registrations| &mut registrations.execute_command,
                         |capabilities| &mut capabilities.execute_command_provider,
                     )?;
+                }
+                "workspace/textDocumentContent" => {
+                    server.remove_text_document_content_provider(Some(&unreg.id));
+                    self.notify_server_capabilities_updated(&server, cx);
                 }
                 "textDocument/rangeFormatting" => {
                     self.unregister_dynamic_text_document_capability(
