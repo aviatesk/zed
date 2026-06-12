@@ -152,11 +152,11 @@ async fn test_local_semantic_tokens_request_uses_matching_dynamic_registration(
 
     let matching_options = lsp::SemanticTokensRegistrationOptions {
         text_document_registration_options: lsp::TextDocumentRegistrationOptions {
-            document_selector: Some(vec![lsp::DocumentFilter {
+            document_selector: Some(vec![lsp::DocumentFilter::Text(lsp::TextDocumentFilter {
                 language: Some("rust".to_string()),
                 scheme: Some("file".to_string()),
                 pattern: None,
-            }]),
+            })]),
         },
         semantic_tokens_options: lsp::SemanticTokensOptions {
             legend: lsp::SemanticTokensLegend {
@@ -170,11 +170,11 @@ async fn test_local_semantic_tokens_request_uses_matching_dynamic_registration(
     };
     let nonmatching_options = lsp::SemanticTokensRegistrationOptions {
         text_document_registration_options: lsp::TextDocumentRegistrationOptions {
-            document_selector: Some(vec![lsp::DocumentFilter {
+            document_selector: Some(vec![lsp::DocumentFilter::Text(lsp::TextDocumentFilter {
                 language: Some("rust".to_string()),
                 scheme: Some("untitled".to_string()),
                 pattern: None,
-            }]),
+            })]),
         },
         semantic_tokens_options: lsp::SemanticTokensOptions {
             legend: lsp::SemanticTokensLegend {
@@ -265,11 +265,11 @@ async fn test_local_semantic_tokens_request_uses_matching_dynamic_registration(
 
     let updated_matching_options = lsp::SemanticTokensRegistrationOptions {
         text_document_registration_options: lsp::TextDocumentRegistrationOptions {
-            document_selector: Some(vec![lsp::DocumentFilter {
+            document_selector: Some(vec![lsp::DocumentFilter::Text(lsp::TextDocumentFilter {
                 language: Some("rust".to_string()),
                 scheme: Some("file".to_string()),
                 pattern: None,
-            }]),
+            })]),
         },
         semantic_tokens_options: lsp::SemanticTokensOptions {
             legend: lsp::SemanticTokensLegend {
@@ -316,11 +316,11 @@ async fn test_semantic_tokens_refresh_when_duplicate_removal_changes_provider_or
     let registration_options = |scheme: &str, token_type: &str| {
         serde_json::to_value(lsp::SemanticTokensRegistrationOptions {
             text_document_registration_options: lsp::TextDocumentRegistrationOptions {
-                document_selector: Some(vec![lsp::DocumentFilter {
+                document_selector: Some(vec![lsp::DocumentFilter::Text(lsp::TextDocumentFilter {
                     language: Some("rust".to_string()),
                     scheme: Some(scheme.to_string()),
                     pattern: None,
-                }]),
+                })]),
             },
             semantic_tokens_options: lsp::SemanticTokensOptions {
                 legend: lsp::SemanticTokensLegend {
