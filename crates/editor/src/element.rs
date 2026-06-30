@@ -7404,12 +7404,20 @@ impl LineWithInvisibles {
                                         if is_whitespace
                                             && (non_whitespace_added || !is_soft_wrapped)
                                         {
-                                            Some(Invisible::Whitespace {
-                                                line_start_offset: line_byte_offset + index,
-                                                line_end_offset: line_byte_offset
-                                                    + index
-                                                    + c.len_utf8(),
-                                            })
+                                            let line_start_offset = line_byte_offset + index;
+                                            let line_end_offset = line_start_offset + c.len_utf8();
+
+                                            if c == '\u{3000}' {
+                                                Some(Invisible::IdeographicSpace {
+                                                    line_start_offset,
+                                                    line_end_offset,
+                                                })
+                                            } else {
+                                                Some(Invisible::Whitespace {
+                                                    line_start_offset,
+                                                    line_end_offset,
+                                                })
+                                            }
                                         } else {
                                             None
                                         }
@@ -7686,20 +7694,36 @@ impl LineWithInvisibles {
         cx: &mut App,
     ) {
         let extract_whitespace_info = |invisible: &Invisible| {
-            let (token_offset, token_end_offset, invisible_symbol) = match invisible {
-                Invisible::Tab {
-                    line_start_offset,
-                    line_end_offset,
-                } => (*line_start_offset, *line_end_offset, &layout.tab_invisible),
-                Invisible::Whitespace {
-                    line_start_offset,
-                    line_end_offset,
-                } => (
-                    *line_start_offset,
-                    *line_end_offset,
-                    &layout.space_invisible,
-                ),
-            };
+            let (token_offset, token_end_offset, invisible_symbol, is_ideographic_space) =
+                match invisible {
+                    Invisible::Tab {
+                        line_start_offset,
+                        line_end_offset,
+                    } => (
+                        *line_start_offset,
+                        *line_end_offset,
+                        &layout.tab_invisible,
+                        false,
+                    ),
+                    Invisible::Whitespace {
+                        line_start_offset,
+                        line_end_offset,
+                    } => (
+                        *line_start_offset,
+                        *line_end_offset,
+                        &layout.space_invisible,
+                        false,
+                    ),
+                    Invisible::IdeographicSpace {
+                        line_start_offset,
+                        line_end_offset,
+                    } => (
+                        *line_start_offset,
+                        *line_end_offset,
+                        &layout.ideographic_space_invisible,
+                        true,
+                    ),
+                };
 
             let token_x = self.x_for_index(token_offset);
             // Center the marker inside the actual glyph's width so it lines up with
@@ -7718,6 +7742,7 @@ impl LineWithInvisibles {
 
             (
                 [token_offset, token_end_offset],
+                is_ideographic_space,
                 Box::new(move |window: &mut Window, cx: &mut App| {
                     invisible_symbol
                         .paint(origin, line_height, TextAlign::Left, None, window, cx)
@@ -7729,27 +7754,40 @@ impl LineWithInvisibles {
         let invisible_iter = self.invisibles.iter().map(extract_whitespace_info);
         match whitespace_setting {
             ShowWhitespaceSetting::None => (),
-            ShowWhitespaceSetting::All => invisible_iter.for_each(|(_, paint)| paint(window, cx)),
-            ShowWhitespaceSetting::Selection => invisible_iter.for_each(|([start, _], paint)| {
-                let invisible_point = DisplayPoint::new(row, start as u32);
-                if !selection_ranges
-                    .iter()
-                    .any(|region| region.start <= invisible_point && invisible_point < region.end)
-                {
-                    return;
-                }
+            ShowWhitespaceSetting::All => {
+                invisible_iter.for_each(|(_, _, paint)| paint(window, cx))
+            }
+            ShowWhitespaceSetting::Selection => {
+                invisible_iter.for_each(|([start, _], is_ideographic_space, paint)| {
+                    let invisible_point = DisplayPoint::new(row, start as u32);
+                    if !is_ideographic_space
+                        && !selection_ranges.iter().any(|region| {
+                            region.start <= invisible_point && invisible_point < region.end
+                        })
+                    {
+                        return;
+                    }
 
-                paint(window, cx);
-            }),
+                    paint(window, cx);
+                })
+            }
 
             ShowWhitespaceSetting::Trailing => {
                 let mut previous_start = self.len;
-                for ([start, end], paint) in invisible_iter.rev() {
-                    if previous_start != end {
-                        break;
+                let mut is_trailing_whitespace = true;
+                for ([start, end], is_ideographic_space, paint) in invisible_iter.rev() {
+                    if is_ideographic_space {
+                        paint(window, cx);
                     }
-                    previous_start = start;
-                    paint(window, cx);
+
+                    if is_trailing_whitespace && previous_start == end {
+                        previous_start = start;
+                        if !is_ideographic_space {
+                            paint(window, cx);
+                        }
+                    } else {
+                        is_trailing_whitespace = false;
+                    }
                 }
             }
 
@@ -7762,7 +7800,7 @@ impl LineWithInvisibles {
                 // the above cases.
                 // Note: We zip in the original `invisibles` to check for tab equality
                 let mut last_seen: Option<(bool, usize, Box<dyn Fn(&mut Window, &mut App)>)> = None;
-                for (([start, end], paint), invisible) in
+                for (([start, end], is_ideographic_space, paint), invisible) in
                     invisible_iter.zip_eq(self.invisibles.iter())
                 {
                     let should_render = match (&last_seen, invisible) {
@@ -7771,7 +7809,7 @@ impl LineWithInvisibles {
                         _ => false,
                     };
 
-                    if should_render || start == 0 || end == self.len {
+                    if is_ideographic_space || should_render || start == 0 || end == self.len {
                         paint(window, cx);
 
                         // Since we are scanning from the left, we will skip over the first available whitespace that is part
@@ -7786,9 +7824,11 @@ impl LineWithInvisibles {
 
                     // Manually render anything within a selection
                     let invisible_point = DisplayPoint::new(row, start as u32);
-                    if selection_ranges.iter().any(|region| {
-                        region.start <= invisible_point && invisible_point < region.end
-                    }) {
+                    if !is_ideographic_space
+                        && selection_ranges.iter().any(|region| {
+                            region.start <= invisible_point && invisible_point < region.end
+                        })
+                    {
                         paint(window, cx);
                     }
 
@@ -7908,6 +7948,11 @@ enum Invisible {
     /// Storing both offsets correctly accounts for multi-byte whitespace characters
     /// such as U+00A0 NO-BREAK SPACE, keeping adjacency checks correct.
     Whitespace {
+        line_start_offset: usize,
+        line_end_offset: usize,
+    },
+    /// A U+3000 IDEOGRAPHIC SPACE character.
+    IdeographicSpace {
         line_start_offset: usize,
         line_end_offset: usize,
     },
@@ -9463,6 +9508,19 @@ impl Element for EditorElement {
                         }],
                         None,
                     );
+                    let ideographic_space_char = SharedString::from("□");
+                    let ideographic_space_len = ideographic_space_char.len();
+                    let ideographic_space_invisible = window.text_system().shape_line(
+                        ideographic_space_char,
+                        font_size,
+                        &[TextRun {
+                            len: ideographic_space_len,
+                            font: self.style.text.font(),
+                            color: cx.theme().status().error,
+                            ..Default::default()
+                        }],
+                        None,
+                    );
 
                     let mode = snapshot.mode.clone();
 
@@ -9594,6 +9652,7 @@ impl Element for EditorElement {
                         crease_trailers,
                         tab_invisible,
                         space_invisible,
+                        ideographic_space_invisible,
                         sticky_buffer_header,
                         sticky_headers,
                         expand_toggles,
@@ -9814,6 +9873,7 @@ pub struct EditorLayout {
     mouse_context_menu: Option<AnyElement>,
     tab_invisible: ShapedLine,
     space_invisible: ShapedLine,
+    ideographic_space_invisible: ShapedLine,
     sticky_buffer_header: Option<AnyElement>,
     sticky_headers: Option<header::StickyHeaders>,
     document_colors: Option<(DocumentColorsRenderMode, Vec<(Range<DisplayPoint>, Hsla)>)>,
@@ -12058,6 +12118,35 @@ mod tests {
     }
 
     #[gpui::test]
+    fn test_ideographic_space_uses_dedicated_invisible(cx: &mut TestAppContext) {
+        init_test(cx, |s| {
+            s.defaults.show_whitespaces = Some(ShowWhitespaceSetting::All);
+        });
+
+        let actual_invisibles = collect_invisibles_from_new_editor(
+            cx,
+            EditorMode::full(),
+            "a\u{3000}b ",
+            px(500.0),
+            false,
+        );
+
+        assert_eq!(
+            actual_invisibles,
+            vec![
+                Invisible::IdeographicSpace {
+                    line_start_offset: 1,
+                    line_end_offset: 4,
+                },
+                Invisible::Whitespace {
+                    line_start_offset: 5,
+                    line_end_offset: 6,
+                }
+            ]
+        );
+    }
+
+    #[gpui::test]
     fn test_multibyte_whitespace_uses_utf8_byte_offsets(cx: &mut TestAppContext) {
         init_test(cx, |s| {
             s.defaults.show_whitespaces = Some(ShowWhitespaceSetting::All);
@@ -12252,6 +12341,10 @@ mod tests {
                     match expected_invisibles.get(i) {
                         Some(expected_invisible) => match (expected_invisible, actual_invisible) {
                             (Invisible::Whitespace { .. }, Invisible::Whitespace { .. })
+                            | (
+                                Invisible::IdeographicSpace { .. },
+                                Invisible::IdeographicSpace { .. },
+                            )
                             | (Invisible::Tab { .. }, Invisible::Tab { .. }) => {}
                             _ => {
                                 panic!(
