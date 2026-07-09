@@ -53,6 +53,11 @@ pub struct DiagnosticsToolInput {
     /// If you wanna access diagnostics for `dolor.txt` in `ipsum`, you should use the path `ipsum/dolor.txt`.
     /// </example>
     pub path: Option<String>,
+
+    /// Minimum severity to report for a per-file query: "error", "warning", "information",
+    /// or "hint". Defaults to "warning". Lower it to also surface information/hint-level lints
+    /// (e.g. an unused argument in a pure internal helper). Ignored for the project-wide summary.
+    pub min_severity: Option<String>,
 }
 
 pub struct DiagnosticsTool {
@@ -101,7 +106,7 @@ impl AgentTool for DiagnosticsTool {
             let input = input.recv().await.map_err(|e| e.to_string())?;
 
             futures::select! {
-                result = agent_lsp::diagnostics(project, input.path, cx).fuse() => result,
+                result = agent_lsp::diagnostics(project, input.path, input.min_severity, cx).fuse() => result,
                 _ = event_stream.cancelled_by_user().fuse() => {
                     Err("Diagnostics cancelled by user".to_string())
                 }
