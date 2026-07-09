@@ -325,17 +325,64 @@ pub fn buffer_has_running_language_server(
 pub async fn diagnostics(
     project: Entity<Project>,
     path: Option<String>,
+    min_severity: Option<String>,
     cx: &mut AsyncApp,
 ) -> Result<String, String> {
+    let min_severity = parse_min_severity(min_severity.as_deref())?;
     match path {
-        Some(ref path) if !path.is_empty() => diagnostics_for_path(project, path, cx).await,
+        Some(ref path) if !path.is_empty() => {
+            diagnostics_for_path(project, path, min_severity, cx).await
+        }
         _ => diagnostics_for_project(project, cx).await,
     }
+}
+
+/// Parse the `min_severity` argument (default `warning`). Diagnostics less severe than this are
+/// not reported; lowering it to `information`/`hint` also surfaces lower-tier lints (e.g. an
+/// unused argument in a pure internal helper) so the agent can decide whether to act on them.
+fn parse_min_severity(min_severity: Option<&str>) -> Result<DiagnosticSeverity, String> {
+    let Some(min_severity) = min_severity else {
+        return Ok(DiagnosticSeverity::WARNING);
+    };
+    Ok(match min_severity.to_ascii_lowercase().as_str() {
+        "error" => DiagnosticSeverity::ERROR,
+        "warning" => DiagnosticSeverity::WARNING,
+        "information" | "info" => DiagnosticSeverity::INFORMATION,
+        "hint" => DiagnosticSeverity::HINT,
+        other => {
+            return Err(format!(
+                "invalid min_severity {other:?}; expected one of: error, warning, information, hint"
+            ));
+        }
+    })
+}
+
+/// Lower rank = more severe (`ERROR` = 0 … `HINT` = 3). A diagnostic is reported when its rank
+/// is `<=` the requested minimum severity's rank.
+fn severity_rank(severity: DiagnosticSeverity) -> u8 {
+    match severity {
+        DiagnosticSeverity::ERROR => 0,
+        DiagnosticSeverity::WARNING => 1,
+        DiagnosticSeverity::INFORMATION => 2,
+        DiagnosticSeverity::HINT => 3,
+        _ => u8::MAX,
+    }
+}
+
+fn severity_label(severity: DiagnosticSeverity) -> Option<&'static str> {
+    Some(match severity {
+        DiagnosticSeverity::ERROR => "error",
+        DiagnosticSeverity::WARNING => "warning",
+        DiagnosticSeverity::INFORMATION => "information",
+        DiagnosticSeverity::HINT => "hint",
+        _ => return None,
+    })
 }
 
 async fn diagnostics_for_path(
     project: Entity<Project>,
     path: &str,
+    min_severity: DiagnosticSeverity,
     cx: &mut AsyncApp,
 ) -> Result<String, String> {
     let open_buffer_task = project.update(cx, |project, cx| {
@@ -348,6 +395,15 @@ async fn diagnostics_for_path(
     let buffer = open_buffer_task
         .await
         .map_err(|error| format!("Failed to open '{path}': {error}"))?;
+
+    // Register the buffer so `textDocument/didOpen` is sent (refcounted, so a no-op for
+    // buffers already open in an editor); servers that only analyze open documents need
+    // this to produce pull diagnostics. `_lsp_handle` is an RAII guard whose drop sends
+    // `didClose`, so it must stay bound and live until the read below: leaving the value
+    // unbound (or `let _ =`) closes the doc before the pull, yielding empty results.
+    let _lsp_handle = project.update(cx, |project, cx| {
+        project.register_buffer_with_language_servers(&buffer, cx)
+    });
 
     let lsp_store = project.read_with(cx, |project, _cx| project.lsp_store());
     let pull_result = lsp_store
@@ -371,12 +427,16 @@ async fn diagnostics_for_path(
 
     for (_, group) in snapshot.diagnostic_groups(None) {
         let entry = &group.entries[group.primary_ix];
-        let range = entry.range.to_point(&snapshot);
-        let severity = match entry.diagnostic.severity {
-            DiagnosticSeverity::ERROR => "error",
-            DiagnosticSeverity::WARNING => "warning",
-            _ => continue,
+        // Skip anything less severe than the requested minimum (default WARNING). Callers can
+        // lower `min_severity` to also surface information/hint-level lints (e.g. an unused
+        // argument in a pure internal helper) so the agent can decide whether to act on them.
+        if severity_rank(entry.diagnostic.severity) > severity_rank(min_severity) {
+            continue;
+        }
+        let Some(severity) = severity_label(entry.diagnostic.severity) else {
+            continue;
         };
+        let range = entry.range.to_point(&snapshot);
 
         let _ = writeln!(
             output,
@@ -389,7 +449,8 @@ async fn diagnostics_for_path(
     let freshness = diagnostics_freshness_message(refreshed);
     if output.is_empty() {
         Ok(format!(
-            "{freshness}\n\nFile doesn't have errors or warnings!"
+            "{freshness}\n\nFile doesn't have any diagnostics at `{}` severity or higher!",
+            severity_label(min_severity).unwrap_or("warning"),
         ))
     } else {
         Ok(format!("{freshness}\n\n{output}"))
