@@ -248,6 +248,7 @@ fn tool_definitions() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "Optional relative project path. Omit for a project-wide summary." },
+                    "min_severity": { "type": "string", "enum": ["error", "warning", "information", "hint"], "description": "Minimum severity to report for a per-file query (default \"warning\"). Lower it to also surface information/hint-level lints, e.g. an unused argument in a pure internal helper. Ignored for the project-wide summary." },
                 },
             },
         }),
@@ -635,6 +636,8 @@ struct RenameArgs {
 struct DiagnosticsArgs {
     #[serde(default)]
     path: Option<String>,
+    #[serde(default)]
+    min_severity: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -696,6 +699,7 @@ pub(crate) enum LspBridgeOp {
     },
     Diagnostics {
         path: Option<String>,
+        min_severity: Option<String>,
     },
     RenameSymbol {
         file_path: String,
@@ -753,7 +757,10 @@ fn build_op(name: &str, arguments: Value) -> Result<LspBridgeOp, JsonRpcError> {
         "lsp_diagnostics" => {
             let args: DiagnosticsArgs = serde_json::from_value(arguments)
                 .map_err(|err| JsonRpcError::invalid_params(format!("bad arguments: {err}")))?;
-            Ok(LspBridgeOp::Diagnostics { path: args.path })
+            Ok(LspBridgeOp::Diagnostics {
+                path: args.path,
+                min_severity: args.min_severity,
+            })
         }
         "lsp_rename_symbol" => {
             let args: RenameArgs = serde_json::from_value(arguments)
@@ -878,7 +885,9 @@ async fn execute_op(
         } => find_references(project, file_path, line, symbol_name, cx)
             .await
             .map(Into::into),
-        LspBridgeOp::Diagnostics { path } => diagnostics(project, path, cx).await.map(Into::into),
+        LspBridgeOp::Diagnostics { path, min_severity } => {
+            diagnostics(project, path, min_severity, cx).await.map(Into::into)
+        }
         LspBridgeOp::RenameSymbol {
             file_path,
             line,
@@ -945,9 +954,10 @@ async fn find_references(
 async fn diagnostics(
     project: Entity<Project>,
     path: Option<String>,
+    min_severity: Option<String>,
     cx: &mut AsyncApp,
 ) -> Result<String, String> {
-    agent_lsp::diagnostics(project, path, cx).await
+    agent_lsp::diagnostics(project, path, min_severity, cx).await
 }
 
 async fn rename_symbol(
