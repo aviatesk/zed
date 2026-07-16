@@ -10,7 +10,7 @@ use collab::rpc::{CLEANUP_TIMEOUT, RECONNECT_TIMEOUT};
 use collections::{BTreeMap, HashMap, HashSet};
 use fs::{FakeFs, Fs as _, RemoveOptions};
 use futures::{
-    StreamExt as _,
+    FutureExt as _, StreamExt as _,
     channel::{mpsc, oneshot},
 };
 use git::{
@@ -4694,6 +4694,73 @@ async fn test_reloading_buffer_manually(
         assert!(buffer.is_dirty());
         assert!(!buffer.has_conflict());
     });
+}
+
+#[gpui::test(iterations = 10)]
+async fn test_releasing_remote_lsp_handles_unregisters_buffer(
+    executor: BackgroundExecutor,
+    cx_a: &mut TestAppContext,
+    cx_b: &mut TestAppContext,
+) {
+    let mut server = TestServer::start(executor.clone()).await;
+    let client_a = server.create_client(cx_a, "user_a").await;
+    let client_b = server.create_client(cx_b, "user_b").await;
+    server
+        .create_room(&mut [(&client_a, cx_a), (&client_b, cx_b)])
+        .await;
+    let active_call_a = cx_a.read(ActiveCall::global);
+
+    client_a.language_registry().add(rust_lang());
+    let mut fake_language_servers = client_a
+        .language_registry()
+        .register_fake_lsp("Rust", FakeLspAdapter::default());
+    client_a
+        .fs()
+        .insert_tree(path!("/a"), json!({"a.rs": "fn main() {}\n"}))
+        .await;
+    let (project_a, worktree_id) = client_a.build_local_project(path!("/a"), cx_a).await;
+    let project_id = active_call_a
+        .update(cx_a, |call, cx| call.share_project(project_a.clone(), cx))
+        .await
+        .unwrap();
+    let project_b = client_b.join_remote_project(project_id, cx_b).await;
+    let buffer_b = project_b
+        .update(cx_b, |project, cx| {
+            project.open_buffer((worktree_id, rel_path("a.rs")), cx)
+        })
+        .await
+        .unwrap();
+
+    let (first_handle, second_handle) = project_b.update(cx_b, |project, cx| {
+        (
+            project.register_buffer_with_language_servers(&buffer_b, cx),
+            project.register_buffer_with_language_servers(&buffer_b, cx),
+        )
+    });
+    executor.run_until_parked();
+    let mut fake_language_server = fake_language_servers
+        .next()
+        .now_or_never()
+        .flatten()
+        .expect("remote registration should start the host language server");
+    fake_language_server
+        .receive_notification::<lsp::notification::DidOpenTextDocument>()
+        .now_or_never()
+        .expect("remote registration should send didOpen");
+
+    let close =
+        fake_language_server.receive_notification::<lsp::notification::DidCloseTextDocument>();
+    futures::pin_mut!(close);
+    cx_b.update(|_| drop(first_handle));
+    executor.run_until_parked();
+    assert!(close.as_mut().now_or_never().is_none());
+
+    cx_b.update(|_| drop(second_handle));
+    executor.run_until_parked();
+    close
+        .as_mut()
+        .now_or_never()
+        .expect("releasing the final remote handle should send didClose");
 }
 
 #[gpui::test(iterations = 10)]

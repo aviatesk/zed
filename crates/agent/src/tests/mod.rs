@@ -881,6 +881,90 @@ async fn test_streaming_tool_calls(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_lsp_buffer_lease_releases_after_turn_grace_period(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model, thread, fs, ..
+    } = setup(cx, TestModel::Fake).await;
+    let fake_model = model.as_fake();
+
+    fs.insert_file(path!("/test/main.rs"), b"fn main() {}\n".to_vec())
+        .await;
+    let project = thread.read_with(cx, |thread, _cx| thread.project().clone());
+    let rust_language = Arc::new(language::Language::new(
+        language::LanguageConfig {
+            name: "Rust".into(),
+            matcher: Arc::new(language::LanguageMatcher {
+                path_suffixes: vec!["rs".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        None,
+    ));
+    let language_registry = project.read_with(cx, |project, _cx| project.languages().clone());
+    language_registry.add(rust_language);
+    let mut fake_language_servers =
+        language_registry.register_fake_lsp("Rust", language::FakeLspAdapter::default());
+
+    let mut events = thread
+        .update(cx, |thread, cx| {
+            thread.add_tool(LspLeaseTool::new(project));
+            thread.send(ClientUserMessageId::new(), ["Acquire the lease"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    fake_model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(
+        LanguageModelToolUse {
+            id: "lease_tool".into(),
+            name: LspLeaseTool::NAME.into(),
+            raw_input: json!({"path": "test/main.rs"}).to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(json!({"path": "test/main.rs"})),
+            is_input_complete: true,
+            thought_signature: None,
+        },
+    ));
+    fake_model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    let mut fake_language_server = fake_language_servers
+        .next()
+        .now_or_never()
+        .flatten()
+        .expect("the lease tool should start the language server");
+    let open = fake_language_server
+        .receive_notification::<lsp::notification::DidOpenTextDocument>()
+        .now_or_never()
+        .expect("the lease tool should send didOpen");
+    assert!(open.text_document.uri.as_str().ends_with("/test/main.rs"));
+
+    cx.run_until_parked();
+    fake_model.send_last_completion_stream_event(LanguageModelCompletionEvent::Text("Done".into()));
+    fake_model.end_last_completion_stream();
+    let turn_events = collect_events_until_stop(&mut events, cx).await;
+    assert_eq!(stop_events(turn_events), vec![acp::StopReason::EndTurn]);
+    cx.run_until_parked();
+
+    let close =
+        fake_language_server.receive_notification::<lsp::notification::DidCloseTextDocument>();
+    futures::pin_mut!(close);
+    assert!(close.as_mut().now_or_never().is_none());
+
+    cx.executor()
+        .advance_clock(crate::thread::LSP_BUFFER_LEASE_GRACE_PERIOD - Duration::from_secs(1));
+    cx.run_until_parked();
+    assert!(close.as_mut().now_or_never().is_none());
+
+    cx.executor().advance_clock(Duration::from_secs(2));
+    cx.run_until_parked();
+    let close = close
+        .as_mut()
+        .now_or_never()
+        .expect("the lease should send didClose after the grace period");
+    assert!(close.text_document.uri.as_str().ends_with("/test/main.rs"));
+}
+
+#[gpui::test]
 async fn test_tool_authorization(cx: &mut TestAppContext) {
     let ThreadTest { model, thread, .. } = setup(cx, TestModel::Fake).await;
     let fake_model = model.as_fake();
@@ -4910,6 +4994,7 @@ async fn setup(cx: &mut TestAppContext, model: TestModel) -> ThreadTest {
                             StreamingEchoTool::NAME: true,
                             StreamingJsonErrorContextTool::NAME: true,
                             StreamingFailingEchoTool::NAME: true,
+                            LspLeaseTool::NAME: true,
                             TerminalTool::NAME: true,
                         }
                     }
