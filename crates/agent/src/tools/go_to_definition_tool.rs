@@ -54,7 +54,7 @@ impl AgentTool for GoToDefinitionTool {
     fn run(
         self: Arc<Self>,
         input: ToolInput<Self::Input>,
-        _event_stream: ToolCallEventStream,
+        event_stream: ToolCallEventStream,
         cx: &mut App,
     ) -> Task<Result<String, String>> {
         let project = self.project.clone();
@@ -66,6 +66,7 @@ impl AgentTool for GoToDefinitionTool {
 
             agent_lsp::go_to_definition(
                 project,
+                event_stream.lsp_buffer_lease(),
                 agent_lsp::SymbolLocator::new(
                     input.symbol.file_path,
                     input.symbol.line,

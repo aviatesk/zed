@@ -74,6 +74,7 @@ const TOOL_CANCELED_MESSAGE: &str = "Tool canceled by user";
 const TOOL_CALL_INTERRUPTED_BY_FOLLOW_UP_MESSAGE: &str =
     "Permission denied: user sent a follow-up message instead of approving the tool call.";
 pub(crate) const FOLLOW_UP_PERMISSION_DENIED_OPTION_ID: &str = "follow_up_permission_denied";
+pub(crate) const LSP_BUFFER_LEASE_GRACE_PERIOD: Duration = Duration::from_secs(30);
 pub const MAX_TOOL_NAME_LENGTH: usize = 64;
 pub const MAX_SUBAGENT_DEPTH: u8 = 1;
 
@@ -1714,6 +1715,7 @@ impl Thread {
                 Some(self.project.read(cx).fs().clone()),
                 cancellation_rx,
                 self.sandbox_grants.clone(),
+                agent_lsp::LspBufferLease::default(),
                 Some(cx.weak_entity()),
             );
             tool.replay(input, output, tool_event_stream, cx).log_err();
@@ -2796,6 +2798,7 @@ impl Thread {
             event_stream,
             BTreeMap::default(),
             cancellation_tx,
+            agent_lsp::LspBufferLease::default(),
             task,
         ));
 
@@ -2866,10 +2869,12 @@ impl Thread {
         self.clear_summary();
         let tools = self.enabled_tools(cx);
         let (cancellation_tx, mut cancellation_rx) = watch::channel(false);
+        let lsp_buffer_lease = agent_lsp::LspBufferLease::default();
         let task = cx.spawn({
             let prompt_id = self.prompt_id.clone();
             let user_message_id = self.last_user_message_id();
             let event_stream = event_stream.clone();
+            let lsp_buffer_lease = lsp_buffer_lease.clone();
             async move |this, cx| {
                 log::debug!("Starting agent turn execution");
 
@@ -2882,6 +2887,7 @@ impl Thread {
                     cx,
                 )
                 .await;
+                lsp_buffer_lease.release_after(LSP_BUFFER_LEASE_GRACE_PERIOD, cx);
 
                 // Check if we were cancelled - if so, cancel() already took running_turn
                 // and we shouldn't touch it (it might be a NEW turn now)
@@ -2923,6 +2929,7 @@ impl Thread {
             event_stream,
             tools,
             cancellation_tx,
+            lsp_buffer_lease,
             task,
         ));
         Ok(events_rx)
@@ -3912,6 +3919,11 @@ impl Thread {
 
         let fs = self.project.read(cx).fs().clone();
         let tool_call_id = scoped_tool_call_id(owning_message_ix, &tool_use_id);
+        let lsp_buffer_lease = self
+            .running_turn
+            .as_ref()
+            .map(|turn| turn.lsp_buffer_lease.clone())
+            .unwrap_or_default();
         let tool_event_stream = ToolCallEventStream::new(
             tool_use_id.clone(),
             tool_call_id,
@@ -3919,6 +3931,7 @@ impl Thread {
             Some(fs),
             cancellation_rx,
             self.sandbox_grants.clone(),
+            lsp_buffer_lease,
             Some(cx.weak_entity()),
         );
         tool_event_stream.update_fields(|update| update.status(acp_v2::ToolCallStatus::InProgress));
@@ -5113,6 +5126,7 @@ struct RunningTurn {
     /// Sender to signal tool cancellation. When cancel is called, this is
     /// set to true so all tools can detect user-initiated cancellation.
     cancellation_tx: watch::Sender<bool>,
+    lsp_buffer_lease: agent_lsp::LspBufferLease,
     /// Senders for tools that support input streaming and have already been
     /// started but are still receiving input from the LLM.
     streaming_tool_inputs: HashMap<LanguageModelToolUseId, ToolInputSender>,
@@ -5124,6 +5138,7 @@ impl RunningTurn {
         event_stream: ThreadEventStream,
         tools: BTreeMap<SharedString, Arc<dyn AnyAgentTool>>,
         cancellation_tx: watch::Sender<bool>,
+        lsp_buffer_lease: agent_lsp::LspBufferLease,
         task: Task<()>,
     ) -> Self {
         Self {
@@ -5132,6 +5147,7 @@ impl RunningTurn {
             event_stream,
             tools,
             cancellation_tx,
+            lsp_buffer_lease,
             streaming_tool_inputs: HashMap::default(),
         }
     }
@@ -5853,6 +5869,7 @@ pub struct ToolCallEventStream {
     stream: ThreadEventStream,
     fs: Option<Arc<dyn Fs>>,
     cancellation_rx: watch::Receiver<bool>,
+    lsp_buffer_lease: agent_lsp::LspBufferLease,
     /// Shared, thread-scoped sandbox grants (see [`Thread::sandbox_grants`]).
     sandbox_grants: Rc<RefCell<ThreadSandboxGrants>>,
     /// The owning thread, used to trigger a save when a "for this thread"
@@ -5889,6 +5906,7 @@ impl ToolCallEventStream {
             None,
             cancellation_rx,
             sandbox_grants,
+            agent_lsp::LspBufferLease::default(),
             None,
         );
 
@@ -5910,6 +5928,7 @@ impl ToolCallEventStream {
             None,
             cancellation_rx,
             Rc::new(RefCell::new(ThreadSandboxGrants::default())),
+            agent_lsp::LspBufferLease::default(),
             None,
         );
 
@@ -5933,6 +5952,7 @@ impl ToolCallEventStream {
         fs: Option<Arc<dyn Fs>>,
         cancellation_rx: watch::Receiver<bool>,
         sandbox_grants: Rc<RefCell<ThreadSandboxGrants>>,
+        lsp_buffer_lease: agent_lsp::LspBufferLease,
         thread: Option<WeakEntity<Thread>>,
     ) -> Self {
         Self {
@@ -5941,9 +5961,14 @@ impl ToolCallEventStream {
             stream,
             fs,
             cancellation_rx,
+            lsp_buffer_lease,
             sandbox_grants,
             thread,
         }
+    }
+
+    pub(crate) fn lsp_buffer_lease(&self) -> &agent_lsp::LspBufferLease {
+        &self.lsp_buffer_lease
     }
 
     /// Whether the owning thread is a subagent, so prompts can say "for this
@@ -7282,6 +7307,7 @@ mod tests {
             None,
             cancellation_rx,
             Rc::default(),
+            agent_lsp::LspBufferLease::default(),
             None,
         );
         let authorize = cx.update(|cx| {

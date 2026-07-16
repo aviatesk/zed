@@ -1,11 +1,14 @@
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fmt::{self, Write as _};
+use std::rc::Rc;
+use std::time::Duration;
 
 use collections::{HashMap, HashSet};
 use gpui::{App, AsyncApp, Entity};
 use language::{Buffer, BufferId, DiagnosticSeverity, Location, OffsetRangeExt as _};
 use lsp::{LanguageServerName, LanguageServerSelector};
-use project::lsp_store::{FormatTrigger, LspFormatTarget, SymbolLocation};
+use project::lsp_store::{FormatTrigger, LspFormatTarget, OpenLspBufferHandle, SymbolLocation};
 use project::{CodeAction, HoverBlockKind, Project, Symbol};
 use serde::{Deserialize, Serialize};
 use text::{Anchor, Point, ToPoint as _, ToPointUtf16 as _};
@@ -13,6 +16,42 @@ use util::paths::PathStyle;
 
 pub const MAX_LINE_DISPLAY_LEN: usize = 200;
 const MAX_WORKSPACE_SYMBOL_RESULTS: usize = 100;
+
+#[derive(Clone, Default)]
+pub struct LspBufferLease {
+    handles: Rc<RefCell<HashMap<BufferId, OpenLspBufferHandle>>>,
+}
+
+impl LspBufferLease {
+    pub fn acquire(&self, project: &Entity<Project>, buffer: &Entity<Buffer>, cx: &mut AsyncApp) {
+        let buffer_id = buffer.read_with(cx, |buffer, _cx| buffer.remote_id());
+        if self.handles.borrow().contains_key(&buffer_id) {
+            return;
+        }
+
+        let handle = project.update(cx, |project, cx| {
+            project.register_buffer_with_language_servers(buffer, cx)
+        });
+        self.handles.borrow_mut().insert(buffer_id, handle);
+    }
+
+    pub fn release(&self, cx: &mut AsyncApp) {
+        cx.update(|_cx| self.handles.borrow_mut().clear());
+    }
+
+    pub fn release_after(self, delay: Duration, cx: &AsyncApp) {
+        if self.handles.borrow().is_empty() {
+            return;
+        }
+
+        let timer = cx.background_executor().timer(delay);
+        cx.spawn(async move |cx| {
+            timer.await;
+            self.release(cx);
+        })
+        .detach();
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SymbolLocator {
@@ -33,6 +72,7 @@ impl SymbolLocator {
     pub async fn resolve(
         &self,
         project: &Entity<Project>,
+        lease: &LspBufferLease,
         cx: &mut AsyncApp,
     ) -> Result<ResolvedSymbol, String> {
         let Self {
@@ -51,6 +91,7 @@ impl SymbolLocator {
         let buffer = open_buffer_task
             .await
             .map_err(|error| format!("Failed to open '{}': {error}", self.file_path))?;
+        lease.acquire(project, &buffer, cx);
 
         let (position, line_text, truncated) = buffer.read_with(cx, |buffer, _cx| {
             let snapshot = buffer.snapshot();
@@ -324,6 +365,7 @@ pub fn buffer_has_running_language_server(
 
 pub async fn diagnostics(
     project: Entity<Project>,
+    lease: &LspBufferLease,
     path: Option<String>,
     min_severity: Option<String>,
     cx: &mut AsyncApp,
@@ -331,7 +373,7 @@ pub async fn diagnostics(
     let min_severity = parse_min_severity(min_severity.as_deref())?;
     match path {
         Some(ref path) if !path.is_empty() => {
-            diagnostics_for_path(project, path, min_severity, cx).await
+            diagnostics_for_path(project, lease, path, min_severity, cx).await
         }
         _ => diagnostics_for_project(project, cx).await,
     }
@@ -381,6 +423,7 @@ fn severity_label(severity: DiagnosticSeverity) -> Option<&'static str> {
 
 async fn diagnostics_for_path(
     project: Entity<Project>,
+    lease: &LspBufferLease,
     path: &str,
     min_severity: DiagnosticSeverity,
     cx: &mut AsyncApp,
@@ -396,14 +439,10 @@ async fn diagnostics_for_path(
         .await
         .map_err(|error| format!("Failed to open '{path}': {error}"))?;
 
-    // Register the buffer so `textDocument/didOpen` is sent (refcounted, so a no-op for
-    // buffers already open in an editor); servers that only analyze open documents need
-    // this to produce pull diagnostics. `_lsp_handle` is an RAII guard whose drop sends
-    // `didClose`, so it must stay bound and live until the read below: leaving the value
-    // unbound (or `let _ =`) closes the doc before the pull, yielding empty results.
-    let _lsp_handle = project.update(cx, |project, cx| {
-        project.register_buffer_with_language_servers(&buffer, cx)
-    });
+    // Servers that only analyze open documents need the buffer registered before the pull.
+    // The turn-scoped lease keeps it open for subsequent LSP operations without tying its
+    // lifetime to the thread's edit-review state.
+    lease.acquire(&project, &buffer, cx);
 
     let lsp_store = project.read_with(cx, |project, _cx| project.lsp_store());
     let pull_result = lsp_store
@@ -519,10 +558,11 @@ fn diagnostics_freshness_message(refreshed: bool) -> &'static str {
 
 pub async fn find_references(
     project: Entity<Project>,
+    lease: &LspBufferLease,
     symbol: SymbolLocator,
     cx: &mut AsyncApp,
 ) -> Result<String, String> {
-    let resolved = symbol.resolve(&project, cx).await?;
+    let resolved = symbol.resolve(&project, lease, cx).await?;
 
     if !buffer_has_running_language_server(&project, &resolved.buffer, cx) {
         return Ok(format!(
@@ -569,10 +609,11 @@ pub async fn find_references(
 
 pub async fn go_to_definition(
     project: Entity<Project>,
+    lease: &LspBufferLease,
     symbol: SymbolLocator,
     cx: &mut AsyncApp,
 ) -> Result<String, String> {
-    let resolved = symbol.resolve(&project, cx).await?;
+    let resolved = symbol.resolve(&project, lease, cx).await?;
 
     if !buffer_has_running_language_server(&project, &resolved.buffer, cx) {
         return Ok(format!(
@@ -627,10 +668,11 @@ pub async fn go_to_definition(
 
 pub async fn hover(
     project: Entity<Project>,
+    lease: &LspBufferLease,
     symbol: SymbolLocator,
     cx: &mut AsyncApp,
 ) -> Result<String, String> {
-    let resolved = symbol.resolve(&project, cx).await?;
+    let resolved = symbol.resolve(&project, lease, cx).await?;
 
     if !buffer_has_running_language_server(&project, &resolved.buffer, cx) {
         return Ok(format!(
@@ -687,11 +729,12 @@ pub async fn hover(
 
 pub async fn rename_symbol(
     project: Entity<Project>,
+    lease: &LspBufferLease,
     symbol: SymbolLocator,
     new_name: String,
     cx: &mut AsyncApp,
 ) -> Result<EditOperationOutput, String> {
-    let resolved = symbol.resolve(&project, cx).await?;
+    let resolved = symbol.resolve(&project, lease, cx).await?;
 
     if !buffer_has_running_language_server(&project, &resolved.buffer, cx) {
         return Ok(EditOperationOutput::Text(format!(
@@ -754,11 +797,12 @@ pub async fn rename_symbol(
 
 pub async fn get_code_actions(
     project: Entity<Project>,
+    lease: &LspBufferLease,
     symbol: SymbolLocator,
     apply_tool_name: &str,
     cx: &mut AsyncApp,
 ) -> Result<CodeActionsOutput, String> {
-    let resolved = symbol.resolve(&project, cx).await?;
+    let resolved = symbol.resolve(&project, lease, cx).await?;
 
     if !buffer_has_running_language_server(&project, &resolved.buffer, cx) {
         return Ok(CodeActionsOutput {
@@ -821,6 +865,7 @@ pub async fn get_code_actions(
 
 pub async fn apply_code_action(
     project: Entity<Project>,
+    lease: &LspBufferLease,
     index: u32,
     pending: PendingCodeActions,
     cx: &mut AsyncApp,
@@ -842,6 +887,7 @@ pub async fn apply_code_action(
 
     let title = action.lsp_action.title().to_string();
     let buffer = pending.buffer.clone();
+    lease.acquire(&project, &buffer, cx);
     let starting_buffer_id = buffer.read_with(cx, |buffer, _cx| buffer.remote_id());
     let pre_snapshot = snapshot_open_buffer_texts(&project, cx);
 
@@ -887,6 +933,7 @@ pub async fn apply_code_action(
 
 pub async fn format_document(
     project: Entity<Project>,
+    lease: &LspBufferLease,
     file_path: String,
     cx: &mut AsyncApp,
 ) -> Result<EditOperationOutput, String> {
@@ -900,6 +947,7 @@ pub async fn format_document(
     let buffer = open_buffer_task
         .await
         .map_err(|error| format!("Failed to open '{file_path}': {error}"))?;
+    lease.acquire(&project, &buffer, cx);
 
     if !buffer_has_running_language_server(&project, &buffer, cx) {
         return Ok(EditOperationOutput::Text(format!(

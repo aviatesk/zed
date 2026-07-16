@@ -539,6 +539,7 @@ impl AgentTool for ReadFileTool {
 mod test {
     use super::*;
     use fs::Fs as _;
+    use futures::StreamExt as _;
     use gpui::{AppContext, TestAppContext, UpdateGlobal as _};
     use project::{FakeFs, Project};
     use serde_json::json;
@@ -640,6 +641,39 @@ mod test {
             result.unwrap(),
             "     1\tThis is a small file content".into()
         );
+    }
+
+    #[gpui::test]
+    async fn test_read_file_does_not_register_buffer_with_language_server(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({"main.rs": "fn main() {}\n"}))
+            .await;
+        let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+        let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+        language_registry.add(language::rust_lang());
+        let mut fake_language_servers =
+            language_registry.register_fake_lsp("Rust", language::FakeLspAdapter::default());
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let tool = Arc::new(ReadFileTool::new(project, action_log, true));
+
+        cx.update(|cx| {
+            tool.run(
+                ToolInput::resolved(ReadFileToolInput {
+                    path: "root/main.rs".into(),
+                    start_line: None,
+                    end_line: None,
+                }),
+                ToolCallEventStream::test().0,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+        cx.run_until_parked();
+
+        assert!(fake_language_servers.next().now_or_never().is_none());
     }
 
     #[gpui::test]
