@@ -98,10 +98,16 @@ impl AgentTool for ApplyCodeActionTool {
                 )
             })?;
 
-            let output = agent_lsp::apply_code_action(project, input.index, pending, cx)
-                .await
-                .map(LspEditToolOutput::from_agent_lsp)
-                .map_err(LspEditToolOutput::Text)?;
+            let output = agent_lsp::apply_code_action(
+                project,
+                event_stream.lsp_buffer_lease(),
+                input.index,
+                pending,
+                cx,
+            )
+            .await
+            .map(LspEditToolOutput::from_agent_lsp)
+            .map_err(LspEditToolOutput::Text)?;
 
             cx.update(|cx| output.emit_diffs(&event_stream, language_registry, cx));
             Ok(output)
