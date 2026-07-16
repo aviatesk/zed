@@ -391,6 +391,9 @@ impl Server {
             .add_request_handler(
                 forward_mutating_project_request::<proto::RegisterBufferWithLanguageServers>,
             )
+            .add_request_handler(
+                forward_mutating_project_request::<proto::UnregisterBufferWithLanguageServers>,
+            )
             .add_request_handler(forward_mutating_project_request::<proto::UpdateGitBranch>)
             .add_request_handler(forward_mutating_project_request::<proto::GetCompletions>)
             .add_request_handler(
