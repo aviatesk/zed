@@ -5,6 +5,63 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+#[derive(JsonSchema, Serialize, Deserialize)]
+pub struct LspLeaseToolInput {
+    pub path: String,
+}
+
+pub struct LspLeaseTool {
+    project: Entity<Project>,
+}
+
+impl LspLeaseTool {
+    pub fn new(project: Entity<Project>) -> Self {
+        Self { project }
+    }
+}
+
+impl AgentTool for LspLeaseTool {
+    type Input = LspLeaseToolInput;
+    type Output = String;
+
+    const NAME: &'static str = "lsp_lease_test";
+
+    fn kind() -> acp::ToolKind {
+        acp::ToolKind::Other
+    }
+
+    fn initial_title(
+        &self,
+        _input: Result<Self::Input, serde_json::Value>,
+        _cx: &mut App,
+    ) -> SharedString {
+        "Acquire LSP buffer lease".into()
+    }
+
+    fn run(
+        self: Arc<Self>,
+        input: ToolInput<Self::Input>,
+        event_stream: ToolCallEventStream,
+        cx: &mut App,
+    ) -> Task<Result<String, String>> {
+        let project = self.project.clone();
+        cx.spawn(async move |cx| {
+            let input = input.recv().await.map_err(|error| error.to_string())?;
+            let open_buffer = project.update(cx, |project, cx| {
+                let project_path = project
+                    .find_project_path(&input.path, cx)
+                    .ok_or_else(|| format!("Could not find path '{}'", input.path))?;
+                Ok::<_, String>(project.open_buffer(project_path, cx))
+            })?;
+            let buffer = open_buffer.await.map_err(|error| error.to_string())?;
+            event_stream
+                .lsp_buffer_lease()
+                .acquire(&project, &buffer, cx);
+            Ok(input.path)
+        })
+    }
+}
+
 /// A streaming tool that echoes its input, used to test streaming tool
 /// lifecycle (e.g. partial delivery and cleanup when the LLM stream ends
 /// before `is_input_complete`).

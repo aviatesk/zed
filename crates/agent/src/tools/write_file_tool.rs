@@ -569,34 +569,10 @@ mod tests {
         .await
         .unwrap();
 
-        // Open the buffer to trigger LSP initialization
-        let buffer = project
-            .update(cx, |project, cx| {
-                project.open_local_buffer(path!("/root/src/main.rs"), cx)
-            })
-            .await
-            .unwrap();
-
-        // Register the buffer with language servers
-        let _handle = project.update(cx, |project, cx| {
-            project.register_buffer_with_language_servers(&buffer, cx)
-        });
-
         const UNFORMATTED_CONTENT: &str = "fn main() {println!(\"Hello!\");}\
 ";
         const FORMATTED_CONTENT: &str = "This file was formatted by the fake formatter in the test.\
 ";
-
-        // Get the fake language server and set up formatting handler
-        let fake_language_server = fake_language_servers.next().await.unwrap();
-        fake_language_server.set_request_handler::<lsp::request::Formatting, _, _>({
-            |_, _| async move {
-                Ok(Some(vec![lsp::TextEdit {
-                    range: lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(1, 0)),
-                    new_text: FORMATTED_CONTENT.to_string(),
-                }]))
-            }
-        });
 
         // Test with format_on_save enabled
         cx.update(|cx| {
@@ -618,7 +594,29 @@ mod tests {
         sender.send_partial(json!({
             "path": "root/src/main.rs",
         }));
+        sender.send_partial(json!({
+            "path": "root/src/main.rs",
+        }));
         cx.run_until_parked();
+
+        let mut fake_language_server = fake_language_servers.next().await.unwrap();
+        let open = fake_language_server
+            .receive_notification::<lsp::notification::DidOpenTextDocument>()
+            .await;
+        assert!(
+            open.text_document
+                .uri
+                .as_str()
+                .ends_with("/root/src/main.rs")
+        );
+        fake_language_server.set_request_handler::<lsp::request::Formatting, _, _>({
+            |_, _| async move {
+                Ok(Some(vec![lsp::TextEdit {
+                    range: lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(1, 0)),
+                    new_text: FORMATTED_CONTENT.to_string(),
+                }]))
+            }
+        });
 
         sender.send_full(json!({
             "path": "root/src/main.rs",

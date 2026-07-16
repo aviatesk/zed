@@ -106,7 +106,13 @@ impl AgentTool for DiagnosticsTool {
             let input = input.recv().await.map_err(|e| e.to_string())?;
 
             futures::select! {
-                result = agent_lsp::diagnostics(project, input.path, input.min_severity, cx).fuse() => result,
+                result = agent_lsp::diagnostics(
+                                    project,
+                                    event_stream.lsp_buffer_lease(),
+                                    input.path,
+                                    input.min_severity,
+                                    cx,
+                                ).fuse() => result,
                 _ = event_stream.cancelled_by_user().fuse() => {
                     Err("Diagnostics cancelled by user".to_string())
                 }

@@ -54,10 +54,10 @@ struct RemoteProjectSearchState {
     searches_in_progress: HashMap<(PeerId, u64), Task<Result<()>>>,
 }
 
-#[derive(Hash, Eq, PartialEq, Clone)]
+#[derive(Clone)]
 struct SharedBuffer {
-    buffer: Entity<Buffer>,
-    lsp_handle: Option<OpenLspBufferHandle>,
+    _buffer: Entity<Buffer>,
+    lsp_handles: HashMap<u64, OpenLspBufferHandle>,
 }
 
 enum BufferStoreState {
@@ -1262,15 +1262,29 @@ impl BufferStore {
         &mut self,
         peer_id: proto::PeerId,
         buffer_id: BufferId,
+        registration_id: u64,
         handle: OpenLspBufferHandle,
     ) {
         if let Some(shared_buffers) = self.shared_buffers.get_mut(&peer_id)
             && let Some(buffer) = shared_buffers.get_mut(&buffer_id)
         {
-            buffer.lsp_handle = Some(handle);
+            buffer.lsp_handles.insert(registration_id, handle);
             return;
         }
         debug_panic!("tried to register shared lsp handle, but buffer was not shared")
+    }
+
+    pub fn unregister_shared_lsp_handle(
+        &mut self,
+        peer_id: proto::PeerId,
+        buffer_id: BufferId,
+        registration_id: u64,
+    ) {
+        if let Some(shared_buffers) = self.shared_buffers.get_mut(&peer_id)
+            && let Some(buffer) = shared_buffers.get_mut(&buffer_id)
+        {
+            buffer.lsp_handles.remove(&registration_id);
+        }
     }
 
     pub fn handle_synchronize_buffers(
@@ -1297,8 +1311,8 @@ impl BufferStore {
                     .or_default()
                     .entry(buffer_id)
                     .or_insert_with(|| SharedBuffer {
-                        buffer: buffer.clone(),
-                        lsp_handle: None,
+                        _buffer: buffer.clone(),
+                        lsp_handles: HashMap::default(),
                     });
 
                 let buffer = buffer.read(cx);
@@ -1626,8 +1640,8 @@ impl BufferStore {
         shared_buffers.insert(
             buffer_id,
             SharedBuffer {
-                buffer: buffer.clone(),
-                lsp_handle: None,
+                _buffer: buffer.clone(),
+                lsp_handles: HashMap::default(),
             },
         );
 
