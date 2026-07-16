@@ -52,7 +52,7 @@ impl AgentTool for HoverTool {
     fn run(
         self: Arc<Self>,
         input: ToolInput<Self::Input>,
-        _event_stream: ToolCallEventStream,
+        event_stream: ToolCallEventStream,
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
         let project = self.project.clone();
@@ -63,6 +63,7 @@ impl AgentTool for HoverTool {
                 .map_err(|error| format!("Failed to receive tool input: {error}"))?;
             agent_lsp::hover(
                 project,
+                event_stream.lsp_buffer_lease(),
                 agent_lsp::SymbolLocator::new(
                     input.symbol.file_path,
                     input.symbol.line,

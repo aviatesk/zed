@@ -949,12 +949,16 @@ async fn find_references(
     symbol_name: String,
     cx: &mut AsyncApp,
 ) -> Result<String, String> {
-    agent_lsp::find_references(
+    let lease = agent_lsp::LspBufferLease::default();
+    let result = agent_lsp::find_references(
         project,
+        &lease,
         agent_lsp::SymbolLocator::new(file_path, line, symbol_name),
         cx,
     )
-    .await
+    .await;
+    lease.release(cx);
+    result
 }
 
 async fn diagnostics(
@@ -963,7 +967,10 @@ async fn diagnostics(
     min_severity: Option<String>,
     cx: &mut AsyncApp,
 ) -> Result<String, String> {
-    agent_lsp::diagnostics(project, path, min_severity, cx).await
+    let lease = agent_lsp::LspBufferLease::default();
+    let result = agent_lsp::diagnostics(project, &lease, path, min_severity, cx).await;
+    lease.release(cx);
+    result
 }
 
 async fn rename_symbol(
@@ -974,14 +981,17 @@ async fn rename_symbol(
     new_name: String,
     cx: &mut AsyncApp,
 ) -> Result<ToolOutput, String> {
-    match agent_lsp::rename_symbol(
+    let lease = agent_lsp::LspBufferLease::default();
+    let result = agent_lsp::rename_symbol(
         project,
+        &lease,
         agent_lsp::SymbolLocator::new(file_path, line, symbol_name),
         new_name,
         cx,
     )
-    .await?
-    {
+    .await;
+    lease.release(cx);
+    match result? {
         agent_lsp::EditOperationOutput::Text(text) => Ok(ToolOutput::Text(text)),
         agent_lsp::EditOperationOutput::Edited(output) => Ok(build_edit_output(
             output.text,
@@ -1153,7 +1163,10 @@ async fn format_document(
     file_path: String,
     cx: &mut AsyncApp,
 ) -> Result<ToolOutput, String> {
-    match agent_lsp::format_document(project, file_path, cx).await? {
+    let lease = agent_lsp::LspBufferLease::default();
+    let result = agent_lsp::format_document(project, &lease, file_path, cx).await;
+    lease.release(cx);
+    match result? {
         agent_lsp::EditOperationOutput::Text(text) => Ok(ToolOutput::Text(text)),
         agent_lsp::EditOperationOutput::Edited(output) => Ok(build_edit_output(
             output.text,
@@ -1171,7 +1184,11 @@ async fn get_code_actions(
     cx: &mut AsyncApp,
 ) -> Result<String, String> {
     let symbol = agent_lsp::SymbolLocator::new(file_path, line, symbol_name);
-    let output = agent_lsp::get_code_actions(project, symbol, "lsp_apply_code_action", cx).await?;
+    let lease = agent_lsp::LspBufferLease::default();
+    let output =
+        agent_lsp::get_code_actions(project, &lease, symbol, "lsp_apply_code_action", cx).await;
+    lease.release(cx);
+    let output = output?;
     *code_action_store.borrow_mut() = output.pending;
     Ok(output.text)
 }
@@ -1187,7 +1204,10 @@ async fn apply_code_action(
         .take()
         .ok_or_else(|| "No code actions cached. Call `lsp_get_code_actions` first.".to_string())?;
 
-    match agent_lsp::apply_code_action(project, index, pending, cx).await? {
+    let lease = agent_lsp::LspBufferLease::default();
+    let result = agent_lsp::apply_code_action(project, &lease, index, pending, cx).await;
+    lease.release(cx);
+    match result? {
         agent_lsp::EditOperationOutput::Text(text) => Ok(ToolOutput::Text(text)),
         agent_lsp::EditOperationOutput::Edited(output) => Ok(build_edit_output(
             output.text,
@@ -1203,12 +1223,16 @@ async fn hover(
     symbol_name: String,
     cx: &mut AsyncApp,
 ) -> Result<String, String> {
-    agent_lsp::hover(
+    let lease = agent_lsp::LspBufferLease::default();
+    let result = agent_lsp::hover(
         project,
+        &lease,
         agent_lsp::SymbolLocator::new(file_path, line, symbol_name),
         cx,
     )
-    .await
+    .await;
+    lease.release(cx);
+    result
 }
 
 async fn workspace_symbol(
