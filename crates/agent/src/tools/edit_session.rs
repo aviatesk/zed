@@ -736,6 +736,9 @@ impl EditSession {
                 .await
                 .map_err(|e| e.to_string())?,
         };
+        event_stream
+            .lsp_buffer_lease()
+            .acquire(&context.project, &buffer, cx);
 
         let file_changed_since_last_read =
             ensure_buffer_saved(&buffer, &abs_path, mode, &context, event_stream, cx).await?;

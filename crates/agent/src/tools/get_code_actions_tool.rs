@@ -61,7 +61,7 @@ impl AgentTool for GetCodeActionsTool {
     fn run(
         self: Arc<Self>,
         input: ToolInput<Self::Input>,
-        _event_stream: ToolCallEventStream,
+        event_stream: ToolCallEventStream,
         cx: &mut App,
     ) -> Task<Result<String, String>> {
         let project = self.project.clone();
@@ -77,8 +77,14 @@ impl AgentTool for GetCodeActionsTool {
                 input.symbol.line,
                 input.symbol.symbol_name,
             );
-            let output =
-                agent_lsp::get_code_actions(project, symbol, "apply_code_action", cx).await?;
+            let output = agent_lsp::get_code_actions(
+                project,
+                event_stream.lsp_buffer_lease(),
+                symbol,
+                "apply_code_action",
+                cx,
+            )
+            .await?;
 
             store.update(cx, |store, _cx| {
                 *store = output.pending;

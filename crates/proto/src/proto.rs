@@ -245,6 +245,7 @@ messages!(
     (RefreshFoldingRanges, Background),
     (RefreshDocumentSymbols, Background),
     (RegisterBufferWithLanguageServers, Background),
+    (UnregisterBufferWithLanguageServers, Background),
     (RejoinChannelBuffers, Foreground),
     (RejoinChannelBuffersResponse, Foreground),
     (RejoinRemoteProjects, Foreground),
@@ -613,6 +614,7 @@ request_messages!(
     (SyncExtensions, SyncExtensionsResponse),
     (InstallExtension, Ack),
     (RegisterBufferWithLanguageServers, Ack),
+    (UnregisterBufferWithLanguageServers, Ack),
     (GitShow, GitCommitDetails),
     (GitCreateCheckpoint, GitCreateCheckpointResponse),
     (
@@ -846,6 +848,7 @@ entity_messages!(
     GetProcesses,
     CancelLanguageServerWork,
     RegisterBufferWithLanguageServers,
+    UnregisterBufferWithLanguageServers,
     GitShow,
     GitCreateCheckpoint,
     GitRestoreCheckpoint,

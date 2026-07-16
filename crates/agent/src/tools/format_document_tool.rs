@@ -68,10 +68,15 @@ impl AgentTool for FormatDocumentTool {
             let input = input.recv().await.map_err(|error| {
                 LspEditToolOutput::Text(format!("Failed to receive tool input: {error}"))
             })?;
-            let output = agent_lsp::format_document(project, input.file_path, cx)
-                .await
-                .map(LspEditToolOutput::from_agent_lsp)
-                .map_err(LspEditToolOutput::Text)?;
+            let output = agent_lsp::format_document(
+                project,
+                event_stream.lsp_buffer_lease(),
+                input.file_path,
+                cx,
+            )
+            .await
+            .map(LspEditToolOutput::from_agent_lsp)
+            .map_err(LspEditToolOutput::Text)?;
 
             cx.update(|cx| output.emit_diffs(&event_stream, language_registry, cx));
             Ok(output)

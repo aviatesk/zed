@@ -886,7 +886,15 @@ message RegisterBufferWithLanguageServers {
   uint64 project_id = 1;
   uint64 buffer_id = 2;
   repeated LanguageServerSelector only_servers = 3;
+  uint64 registration_id = 4;
 }
+
+message UnregisterBufferWithLanguageServers {
+  uint64 project_id = 1;
+  uint64 buffer_id = 2;
+  uint64 registration_id = 3;
+}
+
 
 enum FormatTrigger {
   Save = 0;

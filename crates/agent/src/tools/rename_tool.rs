@@ -79,6 +79,7 @@ impl AgentTool for RenameTool {
 
             let output = agent_lsp::rename_symbol(
                 project,
+                event_stream.lsp_buffer_lease(),
                 agent_lsp::SymbolLocator::new(
                     input.symbol.file_path,
                     input.symbol.line,
