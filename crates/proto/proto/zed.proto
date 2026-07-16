@@ -525,7 +525,8 @@ message Envelope {
     RefreshDocumentHighlights refresh_document_highlights = 493;
     GetTerminalShell get_terminal_shell = 494;
     GetTerminalShellResponse get_terminal_shell_response = 495;
-    LoadMergeBaseDiff load_merge_base_diff = 496; // current max
+    LoadMergeBaseDiff load_merge_base_diff = 496;
+    UnregisterBufferWithLanguageServers unregister_buffer_with_language_servers = 497; // current max
   }
 
   reserved 87 to 88;
