@@ -4507,6 +4507,9 @@ impl AcpThread {
                 anyhow::Ok(project.open_buffer(path, cx))
             });
             let buffer = load?.await?;
+            let lsp_handle = project.update(cx, |project, cx| {
+                project.register_buffer_with_language_servers(&buffer, cx)
+            });
             let snapshot = this.update(cx, |this, cx| {
                 this.shared_buffers
                     .get(&buffer)
@@ -4579,9 +4582,11 @@ impl AcpThread {
                 });
             }
 
-            project
+            let save_result = project
                 .update(cx, |project, cx| project.save_buffer(buffer, cx))
-                .await
+                .await;
+            cx.update(|_cx| drop(lsp_handle));
+            save_result
         })
     }
 

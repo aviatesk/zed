@@ -4996,6 +4996,7 @@ impl LspStore {
         client.add_entity_request_handler(Self::handle_on_type_formatting);
         client.add_entity_request_handler(Self::handle_apply_additional_edits_for_completion);
         client.add_entity_request_handler(Self::handle_register_buffer_with_language_servers);
+        client.add_entity_request_handler(Self::handle_unregister_buffer_with_language_servers);
         client.add_entity_request_handler(Self::handle_rename_project_entry);
         client.add_entity_request_handler(Self::handle_pull_workspace_diagnostics);
         client.add_entity_request_handler(Self::handle_lsp_get_completions);
@@ -5614,8 +5615,11 @@ impl LspStore {
             }
         } else if let Some((upstream_client, upstream_project_id)) = self.upstream_client() {
             let buffer_id = buffer.read(cx).remote_id().to_proto();
+            let registration_id = handle.0.entity_id().as_u64();
+            let unregister_client = upstream_client.clone();
+            let (registered_tx, registered_rx) = oneshot::channel();
             cx.background_spawn(async move {
-                upstream_client
+                let result = upstream_client
                     .request(proto::RegisterBufferWithLanguageServers {
                         project_id: upstream_project_id,
                         buffer_id,
@@ -5639,8 +5643,30 @@ impl LspStore {
                                 }
                             })
                             .collect(),
+                        registration_id,
                     })
-                    .await
+                    .await;
+                if registered_tx.send(result.is_ok()).is_err() {
+                    log::debug!("LSP buffer registration was released before it completed");
+                }
+                result
+            })
+            .detach_and_log_err(cx);
+            cx.observe_release(&handle.0, move |_lsp_store, _buffer, cx| {
+                cx.background_spawn(async move {
+                    let was_registered = registered_rx.await.unwrap_or(false);
+                    if was_registered {
+                        unregister_client
+                            .request(proto::UnregisterBufferWithLanguageServers {
+                                project_id: upstream_project_id,
+                                buffer_id,
+                                registration_id,
+                            })
+                            .await?;
+                    }
+                    anyhow::Ok(())
+                })
+                .detach_and_log_err(cx);
             })
             .detach();
         } else {
@@ -11596,6 +11622,7 @@ impl LspStore {
                     project_id: upstream_project_id,
                     buffer_id: buffer_id.to_proto(),
                     only_servers: envelope.payload.only_servers,
+                    registration_id: envelope.payload.registration_id,
                 });
             }
 
@@ -11631,9 +11658,42 @@ impl LspStore {
             this.pull_diagnostics_for_buffer(buffer.clone(), cx)
                 .detach();
             this.buffer_store().update(cx, |buffer_store, _| {
-                buffer_store.register_shared_lsp_handle(peer_id, buffer_id, handle);
+                buffer_store.register_shared_lsp_handle(
+                    peer_id,
+                    buffer_id,
+                    envelope.payload.registration_id,
+                    handle,
+                );
             });
 
+            Ok(())
+        })?;
+        Ok(proto::Ack {})
+    }
+
+    async fn handle_unregister_buffer_with_language_servers(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::UnregisterBufferWithLanguageServers>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::Ack> {
+        let buffer_id = BufferId::new(envelope.payload.buffer_id)?;
+        let peer_id = envelope.original_sender_id.unwrap_or(envelope.sender_id);
+        this.update(&mut cx, |this, cx| {
+            if let Some((upstream_client, upstream_project_id)) = this.upstream_client() {
+                return upstream_client.send(proto::UnregisterBufferWithLanguageServers {
+                    project_id: upstream_project_id,
+                    buffer_id: buffer_id.to_proto(),
+                    registration_id: envelope.payload.registration_id,
+                });
+            }
+
+            this.buffer_store().update(cx, |buffer_store, _| {
+                buffer_store.unregister_shared_lsp_handle(
+                    peer_id,
+                    buffer_id,
+                    envelope.payload.registration_id,
+                );
+            });
             Ok(())
         })?;
         Ok(proto::Ack {})
