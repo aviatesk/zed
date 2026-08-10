@@ -434,6 +434,8 @@ This example makes comments italic and changes the color of strings:
 }
 ```
 
+Overrides for a capture also apply to more specific captures. For example, an override for `keyword` applies to `keyword.import` and `keyword.conditional`, while preserving any properties that the override does not specify. An override for a more specific capture takes precedence over an override for its parent.
+
 ### Selecting and Customizing Themes
 
 Change your theme:
