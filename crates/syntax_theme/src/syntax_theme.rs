@@ -1,10 +1,6 @@
 #![allow(missing_docs)]
 
-use std::{
-    collections::{BTreeMap, btree_map::Entry},
-    ops::Range,
-    sync::Arc,
-};
+use std::{collections::BTreeMap, ops::Range, sync::Arc};
 
 use gpui::HighlightStyle;
 #[cfg(any(test, feature = "test-support"))]
@@ -101,37 +97,57 @@ impl SyntaxTheme {
             .map(|(_, index)| *index as u32)
     }
 
+    fn apply_override(existing: &mut HighlightStyle, highlight_override: HighlightStyle) {
+        existing.color = highlight_override.color.or(existing.color);
+        existing.font_weight = highlight_override.font_weight.or(existing.font_weight);
+        existing.font_style = highlight_override.font_style.or(existing.font_style);
+        existing.background_color = highlight_override
+            .background_color
+            .or(existing.background_color);
+        existing.underline = highlight_override.underline.or(existing.underline);
+        existing.strikethrough = highlight_override.strikethrough.or(existing.strikethrough);
+        existing.fade_out = highlight_override.fade_out.or(existing.fade_out);
+    }
+
     /// Returns a new [`Arc<SyntaxTheme>`] with the given syntax styles merged in.
-    pub fn merge(base: Arc<Self>, user_syntax_styles: Vec<(String, HighlightStyle)>) -> Arc<Self> {
+    /// Overrides cascade to dot-delimited descendants, with more specific overrides taking
+    /// precedence over their parents.
+    pub fn merge(
+        base: Arc<Self>,
+        mut user_syntax_styles: Vec<(String, HighlightStyle)>,
+    ) -> Arc<Self> {
         if user_syntax_styles.is_empty() {
             return base;
         }
 
         let mut base = Arc::try_unwrap(base).unwrap_or_else(|base| (*base).clone());
+        user_syntax_styles.sort_by_key(|(capture_name, _)| capture_name.matches('.').count());
 
-        for (name, highlight) in user_syntax_styles {
-            match base.capture_name_map.entry(name) {
-                Entry::Occupied(entry) => {
-                    if let Some(existing_highlight) = base.highlights.get_mut(*entry.get()) {
-                        existing_highlight.color = highlight.color.or(existing_highlight.color);
-                        existing_highlight.font_weight =
-                            highlight.font_weight.or(existing_highlight.font_weight);
-                        existing_highlight.font_style =
-                            highlight.font_style.or(existing_highlight.font_style);
-                        existing_highlight.background_color = highlight
-                            .background_color
-                            .or(existing_highlight.background_color);
-                        existing_highlight.underline =
-                            highlight.underline.or(existing_highlight.underline);
-                        existing_highlight.strikethrough =
-                            highlight.strikethrough.or(existing_highlight.strikethrough);
-                        existing_highlight.fade_out =
-                            highlight.fade_out.or(existing_highlight.fade_out);
-                    }
-                }
-                Entry::Vacant(vacant) => {
-                    vacant.insert(base.highlights.len());
-                    base.highlights.push(highlight);
+        for (capture_name, highlight_override) in user_syntax_styles {
+            if !base.capture_name_map.contains_key(&capture_name) {
+                let inherited_highlight = base
+                    .highlight_id(&capture_name)
+                    .and_then(|highlight_id| usize::try_from(highlight_id).ok())
+                    .and_then(|highlight_index| base.get(highlight_index))
+                    .copied()
+                    .unwrap_or_default();
+                base.capture_name_map
+                    .insert(capture_name.clone(), base.highlights.len());
+                base.highlights.push(inherited_highlight);
+            }
+
+            let affected_highlight_indices = base
+                .capture_name_map
+                .iter()
+                .filter_map(|(existing_capture_name, highlight_index)| {
+                    let remainder = existing_capture_name.strip_prefix(&capture_name)?;
+                    (remainder.is_empty() || remainder.starts_with('.')).then_some(*highlight_index)
+                })
+                .collect::<Vec<_>>();
+
+            for highlight_index in affected_highlight_indices {
+                if let Some(existing_highlight) = base.highlights.get_mut(highlight_index) {
+                    Self::apply_override(existing_highlight, highlight_override);
                 }
             }
         }
@@ -340,6 +356,157 @@ mod tests {
                     }
                 )
             ]))
+        );
+    }
+
+    #[test]
+    fn test_syntax_theme_merge_cascades_overrides() {
+        let syntax_theme = SyntaxTheme::merge(
+            Arc::new(SyntaxTheme::new_test_styles([
+                (
+                    "keyword",
+                    HighlightStyle {
+                        color: Some(gpui::red()),
+                        font_style: Some(FontStyle::Normal),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "keyword.conditional",
+                    HighlightStyle {
+                        color: Some(gpui::green()),
+                        font_style: Some(FontStyle::Normal),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "keyword.import",
+                    HighlightStyle {
+                        color: Some(gpui::blue()),
+                        font_style: Some(FontStyle::Normal),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "keyword.import.special",
+                    HighlightStyle {
+                        color: Some(gpui::yellow()),
+                        font_style: Some(FontStyle::Normal),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "keywordish",
+                    HighlightStyle {
+                        color: Some(gpui::black()),
+                        font_style: Some(FontStyle::Normal),
+                        ..Default::default()
+                    },
+                ),
+            ])),
+            vec![
+                (
+                    "keyword.import".to_string(),
+                    HighlightStyle {
+                        font_style: Some(FontStyle::Normal),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "keyword".to_string(),
+                    HighlightStyle {
+                        font_style: Some(FontStyle::Italic),
+                        ..Default::default()
+                    },
+                ),
+            ],
+        );
+
+        assert_eq!(
+            syntax_theme.style_for_name("keyword"),
+            Some(HighlightStyle {
+                color: Some(gpui::red()),
+                font_style: Some(FontStyle::Italic),
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            syntax_theme.style_for_name("keyword.conditional"),
+            Some(HighlightStyle {
+                color: Some(gpui::green()),
+                font_style: Some(FontStyle::Italic),
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            syntax_theme.style_for_name("keyword.import"),
+            Some(HighlightStyle {
+                color: Some(gpui::blue()),
+                font_style: Some(FontStyle::Normal),
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            syntax_theme.style_for_name("keyword.import.special"),
+            Some(HighlightStyle {
+                color: Some(gpui::yellow()),
+                font_style: Some(FontStyle::Normal),
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            syntax_theme.style_for_name("keywordish"),
+            Some(HighlightStyle {
+                color: Some(gpui::black()),
+                font_style: Some(FontStyle::Normal),
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn test_syntax_theme_merge_inherits_style_for_new_capture() {
+        let syntax_theme = SyntaxTheme::merge(
+            Arc::new(SyntaxTheme::new_test_styles([
+                (
+                    "keyword",
+                    HighlightStyle {
+                        color: Some(gpui::red()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "keyword.operator.regex",
+                    HighlightStyle {
+                        color: Some(gpui::green()),
+                        ..Default::default()
+                    },
+                ),
+            ])),
+            vec![(
+                "keyword.operator".to_string(),
+                HighlightStyle {
+                    font_style: Some(FontStyle::Italic),
+                    ..Default::default()
+                },
+            )],
+        );
+
+        assert_eq!(
+            syntax_theme.style_for_name("keyword.operator"),
+            Some(HighlightStyle {
+                color: Some(gpui::red()),
+                font_style: Some(FontStyle::Italic),
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            syntax_theme.style_for_name("keyword.operator.regex"),
+            Some(HighlightStyle {
+                color: Some(gpui::green()),
+                font_style: Some(FontStyle::Italic),
+                ..Default::default()
+            })
         );
     }
 }
