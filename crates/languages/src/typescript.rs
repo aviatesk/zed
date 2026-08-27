@@ -254,16 +254,68 @@ impl PackageJsonData {
             });
         }
 
-        if self.node_package_path.is_some() {
+        let node_package_test_script_path = if self.node_package_path.is_some()
+            && self.jest_package_path.is_none()
+            && self.mocha_package_path.is_none()
+            && self.vitest_package_path.is_none()
+            && self.jasmine_package_path.is_none()
+            && self.bun_package_path.is_none()
+        {
+            self.scripts
+                .iter()
+                .filter(|(_, script)| script == "test")
+                .map(|(path, _)| path)
+                .max_by_key(|path| path.components().count())
+        } else {
+            None
+        };
+        if let Some(path) = node_package_test_script_path {
             task_templates.0.push(TaskTemplate {
-                label: format!("{} file test", "node test".to_owned()),
-                command: "node".to_owned(),
-                args: vec!["--test".to_owned(), VariableName::File.template_value()],
+                label: format!(
+                    "package.json > test {}",
+                    VariableName::Symbol.template_value()
+                ),
+                command: TYPESCRIPT_RUNNER_VARIABLE.template_value(),
+                args: vec!["test".to_owned()],
+                env: [(
+                    "NODE_OPTIONS".to_owned(),
+                    format!(
+                        "--test-name-pattern=\"{}\"",
+                        VariableName::Symbol.template_value()
+                    ),
+                )]
+                .into_iter()
+                .collect(),
                 tags: vec![
                     "ts-test".to_owned(),
                     "js-test".to_owned(),
                     "tsx-test".to_owned(),
                 ],
+                cwd: Some(
+                    path.parent()
+                        .unwrap_or(Path::new("/"))
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+                ..TaskTemplate::default()
+            });
+        }
+
+        if self.node_package_path.is_some() {
+            let node_test_tags = if node_package_test_script_path.is_some() {
+                Vec::new()
+            } else {
+                vec![
+                    "ts-test".to_owned(),
+                    "js-test".to_owned(),
+                    "tsx-test".to_owned(),
+                ]
+            };
+            task_templates.0.push(TaskTemplate {
+                label: format!("{} file test", "node test".to_owned()),
+                command: "node".to_owned(),
+                args: vec!["--test".to_owned(), VariableName::File.template_value()],
+                tags: node_test_tags.clone(),
                 cwd: Some(TYPESCRIPT_NODE_PACKAGE_PATH_VARIABLE.template_value()),
                 ..TaskTemplate::default()
             });
@@ -276,11 +328,7 @@ impl PackageJsonData {
                     format!("\"{}\"", VariableName::Symbol.template_value()),
                     VariableName::File.template_value(),
                 ],
-                tags: vec![
-                    "ts-test".to_owned(),
-                    "js-test".to_owned(),
-                    "tsx-test".to_owned(),
-                ],
+                tags: node_test_tags,
                 cwd: Some(TYPESCRIPT_NODE_PACKAGE_PATH_VARIABLE.template_value()),
                 ..TaskTemplate::default()
             });
@@ -1777,6 +1825,59 @@ mod tests {
     }
 
     #[test]
+    fn test_node_package_test_script_runnable_uses_nearest_package() {
+        let package_json_data = PackageJsonData {
+            node_package_path: Some(Path::new(path!("/root/sub/package.json")).into()),
+            scripts: [
+                (
+                    Path::new(path!("/root/package.json")).into(),
+                    "test".to_owned(),
+                ),
+                (
+                    Path::new(path!("/root/sub/package.json")).into(),
+                    "test".to_owned(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..PackageJsonData::default()
+        };
+
+        let mut task_templates = TaskTemplates::default();
+        package_json_data.fill_task_templates(&mut task_templates);
+
+        let runnable_tasks = task_templates
+            .0
+            .into_iter()
+            .filter(|template| template.tags.iter().any(|tag| tag == "js-test"))
+            .map(|template| {
+                (
+                    template.label,
+                    template.command,
+                    template.args,
+                    template.env,
+                    template.cwd,
+                )
+            })
+            .collect::<Vec<_>>();
+        pretty_assertions::assert_eq!(
+            runnable_tasks,
+            [(
+                "package.json > test $ZED_SYMBOL".to_owned(),
+                "$ZED_CUSTOM_TYPESCRIPT_RUNNER".to_owned(),
+                vec!["test".to_owned()],
+                [(
+                    "NODE_OPTIONS".to_owned(),
+                    "--test-name-pattern=\"$ZED_SYMBOL\"".to_owned(),
+                )]
+                .into_iter()
+                .collect(),
+                Some(path!("/root/sub").into()),
+            )]
+        );
+    }
+
+    #[test]
     fn test_escaping_name() {
         let cases = [
             ("plain test name", "plain test name"),
@@ -1885,6 +1986,13 @@ mod tests {
             })
             .map(|template| &template.label)
             .collect();
+
+        assert!(
+            !test_tasks
+                .iter()
+                .any(|label| label.contains("package.json > test")),
+            "Package test script should not supersede a dedicated test runner"
+        );
 
         let node_test_index = test_tasks
             .iter()
