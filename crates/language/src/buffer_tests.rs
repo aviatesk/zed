@@ -2,9 +2,9 @@ use super::*;
 use crate::Buffer;
 use clock::ReplicaId;
 use collections::BTreeMap;
-use futures::FutureExt as _;
+use futures::{FutureExt as _, channel::oneshot};
 use futures_lite::future::yield_now;
-use gpui::{App, AppContext as _, BorrowAppContext, Entity};
+use gpui::{App, AppContext as _, BorrowAppContext, Entity, Task};
 use gpui::{HighlightStyle, TestAppContext};
 use indoc::indoc;
 use pretty_assertions::assert_eq;
@@ -13,7 +13,7 @@ use rand::prelude::*;
 use regex::RegexBuilder;
 use settings::SettingsStore;
 use settings::{AllLanguageSettingsContent, LanguageSettingsContent};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::{
     env,
     ops::Range,
@@ -26,6 +26,7 @@ use text::{BufferId, LineEnding};
 use text::{Point, ToPoint};
 use theme::ActiveTheme;
 use unindent::Unindent as _;
+use util::paths::PathStyle;
 use util::rel_path::rel_path;
 use util::test::marked_text_offsets;
 use util::{RandomCharIter, assert_set_eq, post_inc, test::marked_text_ranges};
@@ -560,6 +561,140 @@ fn file(path: &str) -> Arc<dyn File> {
         root_name: "zed".into(),
         local_root: None,
     })
+}
+
+struct DelayedLocalFile {
+    path: Arc<RelPath>,
+    contents: Vec<u8>,
+    loads: parking_lot::Mutex<VecDeque<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+}
+
+impl File for DelayedLocalFile {
+    fn as_local(&self) -> Option<&dyn LocalFile> {
+        Some(self)
+    }
+
+    fn disk_state(&self) -> DiskState {
+        DiskState::New
+    }
+
+    fn path(&self) -> &Arc<RelPath> {
+        &self.path
+    }
+
+    fn full_path(&self, _cx: &App) -> PathBuf {
+        self.path.as_std_path().to_path_buf()
+    }
+
+    fn path_style(&self, _cx: &App) -> PathStyle {
+        PathStyle::local()
+    }
+
+    fn file_name<'a>(&'a self, _cx: &'a App) -> &'a str {
+        self.path.file_name().unwrap_or_default()
+    }
+
+    fn worktree_id(&self, _cx: &App) -> WorktreeId {
+        WorktreeId::from_usize(0)
+    }
+
+    fn to_proto(&self, _cx: &App) -> rpc::proto::File {
+        rpc::proto::File {
+            worktree_id: WorktreeId::from_usize(0).to_proto(),
+            entry_id: None,
+            path: self.path.as_unix_str().to_owned(),
+            mtime: None,
+            is_deleted: false,
+            is_historic: false,
+        }
+    }
+
+    fn is_private(&self) -> bool {
+        false
+    }
+}
+
+impl LocalFile for DelayedLocalFile {
+    fn abs_path(&self, _cx: &App) -> PathBuf {
+        self.path.as_std_path().to_path_buf()
+    }
+
+    fn load(&self, _cx: &App) -> Task<Result<String>> {
+        Task::ready(String::from_utf8(self.contents.clone()).map_err(Into::into))
+    }
+
+    fn load_bytes(&self, cx: &App) -> Task<Result<Vec<u8>>> {
+        let contents = self.contents.clone();
+        let load = self.loads.lock().pop_front();
+        cx.background_spawn(async move {
+            let (load_started_tx, resume_load_rx) = load.context("unexpected extra load")?;
+            load_started_tx
+                .send(())
+                .map_err(|_| anyhow::anyhow!("load-start receiver was dropped"))?;
+            resume_load_rx
+                .await
+                .map_err(|_| anyhow::anyhow!("load-resume sender was dropped"))?;
+            Ok(contents)
+        })
+    }
+}
+
+#[gpui::test]
+async fn test_reload_preserves_edit_made_while_loading(cx: &mut TestAppContext) {
+    let (first_load_started_tx, first_load_started_rx) = oneshot::channel();
+    let (first_resume_load_tx, first_resume_load_rx) = oneshot::channel();
+    let (second_load_started_tx, second_load_started_rx) = oneshot::channel();
+    let (second_resume_load_tx, second_resume_load_rx) = oneshot::channel();
+    let file = Arc::new(DelayedLocalFile {
+        path: rel_path("file.txt").into(),
+        contents: b"contents from disk".to_vec(),
+        loads: parking_lot::Mutex::new(VecDeque::from([
+            (first_load_started_tx, first_resume_load_rx),
+            (second_load_started_tx, second_resume_load_rx),
+        ])),
+    });
+    let buffer = cx.new(|cx| {
+        Buffer::build(
+            TextBuffer::new(
+                ReplicaId::LOCAL,
+                cx.entity_id().as_non_zero_u64().into(),
+                "old contents".to_string(),
+            ),
+            Some(file),
+            Capability::ReadWrite,
+            cx,
+        )
+    });
+
+    let reload = buffer.update(cx, |buffer, cx| buffer.reload(cx));
+    first_load_started_rx
+        .await
+        .expect("first reload should begin loading the file");
+    buffer.update(cx, |buffer, cx| {
+        buffer.set_text("unsaved edit", cx);
+    });
+    let superseding_reload = buffer.update(cx, |buffer, cx| buffer.reload(cx));
+    second_load_started_rx
+        .await
+        .expect("superseding reload should begin loading the file");
+    second_resume_load_tx
+        .send(())
+        .expect("superseding reload should still be waiting for the file");
+    drop(first_resume_load_tx);
+
+    for reload in [reload, superseding_reload] {
+        assert!(
+            reload
+                .await
+                .expect("reload should complete after a conflict")
+                .is_none()
+        );
+    }
+    buffer.read_with(cx, |buffer, _cx| {
+        assert_eq!(buffer.text(), "unsaved edit");
+        assert!(buffer.is_dirty());
+        assert!(buffer.has_conflict());
+    });
 }
 
 #[gpui::test]
