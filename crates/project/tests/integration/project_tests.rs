@@ -9108,6 +9108,177 @@ async fn test_file_changes_multiple_times_on_disk(cx: &mut gpui::TestAppContext)
     });
 }
 
+#[gpui::test]
+async fn test_reopening_git_editor_buffers_reads_current_disk_contents(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/repo"),
+        json!({
+            ".git": {
+                "COMMIT_EDITMSG": "first contents\n",
+                "rebase-merge": {
+                    "git-rebase-todo": "first contents\n",
+                },
+            },
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), [path!("/repo").as_ref()], cx).await;
+    let worktree_id = project.read_with(cx, |project, cx| {
+        project
+            .worktrees(cx)
+            .next()
+            .expect("project should have a worktree")
+            .read(cx)
+            .id()
+    });
+
+    for (relative_path, absolute_path) in [
+        (".git/COMMIT_EDITMSG", "/repo/.git/COMMIT_EDITMSG"),
+        (
+            ".git/rebase-merge/git-rebase-todo",
+            "/repo/.git/rebase-merge/git-rebase-todo",
+        ),
+    ] {
+        let project_path = ProjectPath {
+            worktree_id,
+            path: RelPath::from_unix_str(relative_path)
+                .expect("Git editor path should be valid")
+                .into(),
+        };
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_buffer(project_path.clone(), cx)
+            })
+            .await
+            .expect("opening Git editor buffer should succeed");
+        assert_eq!(
+            buffer.read_with(cx, |buffer, _cx| buffer.text()),
+            "first contents\n"
+        );
+
+        fs.save(
+            Path::new(absolute_path),
+            &"second contents\n".into(),
+            Default::default(),
+        )
+        .await
+        .expect("updating Git editor file should succeed");
+
+        let reopened_buffer = project
+            .update(cx, |project, cx| {
+                project.open_buffer(project_path.clone(), cx)
+            })
+            .await
+            .expect("reopening Git editor buffer should succeed");
+        assert_eq!(buffer.entity_id(), reopened_buffer.entity_id());
+        reopened_buffer.read_with(cx, |buffer, _cx| {
+            assert_eq!(buffer.text(), "second contents\n");
+            assert!(!buffer.is_dirty());
+        });
+
+        fs.save(
+            Path::new(absolute_path),
+            &"third contents\n".into(),
+            Default::default(),
+        )
+        .await
+        .expect("updating Git editor file should succeed");
+
+        let first_reopen = project.update(cx, |project, cx| {
+            project.open_buffer(project_path.clone(), cx)
+        });
+        let second_reopen = project.update(cx, |project, cx| {
+            project.open_buffer(project_path.clone(), cx)
+        });
+        let (first_reopened_buffer, second_reopened_buffer) =
+            future::join(first_reopen, second_reopen).await;
+        let first_reopened_buffer =
+            first_reopened_buffer.expect("first concurrent reopen should succeed");
+        let second_reopened_buffer =
+            second_reopened_buffer.expect("second concurrent reopen should succeed");
+        assert_eq!(buffer.entity_id(), first_reopened_buffer.entity_id());
+        assert_eq!(buffer.entity_id(), second_reopened_buffer.entity_id());
+        first_reopened_buffer.read_with(cx, |buffer, _cx| {
+            assert_eq!(buffer.text(), "third contents\n");
+            assert!(!buffer.is_dirty());
+        });
+
+        first_reopened_buffer.update(cx, |buffer, cx| {
+            buffer.set_text("unsaved edit\n", cx);
+        });
+        fs.save(
+            Path::new(absolute_path),
+            &"fourth contents\n".into(),
+            Default::default(),
+        )
+        .await
+        .expect("updating dirty Git editor file should succeed");
+
+        let dirty_reopened_buffer = project
+            .update(cx, |project, cx| {
+                project.open_buffer(project_path.clone(), cx)
+            })
+            .await
+            .expect("reopening dirty Git editor buffer should succeed");
+        assert_eq!(buffer.entity_id(), dirty_reopened_buffer.entity_id());
+        dirty_reopened_buffer.read_with(cx, |buffer, _cx| {
+            assert_eq!(buffer.text(), "unsaved edit\n");
+            assert!(buffer.is_dirty());
+        });
+    }
+}
+
+#[gpui::test]
+async fn test_reopening_single_file_git_editor_buffer_reads_current_disk_contents(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/repo"),
+        json!({
+            "git-rebase-todo": "first contents\n",
+        }),
+    )
+    .await;
+
+    let path = path!("/repo/git-rebase-todo");
+    let project = Project::test(fs.clone(), [path.as_ref()], cx).await;
+    let buffer = project
+        .update(cx, |project, cx| project.open_local_buffer(path, cx))
+        .await
+        .expect("opening Git editor buffer should succeed");
+
+    fs.pause_events();
+    fs.save(
+        Path::new(path),
+        &"second contents\n".into(),
+        Default::default(),
+    )
+    .await
+    .expect("updating Git editor file should succeed");
+
+    let reopened_buffer = project
+        .update(cx, |project, cx| project.open_local_buffer(path, cx))
+        .await
+        .expect("reopening Git editor buffer should succeed");
+    assert_eq!(buffer.entity_id(), reopened_buffer.entity_id());
+    reopened_buffer.read_with(cx, |buffer, _cx| {
+        assert_eq!(buffer.text(), "second contents\n");
+        assert!(!buffer.is_dirty());
+    });
+
+    fs.clear_buffered_events();
+    fs.unpause_events_and_flush();
+}
+
 #[gpui::test(iterations = 30)]
 async fn test_edit_buffer_while_it_reloads(cx: &mut gpui::TestAppContext) {
     init_test(cx);
