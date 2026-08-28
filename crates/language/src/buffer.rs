@@ -114,7 +114,7 @@ pub struct Buffer {
     preview_version: clock::Global,
     transaction_depth: usize,
     was_dirty_before_starting_transaction: Option<bool>,
-    reload_task: Option<Task<Result<()>>>,
+    reload_task: Option<BufferReload>,
     language: Option<Arc<Language>>,
     content_language_detection_enabled: bool,
     autoindent_requests: Vec<Arc<AutoindentRequest>>,
@@ -146,6 +146,13 @@ pub struct Buffer {
     encoding: &'static Encoding,
     has_bom: bool,
     reload_with_encoding_txns: HashMap<TransactionId, (&'static Encoding, bool)>,
+}
+
+struct BufferReload {
+    _task: Task<Result<()>>,
+    base_version: clock::Global,
+    base_text: Rope,
+    waiters: Vec<oneshot::Sender<Option<Transaction>>>,
 }
 
 #[derive(Debug)]
@@ -1671,88 +1678,139 @@ impl Buffer {
         cx: &Context<Self>,
     ) -> oneshot::Receiver<Option<Transaction>> {
         let (tx, rx) = futures::channel::oneshot::channel();
-        let prev_version = self.text.version();
+        // A newer reload must read the latest disk state without losing callers or treating edits
+        // made during an earlier generation as part of the reload's base.
+        let (base_version, base_text, mut waiters) = if let Some(reload) = self.reload_task.take() {
+            (reload.base_version, reload.base_text, reload.waiters)
+        } else {
+            (self.text.version(), self.as_rope().clone(), Vec::new())
+        };
+        waiters.push(tx);
 
-        self.reload_task = Some(cx.spawn(async move |this, cx| {
-            let Some((new_mtime, load_bytes_task, current_encoding)) =
-                this.update(cx, |this, cx| {
-                    let file = this.file.as_ref()?.as_local()?;
-                    Some((
-                        file.disk_state().mtime(),
-                        file.load_bytes(cx),
-                        this.encoding,
-                    ))
-                })?
-            else {
-                return Ok(());
-            };
-
-            let target_encoding = force_encoding.unwrap_or(current_encoding);
-
-            let bytes = load_bytes_task.await?;
-
-            anyhow::ensure!(
-                analyze_byte_content(&bytes) != ByteContent::Binary,
-                "Binary files are not supported"
-            );
-
-            let is_unicode = target_encoding == encoding_rs::UTF_8
-                || target_encoding == encoding_rs::UTF_16LE
-                || target_encoding == encoding_rs::UTF_16BE;
-
-            let (new_text, has_bom, encoding_used) = if force_encoding.is_some() && !is_unicode {
-                let (cow, _had_errors) = target_encoding.decode_without_bom_handling(&bytes);
-                (cow.into_owned(), false, target_encoding)
-            } else {
-                let (cow, used_enc, _had_errors) = target_encoding.decode(&bytes);
-
-                let actual_has_bom = if used_enc == encoding_rs::UTF_8 {
-                    bytes.starts_with(&[0xEF, 0xBB, 0xBF])
-                } else if used_enc == encoding_rs::UTF_16LE {
-                    bytes.starts_with(&[0xFF, 0xFE])
-                } else if used_enc == encoding_rs::UTF_16BE {
-                    bytes.starts_with(&[0xFE, 0xFF])
-                } else {
-                    false
+        let task_base_version = base_version.clone();
+        let task_base_text = base_text.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let result: Result<Option<Transaction>> = async {
+                let Some((new_mtime, load_bytes_task, current_encoding)) =
+                    this.update(cx, |this, cx| {
+                        let file = this.file.as_ref()?.as_local()?;
+                        Some((
+                            file.disk_state().mtime(),
+                            file.load_bytes(cx),
+                            this.encoding,
+                        ))
+                    })?
+                else {
+                    return Ok(None);
                 };
-                (cow.into_owned(), actual_has_bom, used_enc)
-            };
 
-            let diff = this.update(cx, |this, cx| this.diff(new_text, cx))?.await;
-            this.update(cx, |this, cx| {
-                if this.version() == diff.base_version {
-                    this.finalize_last_transaction();
-                    let old_encoding = this.encoding;
-                    let old_has_bom = this.has_bom;
-                    this.apply_diff(diff, cx);
-                    this.encoding = encoding_used;
-                    this.has_bom = has_bom;
-                    let transaction = this.finalize_last_transaction().cloned();
-                    if let Some(ref txn) = transaction {
-                        if old_encoding != encoding_used || old_has_bom != has_bom {
+                let target_encoding = force_encoding.unwrap_or(current_encoding);
+                let bytes = load_bytes_task.await?;
+
+                anyhow::ensure!(
+                    analyze_byte_content(&bytes) != ByteContent::Binary,
+                    "Binary files are not supported"
+                );
+
+                let is_unicode = target_encoding == encoding_rs::UTF_8
+                    || target_encoding == encoding_rs::UTF_16LE
+                    || target_encoding == encoding_rs::UTF_16BE;
+
+                let (new_text, has_bom, encoding_used) = if force_encoding.is_some() && !is_unicode
+                {
+                    let (cow, _had_errors) = target_encoding.decode_without_bom_handling(&bytes);
+                    (cow.into_owned(), false, target_encoding)
+                } else {
+                    let (cow, used_enc, _had_errors) = target_encoding.decode(&bytes);
+
+                    let actual_has_bom = if used_enc == encoding_rs::UTF_8 {
+                        bytes.starts_with(&[0xEF, 0xBB, 0xBF])
+                    } else if used_enc == encoding_rs::UTF_16LE {
+                        bytes.starts_with(&[0xFF, 0xFE])
+                    } else if used_enc == encoding_rs::UTF_16BE {
+                        bytes.starts_with(&[0xFE, 0xFF])
+                    } else {
+                        false
+                    };
+                    (cow.into_owned(), actual_has_bom, used_enc)
+                };
+
+                let diff_base_version = task_base_version.clone();
+                let diff = cx
+                    .background_executor()
+                    .spawn(async move {
+                        Self::compute_diff(task_base_text, diff_base_version, new_text)
+                    })
+                    .await;
+                this.update(cx, |this, cx| {
+                    if this.version() == diff.base_version {
+                        this.finalize_last_transaction();
+                        let old_encoding = this.encoding;
+                        let old_has_bom = this.has_bom;
+                        this.apply_diff(diff, cx);
+                        this.encoding = encoding_used;
+                        this.has_bom = has_bom;
+                        let transaction = this.finalize_last_transaction().cloned();
+                        if let Some(ref transaction) = transaction
+                            && (old_encoding != encoding_used || old_has_bom != has_bom)
+                        {
                             this.reload_with_encoding_txns
-                                .insert(txn.id, (old_encoding, old_has_bom));
+                                .insert(transaction.id, (old_encoding, old_has_bom));
+                        }
+                        this.has_conflict = false;
+                        this.did_reload(this.version(), this.line_ending(), new_mtime, cx);
+                        transaction
+                    } else {
+                        if !diff.edits.is_empty()
+                            || this
+                                .edits_since::<usize>(&diff.base_version)
+                                .next()
+                                .is_some()
+                        {
+                            this.has_conflict = true;
+                        }
+
+                        this.did_reload(
+                            task_base_version,
+                            this.line_ending(),
+                            this.saved_mtime,
+                            cx,
+                        );
+                        None
+                    }
+                })
+            }
+            .await;
+
+            this.update(cx, |this, _cx| {
+                let mut waiters = this
+                    .reload_task
+                    .take()
+                    .map(|reload| reload.waiters)
+                    .unwrap_or_default();
+                if let Ok(transaction) = &result
+                    && let Some(current_waiter) = waiters.pop()
+                {
+                    // Only the latest caller owns the transaction; superseded callers only need to
+                    // know that the replacement reload completed.
+                    for waiter in waiters {
+                        if waiter.send(None).is_err() {
+                            log::debug!("buffer reload result receiver was dropped");
                         }
                     }
-                    tx.send(transaction).ok();
-                    this.has_conflict = false;
-                    this.did_reload(this.version(), this.line_ending(), new_mtime, cx);
-                } else {
-                    if !diff.edits.is_empty()
-                        || this
-                            .edits_since::<usize>(&diff.base_version)
-                            .next()
-                            .is_some()
-                    {
-                        this.has_conflict = true;
+                    if current_waiter.send(transaction.clone()).is_err() {
+                        log::debug!("buffer reload result receiver was dropped");
                     }
-
-                    this.did_reload(prev_version, this.line_ending(), this.saved_mtime, cx);
                 }
-
-                this.reload_task.take();
-            })
-        }));
+            })?;
+            result.map(|_| ())
+        });
+        self.reload_task = Some(BufferReload {
+            _task: task,
+            base_version,
+            base_text,
+            waiters,
+        });
         rx
     }
 
@@ -2356,18 +2414,23 @@ impl Buffer {
     {
         let old_text = self.as_rope().clone();
         let base_version = self.version();
-        cx.background_spawn(async move {
-            let old_text = old_text.to_string();
-            let mut new_text = new_text.as_ref().to_owned();
-            let line_ending = LineEnding::detect(&new_text);
-            LineEnding::normalize(&mut new_text);
-            let edits = text_diff(&old_text, &new_text);
-            Diff {
-                base_version,
-                line_ending,
-                edits,
-            }
-        })
+        cx.background_spawn(async move { Self::compute_diff(old_text, base_version, new_text) })
+    }
+
+    fn compute_diff<T>(old_text: Rope, base_version: clock::Global, new_text: T) -> Diff
+    where
+        T: AsRef<str>,
+    {
+        let old_text = old_text.to_string();
+        let mut new_text = new_text.as_ref().to_owned();
+        let line_ending = LineEnding::detect(&new_text);
+        LineEnding::normalize(&mut new_text);
+        let edits = text_diff(&old_text, &new_text);
+        Diff {
+            base_version,
+            line_ending,
+            edits,
+        }
     }
 
     /// Spawns a background task that returns a `Diff` removing trailing whitespace from line ends.

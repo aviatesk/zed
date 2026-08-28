@@ -28,6 +28,7 @@ pub const LOGS_DIR: &str = "logs";
 pub const LOGS_REF_STASH: &str = "logs/refs/stash";
 pub const REBASE_MERGE_DIR: &str = "rebase-merge";
 pub const REBASE_APPLY_DIR: &str = "rebase-apply";
+pub const REBASE_TODO: &str = "git-rebase-todo";
 pub const SEQUENCER_DIR: &str = "sequencer";
 pub const COMMIT_MESSAGE: &str = "COMMIT_EDITMSG";
 pub const FETCH_HEAD: &str = "FETCH_HEAD";
