@@ -481,6 +481,17 @@ name = "My Language LSP"
 languages = ["My Language"]
 ```
 
+Language servers are enabled by default. With extension manifest schema version 2 or newer, you can register an opt-in language server that is only started when a user explicitly includes its ID in their language settings:
+
+```toml
+[language_servers.my-optional-language-server]
+name = "My Optional Language LSP"
+languages = ["My Language"]
+default_enabled = false
+```
+
+The server remains registered and can be enabled with `"language_servers": ["my-optional-language-server", "..."]`. Default-disabled extension servers are not included by the `"..."` wildcard.
+
 Then, in the Rust code for your extension, implement the `language_server_command` method on your extension:
 
 ```rust
