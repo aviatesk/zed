@@ -5291,6 +5291,82 @@ async fn test_workspace_diagnostics_long_poll_is_kept_open(cx: &mut gpui::TestAp
     );
 }
 
+#[gpui::test(iterations = 20)]
+async fn test_workspace_diagnostics_partial_results_before_response_are_retained(
+    cx: &mut gpui::TestAppContext,
+) {
+    use lsp::WorkspaceDiagnosticReportResult::Report;
+
+    let streamed_result_ids = ["b", "c", "d", "e"].map(|name| lsp::PreviousResultId {
+        uri: lsp::Uri::from_file_path(Path::new(path!("/dir")).join(format!("{name}.rs"))).unwrap(),
+        value: format!("partial-{name}"),
+    });
+    let (project, mut fake_servers) = diagnostics_pull_project(
+        cx,
+        json!({ "a.rs": "", "b.rs": "", "c.rs": "", "d.rs": "", "e.rs": "" }),
+        DiagnosticsPullServer {
+            identifier: "test-ws-partials-before-response",
+            inter_file_dependencies: true,
+            workspace_diagnostics: true,
+            initializer: None,
+        },
+    )
+    .await;
+    let (_buffer, _handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/a.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let fake_server = fake_servers.next().await.unwrap();
+    // The initial pull waits 50 ms, so install the handler before advancing time.
+    let (request_sender, requests) = smol::channel::unbounded();
+    let mut pending_result_ids = streamed_result_ids.to_vec();
+    let send_progress = fake_server.notification_sender::<lsp::notification::Progress>();
+    fake_server.set_request_handler::<lsp::WorkspaceDiagnosticRequest, _, _>(move |params, _| {
+        request_sender.try_send(params.clone()).unwrap();
+        let result_ids = mem::take(&mut pending_result_ids);
+        let send_progress = send_progress.clone();
+        async move {
+            let token = params.partial_result_params.partial_result_token.unwrap();
+            for result_id in result_ids {
+                let report = lsp::WorkspaceFullDocumentDiagnosticReport {
+                    uri: result_id.uri,
+                    version: None,
+                    full_document_diagnostic_report: lsp::FullDocumentDiagnosticReport {
+                        result_id: Some(result_id.value),
+                        items: Vec::new(),
+                    },
+                };
+                send_progress(lsp::ProgressParams {
+                    token: token.clone(),
+                    value: lsp::ProgressParamsValue::WorkspaceDiagnostic(Report(
+                        lsp::WorkspaceDiagnosticReport {
+                            items: vec![lsp::WorkspaceDocumentDiagnosticReport::Full(report)],
+                        },
+                    )),
+                });
+            }
+            Ok(Report(lsp::WorkspaceDiagnosticReport { items: Vec::new() }))
+        }
+    });
+    cx.executor().advance_clock(Duration::from_millis(100));
+    cx.executor().run_until_parked();
+    assert!(requests.try_recv().unwrap().previous_result_ids.is_empty());
+
+    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
+    let pull_task = lsp_store.update(cx, |lsp_store, cx| {
+        lsp_store.pull_workspace_diagnostics_once(cx)
+    });
+    cx.executor().advance_clock(Duration::from_millis(100));
+    cx.executor().run_until_parked();
+    assert!(pull_task.await);
+    let previous_result_ids = requests.try_recv().unwrap().previous_result_ids;
+    assert_eq!(previous_result_ids.len(), streamed_result_ids.len());
+    assert_set_eq!(previous_result_ids, streamed_result_ids);
+    assert!(requests.is_empty());
+}
+
 #[gpui::test]
 async fn test_workspace_diagnostics_refresh_during_open_request_pulls_again(
     cx: &mut gpui::TestAppContext,

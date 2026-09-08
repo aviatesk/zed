@@ -78,7 +78,10 @@ pub fn workspace_folder_for_uri(uri: Uri) -> WorkspaceFolder {
 
 type NotificationHandler = Box<dyn Send + FnMut(Option<RequestId>, Value, &mut AsyncApp)>;
 type PendingRespondTasks = Arc<Mutex<HashMap<RequestId, Task<()>>>>;
-type ResponseHandler = Box<dyn Send + FnOnce(Result<String, ResponseError>) -> Task<()>>;
+struct ResponseHandler {
+    callback: Box<dyn Send + FnOnce(Result<String, ResponseError>) -> Task<()>>,
+    is_shutdown: bool,
+}
 type IoHandler = Box<dyn Send + FnMut(IoKind, &str)>;
 
 /// Kind of language server stdio given to an IO handler.
@@ -748,40 +751,57 @@ impl LanguageServer {
         });
         let mut input_handler = input_handler::LspStdoutHandler::new(
             stdout,
-            response_handlers,
+            response_handlers.clone(),
             io_handlers,
             cx.background_executor().clone(),
         );
 
-        while let Some(msg) = input_handler.incoming_messages.next().await {
-            if msg.method == <notification::Cancel as notification::Notification>::METHOD {
-                if let Some(params) = msg.params {
-                    if let Ok(cancel_params) = serde_json::from_value::<CancelParams>(params) {
-                        let id = match cancel_params.id {
-                            NumberOrString::Number(id) => RequestId::Int(id),
-                            NumberOrString::String(id) => RequestId::Str(id),
-                        };
-                        pending_respond_tasks.lock().remove(&id);
+        while let Some(message) = input_handler.incoming_messages.next().await {
+            match message {
+                input_handler::IncomingMessage::NotificationOrRequest(msg) => {
+                    if msg.method == <notification::Cancel as notification::Notification>::METHOD {
+                        if let Some(params) = msg.params {
+                            if let Ok(cancel_params) =
+                                serde_json::from_value::<CancelParams>(params)
+                            {
+                                let id = match cancel_params.id {
+                                    NumberOrString::Number(id) => RequestId::Int(id),
+                                    NumberOrString::String(id) => RequestId::Str(id),
+                                };
+                                pending_respond_tasks.lock().remove(&id);
+                            }
+                        }
+                        continue;
+                    }
+
+                    let unhandled_message = {
+                        let mut notification_handlers = notification_handlers.lock();
+                        if let Some(handler) = notification_handlers.get_mut(msg.method.as_str()) {
+                            handler(msg.id, msg.params.unwrap_or(Value::Null), cx);
+                            None
+                        } else {
+                            Some(msg)
+                        }
+                    };
+
+                    if let Some(msg) = unhandled_message {
+                        on_unhandled_notification(msg).await;
                     }
                 }
-                continue;
-            }
-
-            let unhandled_message = {
-                let mut notification_handlers = notification_handlers.lock();
-                if let Some(handler) = notification_handlers.get_mut(msg.method.as_str()) {
-                    handler(msg.id, msg.params.unwrap_or(Value::Null), cx);
-                    None
-                } else {
-                    Some(msg)
+                input_handler::IncomingMessage::Response { id, result } => {
+                    let handler = {
+                        response_handlers
+                            .lock()
+                            .as_mut()
+                            .and_then(|handlers| handlers.remove(&id))
+                    };
+                    if let Some(handler) = handler {
+                        (handler.callback)(result).await;
+                    }
                 }
-            };
-
-            if let Some(msg) = unhandled_message {
-                on_unhandled_notification(msg).await;
             }
 
-            // Don't starve the main thread when receiving lots of notifications at once.
+            // Don't starve the main thread when receiving lots of messages at once.
             futures_lite::future::yield_now().await;
         }
         input_handler.loop_handle.await
@@ -1593,9 +1613,10 @@ impl LanguageServer {
                 let executor = executor.clone();
                 handlers.insert(
                     RequestId::Int(id),
-                    Box::new(move |result| {
-                        executor
-                            .spawn(async move {
+                    ResponseHandler {
+                        is_shutdown: T::METHOD == <request::Shutdown as request::Request>::METHOD,
+                        callback: Box::new(move |result| {
+                            executor.spawn(async move {
                                 let response = match result {
                                     Ok(response) => match deserialize_result(&response) {
                                         Ok(deserialized) => Ok(deserialized),
@@ -1608,7 +1629,8 @@ impl LanguageServer {
                                 };
                                 tx.send(response).ok();
                             })
-                    }),
+                        }),
+                    },
                 );
             });
 
@@ -2074,6 +2096,25 @@ impl FakeLanguageServer {
         self.server.notify::<T>(params).ok();
     }
 
+    /// Returns a synchronous sender so notifications precede a response returned
+    /// immediately afterward by a fake server's request handler on the wire.
+    pub fn notification_sender<T: notification::Notification>(
+        &self,
+    ) -> impl Fn(T::Params) + Clone + Send + use<T> {
+        let outbound_tx = self.server.outbound_tx.clone();
+        move |params| {
+            let message = serde_json::to_string(&Notification {
+                jsonrpc: JSON_RPC_VERSION,
+                method: T::METHOD,
+                params,
+            })
+            .expect("test notification should serialize");
+            outbound_tx
+                .try_send(message)
+                .expect("fake server should be running");
+        }
+    }
+
     /// See [`LanguageServer::request`].
     pub async fn request<T>(
         &self,
@@ -2214,6 +2255,141 @@ mod tests {
     #[ctor::ctor(unsafe)]
     fn init_logger() {
         zlog::init_test();
+    }
+
+    fn queue_incoming_messages(
+        messages: &[&str],
+        notification_handlers: HashMap<&'static str, NotificationHandler>,
+        response_handlers: Arc<Mutex<Option<HashMap<RequestId, ResponseHandler>>>>,
+        cx: &mut TestAppContext,
+    ) -> Task<Result<()>> {
+        let (mut writer, reader) = async_pipe::pipe();
+        let input_task = cx.spawn(async move |mut cx| {
+            LanguageServer::handle_incoming_messages(
+                reader,
+                async |_| panic!("unexpected notification"),
+                Arc::new(Mutex::new(notification_handlers)),
+                response_handlers,
+                Default::default(),
+                Default::default(),
+                &mut cx,
+            )
+            .await
+        });
+        cx.run_until_parked();
+        let messages = messages
+            .iter()
+            .map(|payload| format!("Content-Length: {}\r\n\r\n{payload}", payload.len()))
+            .collect::<String>();
+        cx.background_executor
+            .spawn(async move { writer.write_all(messages.as_bytes()).await.unwrap() })
+            .detach();
+        // Read through EOF while holding back foreground dispatch to expose ordering races.
+        while cx.dispatcher.scheduler().tick_background_only() {}
+        input_task
+    }
+
+    #[gpui::test]
+    async fn test_incoming_response_waits_for_preceding_notifications(cx: &mut TestAppContext) {
+        let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let notification_handler: NotificationHandler = Box::new({
+            let events = events.clone();
+            move |_, params, _| events.lock().push(params)
+        });
+        let response_handler = ResponseHandler {
+            callback: Box::new({
+                let events = events.clone();
+                move |response| {
+                    assert_eq!(response.unwrap(), "null");
+                    events.lock().push(json!("response"));
+                    Task::ready(())
+                }
+            }),
+            is_shutdown: false,
+        };
+        let response_handlers = Arc::new(Mutex::new(Some(HashMap::from_iter([(
+            RequestId::Int(1),
+            response_handler,
+        )]))));
+        let input_task = queue_incoming_messages(
+            &[
+                r#"{"jsonrpc":"2.0","method":"test/notification","params":"A"}"#,
+                r#"{"jsonrpc":"2.0","method":"test/notification","params":"B"}"#,
+                r#"{"jsonrpc":"2.0","id":1,"result":null}"#,
+            ],
+            HashMap::from_iter([("test/notification", notification_handler)]),
+            response_handlers.clone(),
+            cx,
+        );
+        input_task.await.unwrap_err();
+        assert_eq!(
+            *events.lock(),
+            vec![json!("A"), json!("B"), json!("response")]
+        );
+        assert!(response_handlers.lock().is_none());
+    }
+
+    #[gpui::test]
+    async fn test_shutdown_response_completes_without_foreground_dispatch(cx: &mut TestAppContext) {
+        let response_handlers = Arc::new(Mutex::new(Some(HashMap::default())));
+        let (outbound_tx, _outbound_rx) = async_channel::unbounded();
+        let (notification_serializers, _notifications) = async_channel::unbounded();
+        let request = LanguageServer::request_internal::<request::Shutdown>(
+            &AtomicI32::new(0),
+            &response_handlers,
+            &outbound_tx,
+            &notification_serializers,
+            &cx.background_executor,
+            Duration::MAX,
+            (),
+        );
+        let shutdown_task = cx.background_executor.spawn(request);
+        let input_task = queue_incoming_messages(
+            &[r#"{"jsonrpc":"2.0","id":0,"result":null}"#],
+            Default::default(),
+            response_handlers,
+            cx,
+        );
+        // Application quit cannot pump foreground dispatch while awaiting shutdown.
+        shutdown_task
+            .now_or_never()
+            .expect("shutdown must complete without foreground dispatch")
+            .into_response()
+            .unwrap();
+        input_task.await.unwrap_err();
+    }
+
+    #[gpui::test]
+    async fn test_incoming_cleanup_drops_response_handlers(cx: &mut TestAppContext) {
+        for messages in [&[][..], &[r#"{"jsonrpc":"2.0","id":1,"result":null}"#][..]] {
+            let (response_tx, mut response_rx) = oneshot::channel();
+            let response_handler = ResponseHandler {
+                callback: Box::new(move |response| {
+                    response_tx.send(response).unwrap();
+                    Task::ready(())
+                }),
+                is_shutdown: false,
+            };
+            let response_handlers = Arc::new(Mutex::new(Some(HashMap::from_iter([(
+                RequestId::Int(1),
+                response_handler,
+            )]))));
+            let input_task = queue_incoming_messages(
+                messages,
+                Default::default(),
+                response_handlers.clone(),
+                cx,
+            );
+            assert!(response_rx.try_recv().unwrap().is_none());
+            if !messages.is_empty() {
+                // Shutdown may clear handlers before an already-buffered response is dispatched.
+                response_handlers.lock().take();
+                assert!(matches!(response_rx.try_recv(), Err(Canceled)));
+            }
+            input_task.await.unwrap_err();
+            assert!(response_handlers.lock().is_none());
+            assert!(matches!(response_rx.await, Err(Canceled)));
+        }
     }
 
     #[gpui::test]
