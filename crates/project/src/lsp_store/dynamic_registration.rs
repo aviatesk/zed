@@ -1217,11 +1217,30 @@ impl LspStore {
                             workspace_diagnostics_refresh_tasks.remove(&Some(unreg.id.clone()));
                         }
 
-                        self.clear_unregistered_diagnostics(
+                        let registration_id = Some(SharedString::from(unreg.id.clone()));
+                        let clear_result = self.clear_unregistered_diagnostics(
                             server_id,
                             SharedString::from(unreg.id.clone()),
                             cx,
-                        )?;
+                        );
+
+                        // Clearing buffer diagnostics can write result IDs, so invalidate both
+                        // caches afterwards, even if there were no diagnostics to clear.
+                        let local = self
+                            .as_local_mut()
+                            .context("Expected LSP Store to be local")?;
+                        if let Some(result_ids) = local
+                            .workspace_pull_diagnostics_result_ids
+                            .get_mut(&server_id)
+                        {
+                            result_ids.remove(&registration_id);
+                        }
+                        if let Some(result_ids) =
+                            local.buffer_pull_diagnostics_result_ids.get_mut(&server_id)
+                        {
+                            result_ids.remove(&registration_id);
+                        }
+                        clear_result?;
                     }
                 }
                 "textDocument/documentColor" => {
