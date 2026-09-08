@@ -2083,6 +2083,226 @@ async fn test_dynamic_workspace_diagnostics_unregister_clears_empty_report_resul
     );
 }
 
+#[gpui::test]
+async fn test_dynamic_workspace_diagnostics_document_precedence_is_registration_specific(
+    cx: &mut gpui::TestAppContext,
+) {
+    fn full_report(message: String) -> lsp::FullDocumentDiagnosticReport {
+        lsp::FullDocumentDiagnosticReport {
+            result_id: Some(message.clone()),
+            items: vec![lsp::Diagnostic {
+                severity: Some(lsp::DiagnosticSeverity::ERROR),
+                message: lsp::DiagnosticMessage::from(message),
+                ..Default::default()
+            }],
+        }
+    }
+
+    init_test(cx);
+    let (project, fake_server) =
+        setup_dynamic_registration_test(cx, lsp::ServerCapabilities::default()).await;
+    let server_id = fake_server.server.server_id();
+    let (buffer, _handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/the-root/a.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let (document_request_sender, document_requests) = smol::channel::unbounded();
+    fake_server.set_request_handler::<lsp::request::DocumentDiagnosticRequest, _, _>(
+        move |params, _| {
+            assert_eq!(
+                params.text_document.uri,
+                lsp::Uri::from_file_path(path!("/the-root/a.rs")).unwrap(),
+            );
+            document_request_sender.try_send(params.clone()).unwrap();
+            let identifier = params.identifier.unwrap();
+            async move {
+                Ok(lsp::DocumentDiagnosticReportResult::Report(
+                    lsp::DocumentDiagnosticReport::Full(lsp::RelatedFullDocumentDiagnosticReport {
+                        related_documents: None,
+                        full_document_diagnostic_report: full_report(format!(
+                            "{identifier} document"
+                        )),
+                    }),
+                ))
+            }
+        },
+    );
+    let (workspace_request_sender, workspace_requests) = smol::channel::unbounded();
+    let (release_workspace_response, workspace_responses) = smol::channel::unbounded();
+    fake_server.set_request_handler::<lsp::request::WorkspaceDiagnosticRequest, _, _>(
+        move |params, _| {
+            let identifier = params.identifier.unwrap();
+            workspace_request_sender
+                .try_send(identifier.clone())
+                .unwrap();
+            let workspace_responses = workspace_responses.clone();
+            async move {
+                workspace_responses.recv().await.unwrap();
+                Ok(lsp::WorkspaceDiagnosticReportResult::Report(
+                    lsp::WorkspaceDiagnosticReport {
+                        items: vec![lsp::WorkspaceDocumentDiagnosticReport::Full(
+                            lsp::WorkspaceFullDocumentDiagnosticReport {
+                                uri: lsp::Uri::from_file_path(path!("/the-root/a.rs")).unwrap(),
+                                version: None,
+                                full_document_diagnostic_report: full_report(format!(
+                                    "{identifier} workspace"
+                                )),
+                            },
+                        )],
+                    },
+                ))
+            }
+        },
+    );
+
+    for language in ["rust", "python"] {
+        register_capability(
+            &fake_server,
+            "textDocument/diagnostic",
+            language,
+            Some(json!({
+                "identifier": language,
+                "documentSelector": [{ "language": language, "scheme": "file" }],
+                "interFileDependencies": false,
+                "workspaceDiagnostics": true,
+            })),
+        )
+        .await;
+    }
+
+    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
+    let document_pull = lsp_store.update(cx, |lsp_store, cx| {
+        lsp_store.pull_document_diagnostics_for_server(server_id, None, cx)
+    });
+    let workspace_pull = lsp_store.update(cx, |lsp_store, cx| {
+        lsp_store.pull_workspace_diagnostics_once(cx)
+    });
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.executor().run_until_parked();
+    document_pull.await;
+    assert_eq!(
+        document_requests.try_recv().unwrap().identifier.as_deref(),
+        Some("rust"),
+    );
+    while let Ok(request) = document_requests.try_recv() {
+        assert_eq!(
+            request.identifier.as_deref(),
+            Some("rust"),
+            "only the Rust selector matches a.rs",
+        );
+    }
+    assert_eq!(
+        sorted([
+            workspace_requests.try_recv().unwrap(),
+            workspace_requests.try_recv().unwrap(),
+        ]),
+        ["python", "rust"],
+    );
+    assert!(workspace_requests.is_empty());
+
+    let diagnostic_messages = |cx: &mut gpui::TestAppContext| {
+        buffer.read_with(cx, |buffer, _| {
+            sorted(
+                buffer
+                    .buffer_diagnostics(Some(server_id))
+                    .into_iter()
+                    .map(|entry| entry.diagnostic.message.to_string()),
+            )
+        })
+    };
+    assert_eq!(diagnostic_messages(cx), ["rust document"]);
+
+    // Apply workspace reports after the document refresh has finished, so a later
+    // document response cannot hide an incorrectly applied Rust workspace report.
+    release_workspace_response.try_send(()).unwrap();
+    release_workspace_response.try_send(()).unwrap();
+    cx.executor().run_until_parked();
+    assert!(workspace_pull.await);
+    assert_eq!(
+        diagnostic_messages(cx),
+        ["python workspace", "rust document"],
+        "document precedence applies only to the registration whose selector matches the open buffer",
+    );
+    assert!(document_requests.is_empty());
+
+    let buffer_id = buffer.read_with(cx, |buffer, _| buffer.remote_id());
+    let cached_result_ids = |registration_id: &'static str, cx: &mut gpui::TestAppContext| {
+        lsp_store.read_with(cx, |lsp_store, cx| {
+            let registration_id = Some(SharedString::from(registration_id));
+            (
+                lsp_store.result_id_for_buffer_pull(server_id, buffer_id, &registration_id, cx),
+                lsp_store.result_ids_for_workspace_refresh(server_id, &registration_id),
+            )
+        })
+    };
+    // Workspace refreshes prefer Rust's document result, but Python's workspace
+    // result must not populate the document cache.
+    for (registration_id, document_result_id, workspace_result_id) in [
+        ("rust", Some("rust document"), "rust document"),
+        ("python", None, "python workspace"),
+    ] {
+        assert_eq!(
+            cached_result_ids(registration_id, cx),
+            (
+                document_result_id.map(SharedString::from),
+                HashMap::from_iter([(
+                    PathBuf::from(path!("/the-root/a.rs")),
+                    SharedString::from(workspace_result_id),
+                )]),
+            ),
+        );
+    }
+    let python_result_ids = cached_result_ids("python", cx);
+
+    unregister_capabilities(&fake_server, "textDocument/diagnostic", &["rust"]).await;
+    cx.executor().run_until_parked();
+    assert_eq!(diagnostic_messages(cx), ["python workspace"]);
+    assert_eq!(cached_result_ids("rust", cx), (None, HashMap::default()));
+    assert_eq!(cached_result_ids("python", cx), python_result_ids);
+
+    register_capability(
+        &fake_server,
+        "textDocument/diagnostic",
+        "rust",
+        Some(json!({
+            "identifier": "rust",
+            "documentSelector": [{ "language": "rust", "scheme": "file" }],
+            "interFileDependencies": false,
+            "workspaceDiagnostics": false,
+        })),
+    )
+    .await;
+    let document_pull = lsp_store.update(cx, |lsp_store, cx| {
+        lsp_store.pull_document_diagnostics_for_server(server_id, None, cx)
+    });
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.executor().run_until_parked();
+    document_pull.await;
+    let request = document_requests.try_recv().unwrap();
+    assert_eq!(request.identifier.as_deref(), Some("rust"));
+    assert_eq!(
+        request.previous_result_id, None,
+        "the first document pull after same-ID reregistration must not reuse the old result ID",
+    );
+    while let Ok(request) = document_requests.try_recv() {
+        assert_eq!(request.identifier.as_deref(), Some("rust"));
+    }
+    assert_eq!(
+        diagnostic_messages(cx),
+        ["python workspace", "rust document"]
+    );
+    assert_eq!(
+        cached_result_ids("rust", cx),
+        (
+            Some(SharedString::from("rust document")),
+            HashMap::default()
+        ),
+    );
+    assert_eq!(cached_result_ids("python", cx), python_result_ids);
+}
+
 /// One large scenario for all per-server-refreshable LSP data kinds (document colors,
 /// links, folding ranges, symbols, code lens, semantic tokens, inlay hints), asserting
 /// at the data level that per-server refreshes never disturb other servers:
