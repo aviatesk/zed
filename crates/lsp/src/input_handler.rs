@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 
 use crate::{
     AnyResponse, CONTENT_LEN_HEADER, IoHandler, IoKind, NotificationOrRequest, RequestId,
-    ResponseHandler,
+    ResponseError, ResponseHandler,
 };
 
 const HEADER_DELIMITER: &[u8; 4] = b"\r\n\r\n";
@@ -26,10 +26,18 @@ const HEADER_DELIMITER: &[u8; 4] = b"\r\n\r\n";
 /// the foreground thread is unresponsive.
 pub(crate) const INCOMING_MESSAGE_QUEUE_CAPACITY: usize = 128;
 
+pub(super) enum IncomingMessage {
+    NotificationOrRequest(NotificationOrRequest),
+    Response {
+        id: RequestId,
+        result: Result<String, ResponseError>,
+    },
+}
+
 /// Handler for stdout of language server.
 pub struct LspStdoutHandler {
     pub(super) loop_handle: Task<Result<()>>,
-    pub(super) incoming_messages: Receiver<NotificationOrRequest>,
+    pub(super) incoming_messages: Receiver<IncomingMessage>,
 }
 
 async fn read_headers<Stdout>(reader: &mut BufReader<Stdout>, buffer: &mut Vec<u8>) -> Result<()>
@@ -59,17 +67,22 @@ impl LspStdoutHandler {
     where
         Input: AsyncRead + Unpin + Send + 'static,
     {
-        let (tx, notifications_channel) = channel(INCOMING_MESSAGE_QUEUE_CAPACITY);
-        let loop_handle = cx.spawn(Self::handler(stdout, tx, response_handlers, io_handlers));
+        let (sender, incoming_messages) = channel(INCOMING_MESSAGE_QUEUE_CAPACITY);
+        let loop_handle = cx.spawn(Self::handler(
+            stdout,
+            sender,
+            response_handlers,
+            io_handlers,
+        ));
         Self {
             loop_handle,
-            incoming_messages: notifications_channel,
+            incoming_messages,
         }
     }
 
     async fn handler<Input>(
         stdout: Input,
-        mut notifications_sender: Sender<NotificationOrRequest>,
+        mut incoming_sender: Sender<IncomingMessage>,
         response_handlers: Arc<Mutex<Option<HashMap<RequestId, ResponseHandler>>>>,
         io_handlers: Arc<Mutex<HashMap<i32, IoHandler>>>,
     ) -> anyhow::Result<()>
@@ -105,26 +118,36 @@ impl LspStdoutHandler {
                 }
             }
 
-            if let Ok(msg) = serde_json::from_slice::<NotificationOrRequest>(&buffer) {
-                notifications_sender.send(msg).await?;
+            if let Ok(message) = serde_json::from_slice::<NotificationOrRequest>(&buffer) {
+                incoming_sender
+                    .send(IncomingMessage::NotificationOrRequest(message))
+                    .await?;
             } else if let Ok(AnyResponse {
                 id, error, result, ..
             }) = serde_json::from_slice(&buffer)
             {
-                let handler = {
-                    response_handlers
-                        .lock()
-                        .as_mut()
-                        .and_then(|handlers| handlers.remove(&id))
+                let result = match error {
+                    Some(error) => Err(error),
+                    None => Ok(result.map_or("null", |result| result.get()).into()),
                 };
-                if let Some(handler) = handler {
-                    if let Some(error) = error {
-                        handler(Err(error)).await;
-                    } else if let Some(result) = result {
-                        handler(Ok(result.get().into())).await;
-                    } else {
-                        handler(Ok("null".into())).await;
-                    }
+                let shutdown_handler = {
+                    let mut response_handlers = response_handlers.lock();
+                    response_handlers.as_mut().and_then(|handlers| {
+                        if handlers.get(&id).is_some_and(|handler| handler.is_shutdown) {
+                            handlers.remove(&id)
+                        } else {
+                            None
+                        }
+                    })
+                };
+                if let Some(handler) = shutdown_handler {
+                    // Application quit blocks foreground dispatch while waiting for shutdown.
+                    (handler.callback)(result).await;
+                } else {
+                    // A response must not overtake partial results still queued for dispatch.
+                    incoming_sender
+                        .send(IncomingMessage::Response { id, result })
+                        .await?;
                 }
             } else {
                 warn!(
