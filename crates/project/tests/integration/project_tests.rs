@@ -5139,6 +5139,325 @@ async fn test_diagnostic_summaries_retained_on_buffer_close_with_workspace_diagn
 }
 
 #[gpui::test]
+async fn test_workspace_diagnostics_update_lsp_closed_live_buffer(cx: &mut gpui::TestAppContext) {
+    fn full_report(
+        result_id: &str,
+        severity: DiagnosticSeverity,
+    ) -> lsp::FullDocumentDiagnosticReport {
+        lsp::FullDocumentDiagnosticReport {
+            result_id: Some(result_id.to_string()),
+            items: vec![lsp::Diagnostic {
+                range: lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(0, 3)),
+                severity: Some(severity),
+                message: lsp::DiagnosticMessage::from(result_id.to_string()),
+                ..Default::default()
+            }],
+        }
+    }
+
+    let (project, mut fake_servers) = diagnostics_pull_project(
+        cx,
+        json!({ "a.rs": "one two three" }),
+        DiagnosticsPullServer {
+            identifier: "test-ws-closed-live-buffer",
+            inter_file_dependencies: false,
+            workspace_diagnostics: true,
+            initializer: Some(Box::new(|fake_server| {
+                fake_server.set_request_handler::<lsp::request::DocumentDiagnosticRequest, _, _>(
+                    |_, _| async {
+                        Ok(lsp::DocumentDiagnosticReportResult::Report(
+                            lsp::DocumentDiagnosticReport::Full(
+                                lsp::RelatedFullDocumentDiagnosticReport {
+                                    related_documents: None,
+                                    full_document_diagnostic_report: full_report(
+                                        "document",
+                                        DiagnosticSeverity::ERROR,
+                                    ),
+                                },
+                            ),
+                        ))
+                    },
+                );
+            })),
+        },
+    )
+    .await;
+    let (buffer, handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/a.rs"), cx)
+        })
+        .await
+        .expect("buffer should open with an LSP registration");
+    let mut fake_server = fake_servers
+        .next()
+        .await
+        .expect("language server should start");
+    let server_id = fake_server.server.server_id();
+    let uri = lsp::Uri::from_file_path(path!("/dir/a.rs")).expect("valid file URI");
+
+    // Hold each response until the document pull or didClose has completed.
+    let (request_sender, requests) = smol::channel::unbounded();
+    let (response_sender, responses) = smol::channel::unbounded();
+    fake_server.set_request_handler::<lsp::request::WorkspaceDiagnosticRequest, _, _>(
+        move |params, _| {
+            request_sender
+                .try_send(params)
+                .expect("request receiver should be alive");
+            let responses = responses.clone();
+            async move {
+                Ok(lsp::WorkspaceDiagnosticReportResult::Report(
+                    responses.recv().await?,
+                ))
+            }
+        },
+    );
+    assert_eq!(
+        fake_server
+            .receive_notification::<lsp::notification::DidOpenTextDocument>()
+            .await
+            .text_document
+            .uri,
+        uri,
+    );
+    cx.executor().advance_clock(Duration::from_millis(100));
+    cx.executor().run_until_parked();
+    assert!(
+        requests
+            .try_recv()
+            .expect("initial workspace pull")
+            .previous_result_ids
+            .is_empty()
+    );
+
+    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
+    lsp_store
+        .update(cx, |lsp_store, cx| {
+            lsp_store.pull_diagnostics_for_buffer(buffer.clone(), cx)
+        })
+        .await
+        .expect("document diagnostics should be pulled");
+    cx.executor().run_until_parked();
+
+    let assert_buffer_diagnostics =
+        |buffer: &Entity<Buffer>, message: &str, cx: &mut TestAppContext| {
+            buffer.read_with(cx, |buffer, _| {
+                assert_eq!(
+                    buffer
+                        .snapshot()
+                        .diagnostics_in_range::<_, usize>(0..buffer.len(), false)
+                        .map(|entry| entry.diagnostic.message.to_string())
+                        .collect::<Vec<_>>(),
+                    vec![message.to_string()],
+                );
+            });
+        };
+    assert_buffer_diagnostics(&buffer, "document", cx);
+    let workspace_report = |result_id, version| lsp::WorkspaceDiagnosticReport {
+        items: vec![lsp::WorkspaceDocumentDiagnosticReport::Full(
+            lsp::WorkspaceFullDocumentDiagnosticReport {
+                uri: uri.clone(),
+                version,
+                full_document_diagnostic_report: full_report(
+                    result_id,
+                    DiagnosticSeverity::WARNING,
+                ),
+            },
+        )],
+    };
+    response_sender
+        .try_send(workspace_report("workspace-open", None))
+        .expect("workspace response should be delivered");
+    cx.executor().run_until_parked();
+
+    assert_buffer_diagnostics(&buffer, "document", cx);
+    lsp_store.read_with(cx, |lsp_store, cx| {
+        assert_eq!(
+            lsp_store.diagnostic_summary(false, cx),
+            DiagnosticSummary {
+                error_count: 1,
+                warning_count: 0
+            },
+            "document pulls must win while the document is LSP-open",
+        );
+        assert_eq!(
+            lsp_store.result_ids_for_workspace_refresh(server_id, &None),
+            HashMap::from_iter([(
+                PathBuf::from(path!("/dir/a.rs")),
+                SharedString::from("document")
+            )]),
+        );
+    });
+
+    // The Entity outlives its last LSP registration, as it can in diagnostics views.
+    cx.update(|_| drop(handle));
+    assert_eq!(
+        fake_server
+            .receive_notification::<lsp::notification::DidCloseTextDocument>()
+            .await
+            .text_document
+            .uri,
+        uri,
+    );
+    lsp_store.read_with(cx, |lsp_store, cx| {
+        assert!(
+            lsp_store
+                .language_server_ids_for_opened_buffer(buffer.read(cx).remote_id())
+                .is_none(),
+        );
+    });
+    assert_buffer_diagnostics(&buffer, "document", cx);
+
+    let pull_task = lsp_store.update(cx, |lsp_store, cx| {
+        lsp_store.pull_workspace_diagnostics_once(cx)
+    });
+    cx.executor().advance_clock(Duration::from_millis(100));
+    cx.executor().run_until_parked();
+    assert!(
+        requests
+            .try_recv()
+            .expect("workspace pull after didClose")
+            .previous_result_ids
+            .is_empty(),
+        "discarded workspace contents must not leave an advertised result ID after didClose",
+    );
+
+    // didClose discarded the versioned snapshots, so this delayed report cannot be applied.
+    response_sender
+        .try_send(workspace_report("workspace-stale", Some(1)))
+        .expect("workspace response should be delivered");
+    pull_task.await;
+    cx.executor().run_until_parked();
+    assert_buffer_diagnostics(&buffer, "document", cx);
+    lsp_store.read_with(cx, |lsp_store, cx| {
+        assert!(
+            lsp_store
+                .result_ids_for_workspace_refresh(server_id, &None)
+                .is_empty(),
+            "a rejected workspace report must not advance its result ID",
+        );
+        assert_eq!(
+            lsp_store.diagnostic_summary(false, cx),
+            DiagnosticSummary {
+                error_count: 1,
+                warning_count: 0,
+            },
+        );
+    });
+
+    let pull_task = lsp_store.update(cx, |lsp_store, cx| {
+        lsp_store.pull_workspace_diagnostics_once(cx)
+    });
+    cx.executor().advance_clock(Duration::from_millis(100));
+    cx.executor().run_until_parked();
+    assert!(
+        requests
+            .try_recv()
+            .expect("workspace pull after rejected report")
+            .previous_result_ids
+            .is_empty(),
+        "the retry must not advertise the rejected report's result ID",
+    );
+    response_sender
+        .try_send(workspace_report("workspace-closed", None))
+        .expect("workspace response should be delivered");
+    assert!(pull_task.await);
+    cx.executor().run_until_parked();
+
+    lsp_store.read_with(cx, |lsp_store, cx| {
+        assert_eq!(
+            lsp_store.result_ids_for_workspace_refresh(server_id, &None),
+            HashMap::from_iter([(
+                PathBuf::from(path!("/dir/a.rs")),
+                SharedString::from("workspace-closed")
+            )]),
+        );
+        assert_eq!(
+            lsp_store.result_id_for_buffer_pull(server_id, buffer.read(cx).remote_id(), &None, cx,),
+            None,
+            "a workspace merge must not populate the closed buffer's document result ID",
+        );
+    });
+    assert_buffer_diagnostics(&buffer, "workspace-closed", cx);
+    lsp_store.read_with(cx, |lsp_store, cx| {
+        assert_eq!(
+            lsp_store.diagnostic_summary(false, cx),
+            DiagnosticSummary {
+                error_count: 0,
+                warning_count: 1
+            },
+        );
+    });
+
+    // A leftover document ID must not shadow later workspace-only updates after the Entity dies.
+    let weak_buffer = buffer.downgrade();
+    cx.update(|_| drop(buffer));
+    cx.executor().run_until_parked();
+    assert!(weak_buffer.upgrade().is_none());
+
+    let pull_task = lsp_store.update(cx, |lsp_store, cx| {
+        lsp_store.pull_workspace_diagnostics_once(cx)
+    });
+    cx.executor().advance_clock(Duration::from_millis(100));
+    cx.executor().run_until_parked();
+    assert_eq!(
+        requests
+            .try_recv()
+            .expect("workspace pull after buffer destruction")
+            .previous_result_ids,
+        vec![lsp::PreviousResultId {
+            uri: uri.clone(),
+            value: "workspace-closed".to_string(),
+        }],
+    );
+    response_sender
+        .try_send(workspace_report("workspace-newer", None))
+        .expect("workspace response should be delivered");
+    assert!(pull_task.await);
+    cx.executor().run_until_parked();
+
+    let pull_task = lsp_store.update(cx, |lsp_store, cx| {
+        lsp_store.pull_workspace_diagnostics_once(cx)
+    });
+    cx.executor().advance_clock(Duration::from_millis(100));
+    cx.executor().run_until_parked();
+    assert_eq!(
+        requests
+            .try_recv()
+            .expect("workspace pull after newer report")
+            .previous_result_ids,
+        vec![lsp::PreviousResultId {
+            uri: uri.clone(),
+            value: "workspace-newer".to_string(),
+        }],
+        "the newest workspace result ID must not be shadowed by the old live-buffer merge",
+    );
+    response_sender
+        .try_send(lsp::WorkspaceDiagnosticReport {
+            items: vec![lsp::WorkspaceDocumentDiagnosticReport::Unchanged(
+                lsp::WorkspaceUnchangedDocumentDiagnosticReport {
+                    uri: uri.clone(),
+                    version: None,
+                    unchanged_document_diagnostic_report: lsp::UnchangedDocumentDiagnosticReport {
+                        result_id: "workspace-newer".to_string(),
+                    },
+                },
+            )],
+        })
+        .expect("unchanged workspace response should be delivered");
+    assert!(pull_task.await);
+    cx.executor().run_until_parked();
+
+    // Recreate the buffer without LSP registration to verify the stored diagnostics too.
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/dir/a.rs"), cx)
+        })
+        .await
+        .expect("buffer should reopen without LSP registration");
+    assert_buffer_diagnostics(&buffer, "workspace-newer", cx);
+}
+
+#[gpui::test]
 async fn test_workspace_diagnostics_pull_timeout_releases_waiters(cx: &mut gpui::TestAppContext) {
     let (project, mut fake_servers) = diagnostics_pull_project(
         cx,

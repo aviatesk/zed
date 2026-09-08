@@ -14949,6 +14949,50 @@ impl LspStore {
         }
     }
 
+    fn buffer_uses_document_diagnostics(
+        &self,
+        buffer: &Buffer,
+        server_id: LanguageServerId,
+        registration_id: &Option<SharedString>,
+    ) -> bool {
+        let Some(local) = self.as_local() else {
+            return false;
+        };
+        if !local
+            .buffers_opened_in_servers
+            .get(&buffer.remote_id())
+            .is_some_and(|servers| servers.contains(&server_id))
+        {
+            return false;
+        }
+        let Some(registration_id) = registration_id else {
+            return self.diagnostic_registration_exists(server_id, &None);
+        };
+        let Some(registration) = local
+            .language_server_dynamic_registrations
+            .get(&server_id)
+            .and_then(|registrations| registrations.text_documents.get("textDocument/diagnostic"))
+            .and_then(|registrations| registrations.get(registration_id.as_ref()))
+        else {
+            return false;
+        };
+        let Some(LanguageServerState::Running { adapter, .. }) =
+            local.language_servers.get(&server_id)
+        else {
+            return false;
+        };
+        registration
+            .server_capabilities
+            .diagnostic_provider
+            .is_some()
+            && dynamic_text_document_registration_allows_buffer(
+                local,
+                registration,
+                buffer,
+                adapter,
+            )
+    }
+
     fn apply_workspace_diagnostic_report(
         &mut self,
         server_id: LanguageServerId,
@@ -15029,17 +15073,22 @@ impl LspStore {
                         path: relative_path,
                     };
                     if let Some(local_lsp_store) = self.as_local_mut() {
+                        // Keep the path so a document result ID can be sent, but do not
+                        // advertise a workspace result until its contents have been retained.
                         local_lsp_store.workspace_pull_diagnostics_result_ids.entry(server_id)
-                            .or_default().entry(new_registration_id.clone()).or_default().insert(abs_path, result_id.clone());
+                            .or_default().entry(new_registration_id.clone()).or_default().insert(abs_path.clone(), None);
                     }
-                    // The LSP spec recommends that "diagnostics from a document pull should win over diagnostics from a workspace pull."
-                    // Since we actively pull diagnostics for documents with open buffers, we ignore contents of workspace pulls for these documents.
-                    if self.buffer_store.read(cx).get_by_path(&project_path).is_none() {
-                        acc.entry(server_id)
+                    // Document pulls take precedence only while this server and registration
+                    // are responsible for the buffer. A buffer can outlive its LSP registration.
+                    let use_document_diagnostics = self.buffer_store.read(cx).get_by_path(&project_path)
+                        .is_some_and(|buffer| self.buffer_uses_document_diagnostics(buffer.read(cx), server_id, &new_registration_id));
+                    if !use_document_diagnostics {
+                        let (updates, result_ids) = acc.entry(server_id)
                             .or_insert_with(HashMap::default)
                             .entry(new_registration_id.clone())
-                            .or_insert_with(Vec::new)
-                            .push(DocumentDiagnosticsUpdate {
+                            .or_insert_with(|| (Vec::new(), HashMap::default()));
+                        result_ids.insert(abs_path, result_id.clone());
+                        updates.push(DocumentDiagnosticsUpdate {
                                 server_id,
                                 diagnostics: lsp::PublishDiagnosticsParams {
                                     uri,
@@ -15055,25 +15104,50 @@ impl LspStore {
                 },
             );
 
-        for diagnostic_updates in workspace_diagnostics_updates.into_values() {
-            for (registration_id, diagnostic_updates) in diagnostic_updates {
-                self.merge_lsp_diagnostics(
-                    DiagnosticSourceKind::Pulled,
-                    diagnostic_updates,
-                    |document_uri, old_diagnostic, _| match old_diagnostic.source_kind {
-                        DiagnosticSourceKind::Pulled => {
-                            old_diagnostic.registration_id != registration_id
-                                || unchanged_buffers
-                                    .get(&old_diagnostic.registration_id)
-                                    .is_some_and(|unchanged_buffers| {
-                                        unchanged_buffers.contains(&document_uri)
-                                    })
+        for (server_id, diagnostic_updates) in workspace_diagnostics_updates {
+            for (registration_id, (diagnostic_updates, result_ids)) in diagnostic_updates {
+                let merged = self
+                    .merge_lsp_diagnostics(
+                        DiagnosticSourceKind::Pulled,
+                        diagnostic_updates,
+                        |document_uri, old_diagnostic, _| match old_diagnostic.source_kind {
+                            DiagnosticSourceKind::Pulled => {
+                                old_diagnostic.registration_id != registration_id
+                                    || unchanged_buffers
+                                        .get(&old_diagnostic.registration_id)
+                                        .is_some_and(|unchanged_buffers| {
+                                            unchanged_buffers.contains(&document_uri)
+                                        })
+                            }
+                            DiagnosticSourceKind::Other | DiagnosticSourceKind::Pushed => true,
+                        },
+                        cx,
+                    )
+                    .log_err()
+                    .is_some();
+                if let Some(local) = self.as_local_mut() {
+                    // Merging into a live buffer also writes its document cache. These
+                    // workspace-owned IDs must not later override newer workspace reports
+                    // after the buffer is dropped, even if only part of the merge succeeded.
+                    if let Some(buffer_result_ids) = local
+                        .buffer_pull_diagnostics_result_ids
+                        .get_mut(&server_id)
+                        .and_then(|registrations| registrations.get_mut(&registration_id))
+                    {
+                        for abs_path in result_ids.keys() {
+                            buffer_result_ids.remove(abs_path);
                         }
-                        DiagnosticSourceKind::Other | DiagnosticSourceKind::Pushed => true,
-                    },
-                    cx,
-                )
-                .log_err();
+                    }
+                    if merged {
+                        local
+                            .workspace_pull_diagnostics_result_ids
+                            .entry(server_id)
+                            .or_default()
+                            .entry(registration_id)
+                            .or_default()
+                            .extend(result_ids);
+                    }
+                }
             }
         }
     }
