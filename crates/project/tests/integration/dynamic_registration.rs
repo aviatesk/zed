@@ -1870,6 +1870,219 @@ async fn test_multi_registration_diagnostics(cx: &mut gpui::TestAppContext) {
     );
 }
 
+#[gpui::test]
+async fn test_dynamic_workspace_diagnostics_reregister_clears_result_ids(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+    let (project, fake_server, requests) = setup_dynamic_workspace_diagnostics_test(cx, true).await;
+    let server_id = fake_server.server.server_id();
+    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
+    let result_ids = |cx: &mut gpui::TestAppContext| {
+        lsp_store.read_with(cx, |lsp_store, _| {
+            lsp_store.result_ids_for_workspace_refresh(server_id, &Some("diagnostics".into()))
+        })
+    };
+    let expected_result_ids = HashMap::from_iter([(
+        PathBuf::from(path!("/the-root/b.rs")),
+        SharedString::from("diagnostics-result"),
+    )]);
+    let expected_summary = DiagnosticSummary {
+        error_count: 1,
+        warning_count: 0,
+    };
+
+    register_workspace_diagnostics(&fake_server, "diagnostics").await;
+    pull_workspace_diagnostics_once(&project, cx).await;
+    assert!(requests.try_recv().unwrap().previous_result_ids.is_empty());
+    assert!(requests.is_empty());
+    assert_eq!(result_ids(cx), expected_result_ids);
+    assert_eq!(
+        project.read_with(cx, |project, cx| project.diagnostic_summary(false, cx)),
+        expected_summary,
+    );
+
+    pull_workspace_diagnostics_once(&project, cx).await;
+    assert_eq!(
+        requests.try_recv().unwrap().previous_result_ids,
+        vec![lsp::PreviousResultId {
+            uri: lsp::Uri::from_file_path(path!("/the-root/b.rs")).unwrap(),
+            value: "diagnostics-result".to_string(),
+        }],
+    );
+    assert!(requests.is_empty());
+    assert_eq!(
+        project.read_with(cx, |project, cx| project.diagnostic_summary(false, cx)),
+        expected_summary,
+        "an unchanged response should retain the cached diagnostic",
+    );
+
+    unregister_capabilities(&fake_server, "textDocument/diagnostic", &["diagnostics"]).await;
+    cx.executor().run_until_parked();
+    assert_eq!(
+        project.read_with(cx, |project, cx| project.diagnostic_summary(false, cx)),
+        DiagnosticSummary::default(),
+        "the unregister ACK must follow removal of the diagnostic for unopened b.rs",
+    );
+    assert!(
+        result_ids(cx).is_empty(),
+        "unregistering must also invalidate the workspace result ID",
+    );
+
+    register_workspace_diagnostics(&fake_server, "diagnostics").await;
+    pull_workspace_diagnostics_once(&project, cx).await;
+    assert!(
+        requests.try_recv().unwrap().previous_result_ids.is_empty(),
+        "the first pull after same-ID reregistration must not reuse the old result ID",
+    );
+    assert!(requests.is_empty());
+    assert_eq!(result_ids(cx), expected_result_ids);
+    assert_eq!(
+        project.read_with(cx, |project, cx| project.diagnostic_summary(false, cx)),
+        expected_summary,
+        "a full response must restore the diagnostic after reregistration",
+    );
+}
+
+#[gpui::test]
+async fn test_dynamic_workspace_diagnostics_unregister_retains_other_registration_and_push(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+    let (project, fake_server, requests) = setup_dynamic_workspace_diagnostics_test(cx, true).await;
+    let server_id = fake_server.server.server_id();
+    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
+
+    register_workspace_diagnostics(&fake_server, "diagnostics-a").await;
+    register_workspace_diagnostics(&fake_server, "diagnostics-b").await;
+    pull_workspace_diagnostics_once(&project, cx).await;
+    let mut identifiers = Vec::new();
+    while let Ok(request) = requests.try_recv() {
+        assert!(request.previous_result_ids.is_empty());
+        identifiers.push(request.identifier.unwrap());
+    }
+    assert_eq!(sorted(identifiers), ["diagnostics-a", "diagnostics-b"]);
+    let retained_result_ids = lsp_store.read_with(cx, |lsp_store, _| {
+        lsp_store.result_ids_for_workspace_refresh(server_id, &Some("diagnostics-b".into()))
+    });
+    assert_eq!(
+        retained_result_ids,
+        HashMap::from_iter([(
+            PathBuf::from(path!("/the-root/b.rs")),
+            SharedString::from("diagnostics-b-result"),
+        )]),
+    );
+
+    fake_server.notify::<lsp::notification::PublishDiagnostics>(lsp::PublishDiagnosticsParams {
+        uri: lsp::Uri::from_file_path(path!("/the-root/b.rs")).unwrap(),
+        version: None,
+        diagnostics: vec![lsp::Diagnostic {
+            range: lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(0, 1)),
+            severity: Some(lsp::DiagnosticSeverity::WARNING),
+            message: lsp::DiagnosticMessage::from("pushed diagnostic"),
+            ..Default::default()
+        }],
+    });
+    cx.executor().run_until_parked();
+    assert_eq!(
+        project.read_with(cx, |project, cx| project.diagnostic_summary(false, cx)),
+        DiagnosticSummary {
+            error_count: 2,
+            warning_count: 1,
+        },
+    );
+
+    unregister_capabilities(&fake_server, "textDocument/diagnostic", &["diagnostics-a"]).await;
+    cx.executor().run_until_parked();
+    let expected_summary = DiagnosticSummary {
+        error_count: 1,
+        warning_count: 1,
+    };
+    assert_eq!(
+        project.read_with(cx, |project, cx| project.diagnostic_summary(false, cx)),
+        expected_summary,
+        "unregistering must retain the other registration's diagnostic and the push diagnostic",
+    );
+    assert_eq!(
+        lsp_store.read_with(cx, |lsp_store, _| {
+            lsp_store.result_ids_for_workspace_refresh(server_id, &Some("diagnostics-b".into()))
+        }),
+        retained_result_ids,
+    );
+
+    pull_workspace_diagnostics_once(&project, cx).await;
+    let request = requests.try_recv().unwrap();
+    assert_eq!(request.identifier.as_deref(), Some("diagnostics-b"));
+    assert_eq!(
+        request.previous_result_ids,
+        vec![lsp::PreviousResultId {
+            uri: lsp::Uri::from_file_path(path!("/the-root/b.rs")).unwrap(),
+            value: "diagnostics-b-result".to_string(),
+        }],
+    );
+    assert!(requests.is_empty());
+    assert_eq!(
+        project.read_with(cx, |project, cx| project.diagnostic_summary(false, cx)),
+        expected_summary,
+    );
+    assert!(lsp_store.read_with(cx, |lsp_store, _| {
+        lsp_store
+            .result_ids_for_workspace_refresh(server_id, &Some("diagnostics-a".into()))
+            .is_empty()
+    }));
+}
+
+#[gpui::test]
+async fn test_dynamic_workspace_diagnostics_unregister_clears_empty_report_result_ids(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+    let (project, fake_server, requests) =
+        setup_dynamic_workspace_diagnostics_test(cx, false).await;
+    let server_id = fake_server.server.server_id();
+    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
+    let result_ids = |cx: &mut gpui::TestAppContext| {
+        lsp_store.read_with(cx, |lsp_store, _| {
+            lsp_store.result_ids_for_workspace_refresh(server_id, &Some("diagnostics".into()))
+        })
+    };
+    let expected_result_ids = HashMap::from_iter([(
+        PathBuf::from(path!("/the-root/b.rs")),
+        SharedString::from("diagnostics-result"),
+    )]);
+
+    register_workspace_diagnostics(&fake_server, "diagnostics").await;
+    pull_workspace_diagnostics_once(&project, cx).await;
+    assert!(requests.try_recv().unwrap().previous_result_ids.is_empty());
+    assert!(requests.is_empty());
+    assert_eq!(result_ids(cx), expected_result_ids);
+    project.read_with(cx, |project, cx| {
+        assert_eq!(project.buffer_store().read(cx).buffers().count(), 0);
+        assert_eq!(
+            project.diagnostic_summary(false, cx),
+            DiagnosticSummary::default(),
+        );
+    });
+
+    // There are no open buffers or diagnostic entries to drive the cleanup path.
+    unregister_capabilities(&fake_server, "textDocument/diagnostic", &["diagnostics"]).await;
+    cx.executor().run_until_parked();
+    assert!(
+        result_ids(cx).is_empty(),
+        "unregistering must invalidate result IDs even for empty reports",
+    );
+
+    register_workspace_diagnostics(&fake_server, "diagnostics").await;
+    pull_workspace_diagnostics_once(&project, cx).await;
+    assert!(requests.try_recv().unwrap().previous_result_ids.is_empty());
+    assert!(requests.is_empty());
+    assert_eq!(result_ids(cx), expected_result_ids);
+    assert_eq!(
+        project.read_with(cx, |project, cx| project.diagnostic_summary(false, cx)),
+        DiagnosticSummary::default(),
+    );
+}
+
 /// One large scenario for all per-server-refreshable LSP data kinds (document colors,
 /// links, folding ranges, symbols, code lens, semantic tokens, inlay hints), asserting
 /// at the data level that per-server refreshes never disturb other servers:
@@ -2776,6 +2989,121 @@ async fn setup_dynamic_registration_test(
     let fake_server = fake_servers.next().await.unwrap();
     cx.executor().run_until_parked();
     (project, fake_server)
+}
+
+async fn setup_dynamic_workspace_diagnostics_test(
+    cx: &mut gpui::TestAppContext,
+    include_diagnostics: bool,
+) -> (
+    Entity<Project>,
+    lsp::FakeLanguageServer,
+    smol::channel::Receiver<lsp::WorkspaceDiagnosticParams>,
+) {
+    let (project, fake_server) =
+        setup_dynamic_registration_test(cx, lsp::ServerCapabilities::default()).await;
+    let fs = project.read_with(cx, |project, _| project.fs().as_fake());
+    fs.insert_tree(path!("/the-root"), json!({ "b.rs": "fn main() {}" }))
+        .await;
+    cx.executor().run_until_parked();
+    assert_eq!(
+        server_capabilities(&project, fake_server.server.server_id(), cx).diagnostic_provider,
+        None,
+    );
+
+    // The setup opens a.rs to start the server, then drops it; b.rs must never be
+    // opened, because document pulls take precedence over workspace diagnostics.
+    project.read_with(cx, |project, cx| {
+        assert_eq!(project.buffer_store().read(cx).buffers().count(), 0);
+    });
+    fake_server.set_request_handler::<lsp::request::DocumentDiagnosticRequest, _, _>(
+        move |_, _| async move {
+            Ok(lsp::DocumentDiagnosticReportResult::Report(
+                lsp::DocumentDiagnosticReport::Full(
+                    lsp::RelatedFullDocumentDiagnosticReport::default(),
+                ),
+            ))
+        },
+    );
+    let (request_sender, requests) = smol::channel::unbounded();
+    fake_server.set_request_handler::<lsp::request::WorkspaceDiagnosticRequest, _, _>(
+        move |params, _| {
+            request_sender.try_send(params.clone()).unwrap();
+            let identifier = params.identifier.unwrap();
+            let result_id = format!("{identifier}-result");
+            let uri = lsp::Uri::from_file_path(path!("/the-root/b.rs")).unwrap();
+            let report = if params
+                .previous_result_ids
+                .iter()
+                .any(|previous| previous.uri == uri && previous.value == result_id)
+            {
+                lsp::WorkspaceDocumentDiagnosticReport::Unchanged(
+                    lsp::WorkspaceUnchangedDocumentDiagnosticReport {
+                        uri,
+                        version: None,
+                        unchanged_document_diagnostic_report:
+                            lsp::UnchangedDocumentDiagnosticReport { result_id },
+                    },
+                )
+            } else {
+                lsp::WorkspaceDocumentDiagnosticReport::Full(
+                    lsp::WorkspaceFullDocumentDiagnosticReport {
+                        uri,
+                        version: None,
+                        full_document_diagnostic_report: lsp::FullDocumentDiagnosticReport {
+                            result_id: Some(result_id),
+                            items: if include_diagnostics {
+                                vec![lsp::Diagnostic {
+                                    range: lsp::Range::new(
+                                        lsp::Position::new(0, 0),
+                                        lsp::Position::new(0, 1),
+                                    ),
+                                    severity: Some(lsp::DiagnosticSeverity::ERROR),
+                                    message: lsp::DiagnosticMessage::from(format!(
+                                        "{identifier} diagnostic"
+                                    )),
+                                    ..Default::default()
+                                }]
+                            } else {
+                                Vec::new()
+                            },
+                        },
+                    },
+                )
+            };
+            async move {
+                Ok(lsp::WorkspaceDiagnosticReportResult::Report(
+                    lsp::WorkspaceDiagnosticReport {
+                        items: vec![report],
+                    },
+                ))
+            }
+        },
+    );
+    (project, fake_server, requests)
+}
+
+async fn register_workspace_diagnostics(fake_server: &lsp::FakeLanguageServer, id: &str) {
+    register_capability(
+        fake_server,
+        "textDocument/diagnostic",
+        id,
+        Some(json!({
+            "identifier": id,
+            "interFileDependencies": false,
+            "workspaceDiagnostics": true,
+        })),
+    )
+    .await;
+}
+
+async fn pull_workspace_diagnostics_once(project: &Entity<Project>, cx: &mut gpui::TestAppContext) {
+    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
+    let pull_task = lsp_store.update(cx, |lsp_store, cx| {
+        lsp_store.pull_workspace_diagnostics_once(cx)
+    });
+    cx.executor().advance_clock(Duration::from_millis(100));
+    cx.executor().run_until_parked();
+    assert!(pull_task.await);
 }
 
 async fn register_capability(
