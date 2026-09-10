@@ -1,4 +1,9 @@
 mod headless_project;
+#[cfg(unix)]
+mod remote_cli;
+
+#[cfg(unix)]
+pub use remote_cli::RemoteCliArgs;
 
 #[cfg(test)]
 mod remote_editing_tests;
@@ -92,6 +97,9 @@ pub enum Commands {
     Version,
     #[cfg(unix)]
     Exec,
+    /// Open paths in the workspace owning this remote terminal.
+    #[cfg(unix)]
+    Cli(RemoteCliArgs),
 }
 
 pub fn run(command: Commands) -> anyhow::Result<()> {
@@ -99,6 +107,8 @@ pub fn run(command: Commands) -> anyhow::Result<()> {
     use release_channel::{RELEASE_CHANNEL, ReleaseChannel};
 
     match command {
+        #[cfg(unix)]
+        Commands::Cli(arguments) => remote_cli::run_cli(arguments),
         Commands::Run {
             log_file,
             pid_file,
@@ -516,13 +526,15 @@ fn start_server(
     log_rx: Receiver<Vec<u8>>,
     cx: &mut App,
     is_wsl_interop: bool,
-) -> AnyProtoClient {
+) -> (AnyProtoClient, watch::Receiver<bool>) {
     // This is the server idle timeout. If no connection comes in this timeout, the server will shut down.
     const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
     let (incoming_tx, incoming_rx) = mpsc::unbounded::<Envelope>();
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded::<Envelope>();
     let (app_quit_tx, mut app_quit_rx) = mpsc::unbounded::<()>();
+    let (mut connection_tx, connection_rx) = watch::channel(false);
+    let connection_lifetime = connection_tx.receiver();
 
     cx.on_app_quit(move |_| {
         let mut app_quit_tx = app_quit_tx.clone();
@@ -534,6 +546,7 @@ fn start_server(
     .detach();
 
     cx.spawn(async move |cx| {
+        let _connection_lifetime = connection_lifetime;
         loop {
             let streams = futures::future::join3(
                 listeners.stdin.accept(),
@@ -571,6 +584,7 @@ fn start_server(
                 break;
             };
 
+            connection_tx.send(true).log_err();
             let _log_task = cx.background_spawn({
                 let log_rx = log_rx.clone();
                 async move {
@@ -640,12 +654,22 @@ fn start_server(
                 }
                 _ = stdout_task.fuse() => {}
             }
+            connection_tx.send(false).log_err();
         }
         anyhow::Ok(())
     })
     .detach();
 
-    RemoteClient::proto_client_from_channels(incoming_rx, outgoing_tx, cx, "server", is_wsl_interop)
+    (
+        RemoteClient::proto_client_from_channels(
+            incoming_rx,
+            outgoing_tx,
+            cx,
+            "server",
+            is_wsl_interop,
+        ),
+        connection_rx,
+    )
 }
 
 fn init_paths() -> anyhow::Result<()> {
@@ -772,7 +796,7 @@ pub fn execute_run(
         };
 
         log::info!("gpui app started, initializing server");
-        let session = start_server(listeners, log_rx, cx, is_wsl_interop);
+        let (session, _connection_state) = start_server(listeners, log_rx, cx, is_wsl_interop);
         init_telemetry_forwarding(session.clone(), cx);
         trusted_worktrees::init(HashMap::default(), cx);
 
@@ -828,6 +852,25 @@ pub fn execute_run(
                 cx,
             )
         });
+
+        #[cfg(unix)]
+        let remote_cli = remote_cli::RemoteCliServer::new().log_err();
+        #[cfg(unix)]
+        let has_remote_cli = remote_cli.is_some();
+        #[cfg(not(unix))]
+        let has_remote_cli = false;
+        if !has_remote_cli {
+            session.add_request_handler(
+                project.downgrade(),
+                |_, _: TypedEnvelope<proto::GetRemoteCliInfo>, _| async {
+                    Ok(proto::RemoteCliInfo::default())
+                },
+            );
+        }
+        #[cfg(unix)]
+        if let Some(remote_cli) = remote_cli {
+            remote_cli.start(&project, session.clone(), _connection_state, cx);
+        }
 
         handle_crash_files_requests(&project, &session);
 
@@ -1505,7 +1548,8 @@ mod tests {
             let (log_tx, log_rx) = async_channel::unbounded();
 
             let handler = cx.new(|_| ());
-            let server = cx.update(|cx| start_server(listeners, log_rx, cx, false));
+            let (server, _connection_state) =
+                cx.update(|cx| start_server(listeners, log_rx, cx, false));
             server.add_request_handler::<proto::Ping, _, _, _>(
                 handler.downgrade(),
                 |_, _, _| async { Ok(proto::Ack {}) },
@@ -1568,7 +1612,8 @@ mod tests {
             let (_log_tx, log_rx) = async_channel::unbounded();
             let (ping_tx, mut ping_rx) = mpsc::unbounded();
             let handler = cx.new(|_| ());
-            let server = cx.update(|cx| start_server(listeners, log_rx, cx, false));
+            let (server, _connection_state) =
+                cx.update(|cx| start_server(listeners, log_rx, cx, false));
             server.add_request_handler::<proto::Ping, _, _, _>(
                 handler.downgrade(),
                 move |_, _, _| {
