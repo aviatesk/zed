@@ -2772,6 +2772,7 @@ impl Sidebar {
 
         let this = cx.weak_entity();
         let key = key.clone();
+        let multi_workspace = self.multi_workspace.clone();
 
         PopoverMenu::new(SharedString::from(format!(
             "{id_prefix}project-header-new-thread-menu-{ix}"
@@ -2790,7 +2791,12 @@ impl Sidebar {
         .menu(move |window, cx| {
             let this = this.clone();
             let key = key.clone();
-            let open_workspaces = open_workspaces.clone();
+            // The cached menu builder must not keep closed workspaces alive.
+            let open_workspaces = multi_workspace
+                .read_with(cx, |multi_workspace, cx| {
+                    multi_workspace.workspaces_for_project_group(&key, cx)
+                })
+                .unwrap_or_default();
             let active_workspace = this
                 .read_with(cx, |sidebar, cx| {
                     sidebar

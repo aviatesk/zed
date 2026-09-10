@@ -552,6 +552,17 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             return;
         };
 
+        cx.subscribe_in(
+            workspace.project(),
+            window,
+            |workspace, _, event, window, cx| {
+                if let project::Event::OpenRemoteCliPaths(request) = event {
+                    open_listener::handle_remote_cli_request(workspace, request, window, cx);
+                }
+            },
+        )
+        .detach();
+
         let workspace_handle = cx.entity();
         let center_pane = workspace.active_pane().clone();
         initialize_pane(workspace, &center_pane, window, cx);
