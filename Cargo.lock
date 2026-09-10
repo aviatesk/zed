@@ -15382,6 +15382,7 @@ dependencies = [
  "lsp",
  "net",
  "node_runtime",
+ "parking_lot",
  "paths",
  "pretty_assertions",
  "project",

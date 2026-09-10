@@ -1444,6 +1444,179 @@ mod tests {
     }
 
     #[gpui::test]
+    fn test_channel_client_dropping_unpolled_request_cleans_up_channel(cx: &mut TestAppContext) {
+        let (_incoming_tx, incoming_rx) = mpsc::unbounded::<Envelope>();
+        let (outgoing_tx, _outgoing_rx) = mpsc::unbounded::<Envelope>();
+        let client =
+            cx.update(|cx| ChannelClient::new(incoming_rx, outgoing_tx, cx, "test-client", false));
+
+        let request = client.request_dynamic(
+            proto::Test { id: 0 }.into_envelope(0, None, None),
+            "Test",
+            true,
+        );
+        let other_request = client.request_dynamic(
+            proto::Test { id: 1 }.into_envelope(0, None, None),
+            "Test",
+            true,
+        );
+        assert_eq!(client.response_channels.lock().len(), 2);
+
+        drop(request);
+        assert_eq!(client.response_channels.lock().len(), 1);
+        assert!(client.response_channels.lock().contains_key(&MessageId(1)));
+
+        drop(other_request);
+        assert!(client.response_channels.lock().is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_channel_client_cancelling_pending_request_ignores_late_response(
+        cx: &mut TestAppContext,
+    ) {
+        let (incoming_tx, incoming_rx) = mpsc::unbounded::<Envelope>();
+        let (outgoing_tx, _outgoing_rx) = mpsc::unbounded::<Envelope>();
+        let client =
+            cx.update(|cx| ChannelClient::new(incoming_rx, outgoing_tx, cx, "test-client", false));
+
+        let mut request = Box::pin(client.request_dynamic(
+            proto::Test { id: 0 }.into_envelope(0, None, None),
+            "Test",
+            true,
+        ));
+        assert!(request.as_mut().now_or_never().is_none());
+        assert_eq!(client.response_channels.lock().len(), 1);
+
+        drop(request);
+        assert!(client.response_channels.lock().is_empty());
+
+        let other_request = client.request_dynamic(
+            proto::Test { id: 1 }.into_envelope(0, None, None),
+            "Test",
+            true,
+        );
+        incoming_tx
+            .unbounded_send(proto::Test { id: 2 }.into_envelope(100, Some(0), None))
+            .expect("send late response");
+        incoming_tx
+            .unbounded_send(proto::Test { id: 3 }.into_envelope(101, Some(1), None))
+            .expect("send response to live request");
+
+        let response = other_request.await.expect("live request should complete");
+        assert_eq!(
+            proto::Test::from_envelope(response).expect("decode response"),
+            proto::Test { id: 3 },
+        );
+        assert!(client.response_channels.lock().is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_channel_client_request_completion_preserves_response_barrier(
+        cx: &mut TestAppContext,
+    ) {
+        let (incoming_tx, incoming_rx) = mpsc::unbounded::<Envelope>();
+        let (outgoing_tx, _outgoing_rx) = mpsc::unbounded::<Envelope>();
+        let client =
+            cx.update(|cx| ChannelClient::new(incoming_rx, outgoing_tx, cx, "test-client", false));
+
+        let request = client.request_dynamic(
+            proto::Test { id: 0 }.into_envelope(0, None, None),
+            "Test",
+            true,
+        );
+        let other_request = client.request_dynamic(
+            proto::Test { id: 1 }.into_envelope(0, None, None),
+            "Test",
+            true,
+        );
+        incoming_tx
+            .unbounded_send(proto::Test { id: 2 }.into_envelope(100, Some(0), None))
+            .expect("send first response");
+        incoming_tx
+            .unbounded_send(proto::Test { id: 3 }.into_envelope(101, Some(1), None))
+            .expect("send second response");
+        cx.run_until_parked();
+
+        assert!(!client.response_channels.lock().contains_key(&MessageId(0)));
+        assert!(
+            client.response_channels.lock().contains_key(&MessageId(1)),
+            "the read loop must wait until the first response is consumed",
+        );
+        let response = request.await.expect("first request should complete");
+        assert_eq!(
+            proto::Test::from_envelope(response).expect("decode first response"),
+            proto::Test { id: 2 },
+        );
+        let response = other_request.await.expect("second request should complete");
+        assert_eq!(
+            proto::Test::from_envelope(response).expect("decode second response"),
+            proto::Test { id: 3 },
+        );
+        assert!(client.response_channels.lock().is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_channel_client_dropping_received_response_releases_barrier(
+        cx: &mut TestAppContext,
+    ) {
+        let (incoming_tx, incoming_rx) = mpsc::unbounded::<Envelope>();
+        let (outgoing_tx, _outgoing_rx) = mpsc::unbounded::<Envelope>();
+        let client =
+            cx.update(|cx| ChannelClient::new(incoming_rx, outgoing_tx, cx, "test-client", false));
+
+        let request = client.request_dynamic(
+            proto::Test { id: 0 }.into_envelope(0, None, None),
+            "Test",
+            true,
+        );
+        let other_request = client.request_dynamic(
+            proto::Test { id: 1 }.into_envelope(0, None, None),
+            "Test",
+            true,
+        );
+        incoming_tx
+            .unbounded_send(proto::Test { id: 2 }.into_envelope(100, Some(0), None))
+            .expect("send first response");
+        incoming_tx
+            .unbounded_send(proto::Test { id: 3 }.into_envelope(101, Some(1), None))
+            .expect("send second response");
+        cx.run_until_parked();
+
+        assert!(!client.response_channels.lock().contains_key(&MessageId(0)));
+        assert!(client.response_channels.lock().contains_key(&MessageId(1)));
+        drop(request);
+
+        let response = other_request
+            .await
+            .expect("dropping the first response should unblock the read loop");
+        assert_eq!(
+            proto::Test::from_envelope(response).expect("decode second response"),
+            proto::Test { id: 3 },
+        );
+        assert!(client.response_channels.lock().is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_channel_client_request_does_not_keep_client_alive(cx: &mut TestAppContext) {
+        let (_incoming_tx, incoming_rx) = mpsc::unbounded::<Envelope>();
+        let (outgoing_tx, _outgoing_rx) = mpsc::unbounded::<Envelope>();
+        let client =
+            cx.update(|cx| ChannelClient::new(incoming_rx, outgoing_tx, cx, "test-client", false));
+        let weak_client = Arc::downgrade(&client);
+        let response_channels = Arc::downgrade(&client.response_channels);
+        let request = client.request_dynamic(
+            proto::Test { id: 0 }.into_envelope(0, None, None),
+            "Test",
+            true,
+        );
+
+        drop(client);
+        assert!(weak_client.upgrade().is_none());
+        assert!(response_channels.upgrade().is_none());
+        assert!(request.await.is_err());
+    }
+
+    #[gpui::test]
     async fn test_channel_client_request_stream_terminates_on_error(cx: &mut TestAppContext) {
         let (incoming_tx, incoming_rx) = mpsc::unbounded::<Envelope>();
         let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded::<Envelope>();
@@ -1665,7 +1838,8 @@ pub trait RemoteConnection: Send + Sync {
     fn simulate_disconnect(&self, _: &AsyncApp) {}
 }
 
-type ResponseChannels = Mutex<HashMap<MessageId, oneshot::Sender<(Envelope, oneshot::Sender<()>)>>>;
+type ResponseChannels =
+    Arc<Mutex<HashMap<MessageId, oneshot::Sender<(Envelope, oneshot::Sender<()>)>>>>;
 type StreamResponseChannels =
     Arc<Mutex<HashMap<MessageId, UnboundedSender<(Result<Envelope>, oneshot::Sender<()>)>>>>;
 
@@ -1976,10 +2150,20 @@ impl ChannelClient {
         use_buffer: bool,
     ) -> impl 'static + Future<Output = Result<proto::Envelope>> {
         envelope.id = self.next_message_id.fetch_add(1, SeqCst);
+        let message_id = MessageId(envelope.id);
         let (tx, rx) = oneshot::channel();
-        let mut response_channels_lock = self.response_channels.lock();
-        response_channels_lock.insert(MessageId(envelope.id), tx);
-        drop(response_channels_lock);
+        self.response_channels.lock().insert(message_id, tx);
+
+        // Install cleanup before constructing the future so unpolled requests
+        // are also removed, without keeping the response senders alive.
+        let cleanup_response_channel = util::defer({
+            let response_channels = Arc::downgrade(&self.response_channels);
+            move || {
+                if let Some(response_channels) = response_channels.upgrade() {
+                    response_channels.lock().remove(&message_id);
+                }
+            }
+        });
 
         let result = if use_buffer {
             self.send_buffered(envelope)
@@ -1987,6 +2171,7 @@ impl ChannelClient {
             self.send_unbuffered(envelope)
         };
         async move {
+            let _cleanup_response_channel = cleanup_response_channel;
             if let Err(error) = &result {
                 log::error!("failed to send message: {error}");
                 anyhow::bail!("failed to send message: {error}");
