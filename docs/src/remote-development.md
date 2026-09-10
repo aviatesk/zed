@@ -31,6 +31,31 @@ On your local machine, Zed runs its UI, talks to language models, uses Tree-sitt
 
 For simple cases where you don't need any SSH arguments, you can run `zed ssh://[<user>@]<host>[:<port>]/<path>` to open a remote folder/file directly. The CLI also accepts the scp style `zed ssh://[<user>@]<host>:~/project` or `zed ssh://[<user>@]<host>:/absolute/path`. If you'd like to hotlink into an SSH project, use a link of the format: `zed://ssh/[<user>@]<host>[:<port>]/<path>`.
 
+## Opening files from a remote terminal
+
+In newly opened Zed SSH terminals on Unix remote hosts, `zed` opens paths in the workspace that owns the terminal, even when another Zed window is focused:
+
+```sh
+zed README.md
+zed src/main.rs:20:5
+zed --add ../another-project
+zed --wait .git/COMMIT_EDITMSG
+```
+
+Relative paths are resolved on the remote machine. Multiple paths and new files are supported. With no paths, `zed` opens the terminal's current directory. `--add` is accepted for compatibility; remote CLI requests always target their originating workspace rather than selecting another window.
+
+For Git, use:
+
+```sh
+GIT_EDITOR='zed --wait --add' git commit --amend
+```
+
+`--wait` keeps the command running until the opened file tabs are closed; saving alone does not finish the command. Directory requests wait for the originating workspace to close. Opening errors and a connection lost before completion produce a nonzero exit status. Closing a workspace can also shut down its remote connection, in which case the waiting command reports failure rather than assuming the edit completed. Cancelling the command stops waiting without closing its editor tabs.
+
+Zed creates a private, session-specific `zed` launcher that reuses the automatically installed remote server executable. You do not need to install the desktop Zed binary on the remote host. The launcher is added to the terminal's `PATH` using terminal startup commands, without changing shell profiles or global installations. This integration supports POSIX shells (including Bash and Zsh) and Fish; shell startup scripts that consume terminal input can interfere with those startup commands.
+
+This integration does not configure separate SSH sessions, task terminals, or Windows remote hosts. After restarting the remote server, open a new Zed terminal: an older terminal's launcher must not silently attach to a different session. Both the local app and remote server must support the remote CLI. An editor configured globally as `zed --wait --add` also requires this session context; outside Zed's remote terminals, use another editor.
+
 ## Supported platforms
 
 The remote machine must be able to run Zed's server. The following platforms should work, though note that we have not exhaustively tested every Linux distribution:
