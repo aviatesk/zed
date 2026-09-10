@@ -15,7 +15,7 @@ use futures::future;
 use futures::{FutureExt, StreamExt};
 use git_ui::multi_diff_view::MultiDiffView;
 use git_ui_core::file_diff_view::FileDiffView;
-use gpui::{App, AsyncApp, Global, TaskExt, WindowHandle};
+use gpui::{App, AsyncApp, Context, Global, Subscription, TaskExt, Window, WindowHandle};
 use onboarding::FIRST_OPEN;
 use onboarding::show_onboarding_view;
 use recent_projects::{RemoteSettings, navigate_to_positions, open_remote_project};
@@ -31,7 +31,9 @@ use util::debug_panic;
 use util::paths::PathWithPosition;
 use workspace::PathList;
 use workspace::item::ItemHandle;
-use workspace::{AppState, MultiWorkspace, OpenOptions, OpenResult, SerializedWorkspaceLocation};
+use workspace::{
+    AppState, MultiWorkspace, OpenOptions, OpenResult, SerializedWorkspaceLocation, Workspace,
+};
 
 #[derive(Default, Debug)]
 pub struct OpenRequest {
@@ -572,6 +574,154 @@ pub async fn open_paths_with_positions(
     Ok((multi_workspace, items))
 }
 
+pub(crate) fn handle_remote_cli_request(
+    _workspace: &mut Workspace,
+    request: &project::RemoteCliRequest,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    cx.emit(workspace::Event::Activate);
+    cx.activate(true);
+    window.activate_window();
+
+    let paths = request.paths.clone();
+    let wait = request.wait;
+    let (workspace_release_sender, workspace_released) = oneshot::channel();
+    let workspace_release_subscription = cx.on_release(move |_, _| {
+        if workspace_release_sender.send(()).is_err() {
+            log::debug!("remote CLI request is no longer waiting for workspace closure");
+        }
+    });
+
+    request.respond(cx.spawn_in(window, async move |workspace, cx| {
+        let _workspace_release_subscription = workspace_release_subscription;
+        let mut workspace_released = workspace_released.fuse();
+        let (subscriptions, item_released, wait_for_workspace_close, errors) = {
+            let opening = async {
+                let mut subscriptions = Vec::new();
+                let mut item_released = Vec::new();
+                let mut wait_for_workspace_close = false;
+                let mut errors = Vec::new();
+                let mut directories = paths
+                    .iter()
+                    .filter(|path| path.is_directory)
+                    .collect::<Vec<_>>();
+                directories.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+
+                // Create parent worktrees first, but open files in the caller's order.
+                for path in directories
+                    .into_iter()
+                    .chain(paths.iter().filter(|path| !path.is_directory))
+                {
+                    let result = async {
+                        let project_path = workspace
+                            .update(cx, |workspace, cx| {
+                                Workspace::project_path_for_path(
+                                    workspace.project().clone(),
+                                    Path::new(&path.path),
+                                    true,
+                                    cx,
+                                )
+                            })?
+                            .await?;
+                        let (_worktree, project_path) = project_path;
+                        if path.is_directory {
+                            return anyhow::Ok(None);
+                        }
+                        let item = workspace
+                            .update_in(cx, |workspace, window, cx| {
+                                workspace.open_path(project_path, None, true, window, cx)
+                            })?
+                            .await?;
+                        if let Some(row) = path.row
+                            && let Some(editor) = item.downcast::<Editor>()
+                        {
+                            editor.update_in(cx, |editor, window, cx| {
+                                if let Some(buffer) = editor.buffer().read(cx).as_singleton() {
+                                    let point =
+                                        buffer.read(cx).snapshot().point_from_external_input(
+                                            row.saturating_sub(1),
+                                            path.column.unwrap_or(1).saturating_sub(1),
+                                        );
+                                    editor.go_to_singleton_buffer_point(point, window, cx);
+                                }
+                            })?;
+                        }
+                        Ok(Some(item))
+                    }
+                    .await
+                    .with_context(|| format!("error opening remote path {:?}", path.path));
+
+                    match result {
+                        Ok(Some(item)) if wait => {
+                            let (subscription, released) =
+                                cx.update(|_, cx| observe_cli_item_release(item.as_ref(), cx))?;
+                            subscriptions.push(subscription);
+                            item_released.push(released);
+                        }
+                        Ok(None) => wait_for_workspace_close = true,
+                        Ok(Some(_)) => {}
+                        Err(error) => errors.push(format!("{error:#}")),
+                    }
+                }
+                anyhow::Ok((
+                    subscriptions,
+                    item_released,
+                    wait_for_workspace_close,
+                    errors,
+                ))
+            }
+            .fuse();
+            futures::pin_mut!(opening);
+            futures::select_biased! {
+                _ = workspace_released => {
+                    anyhow::bail!("workspace closed before remote CLI paths finished opening");
+                },
+                result = opening => result?,
+            }
+        };
+
+        if wait {
+            let _subscriptions = subscriptions;
+            let items_closed = async {
+                future::try_join_all(item_released)
+                    .await
+                    .context("waiting for remote CLI items to close")?;
+
+                anyhow::Ok(())
+            };
+            let workspace_closed = async {
+                if wait_for_workspace_close {
+                    workspace_released
+                        .await
+                        .context("waiting for remote CLI workspace to close")?;
+                }
+                anyhow::Ok(())
+            };
+            future::try_join(items_closed, workspace_closed).await?;
+        }
+
+        anyhow::ensure!(errors.is_empty(), "{}", errors.join("\n"));
+        Ok(())
+    }));
+}
+
+fn observe_cli_item_release(
+    item: &dyn ItemHandle,
+    cx: &mut App,
+) -> (Subscription, oneshot::Receiver<()>) {
+    let (sender, receiver) = oneshot::channel();
+    let subscription = item.on_release(
+        cx,
+        Box::new(move |_| {
+            if sender.send(()).is_err() {
+                log::debug!("CLI request is no longer waiting for item closure");
+            }
+        }),
+    );
+    (subscription, receiver)
+}
+
 pub async fn handle_cli_connection(
     (mut requests, responses): (
         mpsc::UnboundedReceiver<CliRequest>,
@@ -1033,16 +1183,10 @@ async fn open_local_workspace(
         match item {
             Some(Ok(item)) => {
                 if open_options.wait {
-                    let (release_tx, release_rx) = oneshot::channel();
-                    item_release_futures.push(release_rx);
-                    subscriptions.push(Ok(cx.update(|cx| {
-                        item.on_release(
-                            cx,
-                            Box::new(move |_| {
-                                release_tx.send(()).ok();
-                            }),
-                        )
-                    })));
+                    let (subscription, released) =
+                        cx.update(|cx| observe_cli_item_release(item.as_ref(), cx));
+                    item_release_futures.push(released);
+                    subscriptions.push(Ok(subscription));
                 }
             }
             Some(Err(err)) => {
@@ -1129,9 +1273,11 @@ mod tests {
     use cli::CliResponse;
     use editor::Editor;
     use futures::poll;
-    use gpui::{AppContext as _, TestAppContext, UpdateGlobal as _};
-    use language::LineEnding;
-    use remote::SshConnectionOptions;
+    use gpui::{AppContext as _, Entity, EntityId, Task, TestAppContext, UpdateGlobal as _};
+    use language::{LineEnding, Point};
+    use project::Project;
+    use remote::{RemoteClient, SshConnectionOptions};
+    use remote_server::{HeadlessAppState, HeadlessProject};
     use rope::Rope;
     use serde_json::json;
     use session::Session;
@@ -1155,6 +1301,574 @@ mod tests {
                 .send(response)
                 .map_err(|error| anyhow::anyhow!("{error}"))
         }
+    }
+
+    async fn remote_cli_test_workspace(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) -> (
+        WindowHandle<MultiWorkspace>,
+        Entity<Workspace>,
+        Entity<Project>,
+        Entity<HeadlessProject>,
+    ) {
+        let app_state = init_test(cx);
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                path!("/remote"),
+                json!({ "first.txt": "local content must not be opened" }),
+            )
+            .await;
+        server_cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+        let (options, session, connect_guard) = RemoteClient::fake_server(cx, server_cx);
+        let remote_fs = fs::FakeFs::new(server_cx.executor());
+        remote_fs
+            .insert_tree(
+                path!("/remote"),
+                json!({
+                    "first.txt": "first\nsecond line\nthird",
+                    "second.txt": "second file",
+                    "unrelated.txt": "unrelated",
+                    "literal (2)": "literal contents",
+                    "directory": {},
+                }),
+            )
+            .await;
+        remote_fs.insert_tree(path!("/outside"), json!({})).await;
+        server_cx.update(HeadlessProject::init);
+        let languages = Arc::new(language::LanguageRegistry::new(server_cx.executor()));
+        let headless = server_cx.new(|cx| {
+            HeadlessProject::new(
+                HeadlessAppState {
+                    session,
+                    fs: remote_fs,
+                    http_client: Arc::new(http_client::BlockedHttpClient),
+                    node_runtime: node_runtime::NodeRuntime::unavailable(),
+                    languages,
+                    extension_host_proxy: Arc::new(extension::ExtensionHostProxy::new()),
+                    startup_time: std::time::Instant::now(),
+                },
+                false,
+                cx,
+            )
+        });
+        drop(connect_guard);
+        let window = open_remote_project(
+            options,
+            vec![PathBuf::from(path!("/remote"))],
+            app_state,
+            OpenOptions::default(),
+            &mut cx.to_async(),
+        )
+        .await
+        .expect("open mock remote workspace");
+        cx.run_until_parked();
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let project = workspace.read_with(cx, |workspace, _| workspace.project().clone());
+        (window, workspace, project, headless)
+    }
+
+    fn remote_cli_path(path: &str) -> client::proto::RemoteCliPath {
+        client::proto::RemoteCliPath {
+            path: path.into(),
+            row: None,
+            column: None,
+            is_directory: false,
+        }
+    }
+
+    fn open_remote_cli_test_paths(
+        project: &Entity<Project>,
+        request_id: u64,
+        paths: Vec<client::proto::RemoteCliPath>,
+        wait: bool,
+        cx: &mut TestAppContext,
+    ) -> Task<Result<()>> {
+        project.update(cx, |project, cx| {
+            project.open_remote_cli_paths(
+                client::proto::OpenRemoteCliPaths {
+                    project_id: client::proto::REMOTE_SERVER_PROJECT_ID,
+                    request_id,
+                    paths,
+                    wait,
+                },
+                cx,
+            )
+        })
+    }
+
+    fn close_remote_cli_test_item(
+        window: WindowHandle<MultiWorkspace>,
+        workspace: &Entity<Workspace>,
+        item_id: EntityId,
+        cx: &mut TestAppContext,
+    ) {
+        window
+            .update(cx, |_, window, cx| {
+                let pane = workspace
+                    .read(cx)
+                    .pane_for_item_id(item_id)
+                    .expect("item has a pane");
+                pane.update(cx, |pane, cx| {
+                    pane.remove_item(item_id, false, true, window, cx)
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.update(|_| {});
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_remote_cli_routes_to_owning_workspace(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let (window, workspace, project, headless) = remote_cli_test_workspace(cx, server_cx).await;
+        let session = headless.read_with(server_cx, |headless, _| headless.session.clone());
+        let sibling_project = Project::test(fs::FakeFs::new(cx.executor()), [], cx).await;
+        let sibling = window
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.open_sidebar(cx);
+                multi_workspace.test_add_workspace(sibling_project, window, cx)
+            })
+            .unwrap();
+        assert_ne!(workspace, sibling);
+        let mut positioned_path = remote_cli_path(path!("/remote/first.txt"));
+        positioned_path.row = Some(2);
+        positioned_path.column = Some(4);
+        session
+            .request(client::proto::OpenRemoteCliPaths {
+                project_id: client::proto::REMOTE_SERVER_PROJECT_ID,
+                request_id: 1,
+                paths: vec![
+                    remote_cli_path(path!("/remote/new.txt")),
+                    remote_cli_path(path!("/outside/new.txt")),
+                    remote_cli_path(path!("/remote/literal (2)")),
+                    positioned_path,
+                ],
+                wait: false,
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        window
+            .read_with(cx, |multi_workspace, cx| {
+                assert_eq!(multi_workspace.workspace(), &workspace);
+                assert_eq!(sibling.read(cx).items(cx).count(), 0);
+                assert_eq!(workspace.read(cx).items(cx).count(), 4);
+            })
+            .unwrap();
+        workspace.update(cx, |workspace, cx| {
+            assert_eq!(workspace.project(), &project);
+            let editor = workspace
+                .active_item_as::<Editor>(cx)
+                .expect("opened editor");
+            editor.update(cx, |editor, cx| {
+                assert_eq!(editor.text(cx), "first\nsecond line\nthird");
+                assert_eq!(
+                    editor
+                        .selections
+                        .ranges::<Point>(&editor.display_snapshot(cx)),
+                    vec![Point::new(1, 3)..Point::new(1, 3)]
+                );
+            });
+            let new_items = workspace
+                .items_of_type::<Editor>(cx)
+                .filter(|editor| editor.read(cx).text(cx).is_empty())
+                .count();
+            assert_eq!(new_items, 2);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_remote_cli_waits_for_released_items_not_tab_moves(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let (window, workspace, project, _headless) =
+            remote_cli_test_workspace(cx, server_cx).await;
+        open_remote_cli_test_paths(
+            &project,
+            1,
+            vec![
+                remote_cli_path(path!("/remote/first.txt")),
+                remote_cli_path(path!("/remote/unrelated.txt")),
+            ],
+            false,
+            cx,
+        )
+        .await
+        .unwrap();
+        let mut waiting = open_remote_cli_test_paths(
+            &project,
+            2,
+            vec![
+                remote_cli_path(path!("/remote/first.txt")),
+                remote_cli_path(path!("/remote/second.txt")),
+            ],
+            true,
+            cx,
+        );
+        cx.run_until_parked();
+        assert!(matches!(poll!(&mut waiting), Poll::Pending));
+        let items = workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace.items(cx).count(),
+                3,
+                "reuse the existing first tab"
+            );
+            workspace
+                .items_of_type::<Editor>(cx)
+                .filter(|editor| editor.read(cx).text(cx) != "unrelated")
+                .map(|editor| editor.downgrade())
+                .collect::<Vec<_>>()
+        });
+        window
+            .update(cx, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.split_and_move(
+                        workspace.active_pane().clone(),
+                        workspace::SplitDirection::Right,
+                        window,
+                        cx,
+                    );
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(matches!(poll!(&mut waiting), Poll::Pending));
+        let mut items = items.into_iter();
+        let first = items.next().expect("first waited item");
+        let second = items.next().expect("second waited item");
+        close_remote_cli_test_item(window, &workspace, first.entity_id(), cx);
+        assert!(
+            first.upgrade().is_none(),
+            "the waiter must not retain the item"
+        );
+        assert!(matches!(poll!(&mut waiting), Poll::Pending));
+        close_remote_cli_test_item(window, &workspace, second.entity_id(), cx);
+        waiting.await.unwrap();
+        assert!(second.upgrade().is_none());
+        assert_eq!(
+            workspace.read_with(cx, |workspace, cx| workspace.items(cx).count()),
+            1
+        );
+    }
+
+    #[gpui::test]
+    async fn test_remote_cli_directory_waits_for_workspace_not_window(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let (window, workspace, project, _headless) =
+            remote_cli_test_workspace(cx, server_cx).await;
+        let sibling_project = Project::test(fs::FakeFs::new(cx.executor()), [], cx).await;
+        window
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.open_sidebar(cx);
+                multi_workspace.test_add_workspace(sibling_project, window, cx);
+            })
+            .unwrap();
+        let mut directory = remote_cli_path(path!("/remote/directory"));
+        directory.is_directory = true;
+        let mut waiting = open_remote_cli_test_paths(&project, 1, vec![directory], true, cx);
+        cx.run_until_parked();
+        assert!(matches!(poll!(&mut waiting), Poll::Pending));
+        let weak_workspace = workspace.downgrade();
+        let weak_project = project.downgrade();
+        // Keep the connection alive here; project/server teardown is tested separately.
+        let removing = window
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.remove(
+                    [workspace.clone()],
+                    workspace::RemovalIntent::CloseProject,
+                    window,
+                    cx,
+                )
+            })
+            .unwrap();
+        drop(workspace);
+
+        assert!(removing.await.unwrap());
+
+        cx.update(|_| {});
+        cx.run_until_parked();
+
+        weak_workspace.assert_released();
+        waiting.await.unwrap();
+        assert!(weak_workspace.upgrade().is_none());
+        drop(project);
+        cx.run_until_parked();
+        assert!(
+            weak_project.upgrade().is_none(),
+            "the request must not retain its project"
+        );
+        assert_eq!(cx.windows().len(), 1);
+    }
+
+    #[gpui::test]
+    async fn test_remote_cli_project_shutdown_cancels_directory_wait(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let (window, workspace, project, _headless) =
+            remote_cli_test_workspace(cx, server_cx).await;
+        let mut directory = remote_cli_path(path!("/remote/directory"));
+        directory.is_directory = true;
+        let mut waiting = open_remote_cli_test_paths(&project, 1, vec![directory], true, cx);
+        cx.run_until_parked();
+        assert!(matches!(poll!(&mut waiting), Poll::Pending));
+        let weak_project = project.downgrade();
+        drop(project);
+        drop(workspace);
+        window
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+        let error = waiting
+            .await
+            .expect_err("project shutdown must cancel an outstanding wait");
+        assert!(error.to_string().contains("cancelled"));
+        assert!(weak_project.upgrade().is_none());
+    }
+
+    #[gpui::test(iterations = 10)]
+    async fn test_remote_cli_cancel_wait_and_ignore_late_cancel(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let (window, workspace, _project, headless) =
+            remote_cli_test_workspace(cx, server_cx).await;
+        let session = headless.read_with(server_cx, |headless, _| headless.session.clone());
+        let mut waiting = session
+            .request(client::proto::OpenRemoteCliPaths {
+                project_id: client::proto::REMOTE_SERVER_PROJECT_ID,
+                request_id: 1,
+                paths: vec![remote_cli_path(path!("/remote/first.txt"))],
+                wait: true,
+            })
+            .boxed_local();
+        assert!(matches!(poll!(&mut waiting), Poll::Pending));
+        cx.run_until_parked();
+        assert!(matches!(poll!(&mut waiting), Poll::Pending));
+        session
+            .send(client::proto::CancelRemoteCliRequest {
+                project_id: client::proto::REMOTE_SERVER_PROJECT_ID,
+                request_id: 1,
+            })
+            .unwrap();
+        assert!(waiting.await.unwrap_err().to_string().contains("cancelled"));
+        cx.run_until_parked();
+        assert_eq!(
+            workspace.read_with(cx, |workspace, cx| workspace.items(cx).count()),
+            1
+        );
+        let mut next_wait = session
+            .request(client::proto::OpenRemoteCliPaths {
+                project_id: client::proto::REMOTE_SERVER_PROJECT_ID,
+                request_id: 2,
+                paths: vec![remote_cli_path(path!("/remote/second.txt"))],
+                wait: true,
+            })
+            .boxed_local();
+        assert!(matches!(poll!(&mut next_wait), Poll::Pending));
+        cx.run_until_parked();
+        session
+            .send(client::proto::CancelRemoteCliRequest {
+                project_id: client::proto::REMOTE_SERVER_PROJECT_ID,
+                request_id: 1,
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(matches!(poll!(&mut next_wait), Poll::Pending));
+        let item_id = workspace.read_with(cx, |workspace, cx| {
+            workspace.active_item(cx).unwrap().item_id()
+        });
+        close_remote_cli_test_item(window, &workspace, item_id, cx);
+        next_wait.await.unwrap();
+
+        let mut immediately_cancelled = session
+            .request(client::proto::OpenRemoteCliPaths {
+                project_id: client::proto::REMOTE_SERVER_PROJECT_ID,
+                request_id: 3,
+                paths: vec![remote_cli_path(path!("/remote/first.txt"))],
+                wait: true,
+            })
+            .boxed_local();
+        assert!(matches!(poll!(&mut immediately_cancelled), Poll::Pending));
+        session
+            .send(client::proto::CancelRemoteCliRequest {
+                project_id: client::proto::REMOTE_SERVER_PROJECT_ID,
+                request_id: 3,
+            })
+            .unwrap();
+        assert!(
+            immediately_cancelled
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_remote_cli_partial_failure_is_not_success(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let (window, workspace, project, _headless) =
+            remote_cli_test_workspace(cx, server_cx).await;
+
+        let mut waiting = open_remote_cli_test_paths(
+            &project,
+            1,
+            vec![
+                remote_cli_path(path!("/remote/first.txt")),
+                remote_cli_path(path!("/missing-parent/child.txt")),
+            ],
+            true,
+            cx,
+        );
+        cx.run_until_parked();
+        assert!(matches!(poll!(&mut waiting), Poll::Pending));
+        let item_id = workspace.read_with(cx, |workspace, cx| {
+            workspace.active_item(cx).unwrap().item_id()
+        });
+        let weak_item = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_item(cx)
+                .unwrap()
+                .downcast::<Editor>()
+                .unwrap()
+                .into_any()
+                .downgrade()
+        });
+
+        close_remote_cli_test_item(window, &workspace, item_id, cx);
+
+        weak_item.assert_released();
+        let error = waiting.await.unwrap_err();
+
+        assert!(format!("{error:#}").contains("child.txt"));
+
+        let mut missing_directory = remote_cli_path(path!("/missing-parent/directory"));
+        missing_directory.is_directory = true;
+        let error = open_remote_cli_test_paths(&project, 2, vec![missing_directory], true, cx)
+            .await
+            .expect_err("a failed directory open must not wait for workspace closure");
+        assert!(format!("{error:#}").contains("directory"));
+    }
+
+    #[gpui::test]
+    async fn test_remote_cli_disconnect_cancels_all_waits(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let (_window, workspace, project, _headless) =
+            remote_cli_test_workspace(cx, server_cx).await;
+        let mut file_wait = open_remote_cli_test_paths(
+            &project,
+            1,
+            vec![remote_cli_path(path!("/remote/first.txt"))],
+            true,
+            cx,
+        );
+        let mut directory = remote_cli_path(path!("/remote/directory"));
+        directory.is_directory = true;
+        let mut directory_wait = open_remote_cli_test_paths(&project, 2, vec![directory], true, cx);
+        cx.run_until_parked();
+        assert!(matches!(poll!(&mut file_wait), Poll::Pending));
+        assert!(matches!(poll!(&mut directory_wait), Poll::Pending));
+        project.update(cx, |project, cx| {
+            project
+                .remote_client()
+                .unwrap()
+                .update(cx, |client, cx| client.force_server_not_running(cx));
+        });
+        assert!(
+            file_wait
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled")
+        );
+        assert!(
+            directory_wait
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled")
+        );
+        assert_eq!(
+            workspace.read_with(cx, |workspace, cx| workspace.items(cx).count()),
+            1
+        );
+        let error = open_remote_cli_test_paths(
+            &project,
+            3,
+            vec![remote_cli_path(path!("/remote/second.txt"))],
+            false,
+            cx,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("disconnected"));
+    }
+
+    #[gpui::test]
+    async fn test_remote_cli_missing_handler_and_cancellation_during_open(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let error = open_remote_cli_test_paths(
+            &project,
+            1,
+            vec![remote_cli_path(path!("/file.txt"))],
+            false,
+            cx,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("no workspace handled"));
+
+        let (started_sender, started) = oneshot::channel();
+        let (dropped_sender, dropped) = oneshot::channel::<()>();
+        let mut senders = Some((started_sender, dropped_sender));
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&project, move |_, event, cx| {
+                if let project::Event::OpenRemoteCliPaths(request) = event {
+                    let (started_sender, dropped_sender) = senders.take().expect("one request");
+                    request.respond(cx.spawn(async move |_| {
+                        let _dropped_sender = dropped_sender;
+                        started_sender.send(()).expect("test waits for opening");
+                        future::pending::<Result<()>>().await
+                    }));
+                }
+            })
+        });
+        let waiting = open_remote_cli_test_paths(
+            &project,
+            2,
+            vec![remote_cli_path(path!("/file.txt"))],
+            false,
+            cx,
+        );
+        started.await.unwrap();
+        project.update(cx, |project, _| project.cancel_remote_cli_request(2));
+        assert!(waiting.await.unwrap_err().to_string().contains("cancelled"));
+        assert!(
+            dropped.await.is_err(),
+            "cancellation must drop the opening task"
+        );
+        let weak_project = project.downgrade();
+        drop(project);
+        cx.run_until_parked();
+        assert!(weak_project.upgrade().is_none());
     }
 
     fn assert_ssh_parse(

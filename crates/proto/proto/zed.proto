@@ -524,7 +524,11 @@ message Envelope {
     ExecuteLspCommandResponse execute_lsp_command_response = 492;
     RefreshDocumentHighlights refresh_document_highlights = 493;
     LoadMergeBaseDiff load_merge_base_diff = 494;
-    UnregisterBufferWithLanguageServers unregister_buffer_with_language_servers = 495; // current max
+    UnregisterBufferWithLanguageServers unregister_buffer_with_language_servers = 495;
+    GetRemoteCliInfo get_remote_cli_info = 496;
+    RemoteCliInfo remote_cli_info = 497;
+    OpenRemoteCliPaths open_remote_cli_paths = 498;
+    CancelRemoteCliRequest cancel_remote_cli_request = 499; // current max
   }
 
   reserved 87 to 88;
@@ -602,6 +606,32 @@ message FlushBufferedMessages {}
 message FlushBufferedMessagesResponse {}
 
 message RemoteStarted {}
+
+message GetRemoteCliInfo {}
+
+message RemoteCliInfo {
+  string socket_path = 1;
+  string bin_path = 2;
+}
+
+message RemoteCliPath {
+  string path = 1;
+  optional uint32 row = 2;
+  optional uint32 column = 3;
+  bool is_directory = 4;
+}
+
+message OpenRemoteCliPaths {
+  uint64 project_id = 1;
+  uint64 request_id = 2;
+  repeated RemoteCliPath paths = 3;
+  bool wait = 4;
+}
+
+message CancelRemoteCliRequest {
+  uint64 project_id = 1;
+  uint64 request_id = 2;
+}
 
 message SpawnKernel {
   string kernel_name = 1;

@@ -79,7 +79,7 @@ pub use environment::ProjectEnvironment;
 use futures::{
     StreamExt,
     channel::mpsc::{self, UnboundedReceiver},
-    future::try_join_all,
+    future::{AbortHandle, Abortable, try_join_all},
 };
 pub use image_store::{ImageItem, ImageStore};
 use image_store::{ImageItemEvent, ImageStoreEvent};
@@ -229,6 +229,7 @@ pub struct Project {
     user_store: Entity<UserStore>,
     fs: Arc<dyn Fs>,
     remote_client: Option<Entity<RemoteClient>>,
+    remote_cli_requests: Arc<Mutex<HashMap<u64, AbortHandle>>>,
     // todo lw explain the client_state x remote_client matrix, its super confusing
     client_state: ProjectClientState,
     git_store: Entity<GitStore>,
@@ -255,6 +256,49 @@ pub struct Project {
     agent_location: Option<AgentLocation>,
     downloading_files: Arc<Mutex<HashMap<(WorktreeId, String), DownloadingFile>>>,
     last_worktree_paths: WorktreePaths,
+}
+
+#[derive(Clone)]
+pub struct RemoteCliRequest {
+    pub paths: Vec<proto::RemoteCliPath>,
+    pub wait: bool,
+    response: async_channel::Sender<Task<Result<()>>>,
+}
+
+impl RemoteCliRequest {
+    // Hand ownership of the task to the RPC handler so cancellation also stops UI work.
+    pub fn respond(&self, task: Task<Result<()>>) {
+        if self.response.try_send(task).is_err() {
+            log::debug!("remote CLI request is no longer waiting for a UI handler");
+        }
+    }
+}
+
+impl std::fmt::Debug for RemoteCliRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RemoteCliRequest")
+            .field("paths", &self.paths)
+            .field("wait", &self.wait)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for RemoteCliRequest {
+    fn eq(&self, other: &Self) -> bool {
+        self.response.same_channel(&other.response)
+    }
+}
+
+struct RemoteCliRequestGuard {
+    request_id: u64,
+    requests: Arc<Mutex<HashMap<u64, AbortHandle>>>,
+}
+
+impl Drop for RemoteCliRequestGuard {
+    fn drop(&mut self) {
+        self.requests.lock().remove(&self.request_id);
+    }
 }
 
 struct DownloadingFile {
@@ -365,6 +409,7 @@ pub enum Event {
     },
     LanguageServerPrompt(LanguageServerPromptRequest),
     LanguageServerShowDocument(LanguageServerShowDocumentRequest),
+    OpenRemoteCliPaths(RemoteCliRequest),
     LanguageNotFound(Entity<Buffer>),
     ActiveEntryChanged(Option<ProjectEntryId>),
     ActivateProjectPanel,
@@ -1395,6 +1440,7 @@ impl Project {
                 settings_observer,
                 fs,
                 remote_client: None,
+                remote_cli_requests: Default::default(),
                 bookmark_store,
                 breakpoint_store,
                 dap_store,
@@ -1619,6 +1665,7 @@ impl Project {
                 _subscriptions: vec![
                     cx.on_release(Self::release),
                     cx.on_app_quit(|this, cx| {
+                        this.cancel_remote_cli_requests();
                         let shutdown = this.remote_client.take().and_then(|client| {
                             client.update(cx, |client, cx| {
                                 client.shutdown_processes(
@@ -1644,6 +1691,7 @@ impl Project {
                 settings_observer,
                 fs,
                 remote_client: Some(remote.clone()),
+                remote_cli_requests: Default::default(),
                 buffers_needing_diff: Default::default(),
                 git_diff_debouncer: DebouncedDelay::new(),
                 terminals: Terminals {
@@ -1684,6 +1732,8 @@ impl Project {
             remote_proto.add_entity_request_handler(Self::handle_language_server_prompt_request);
             remote_proto
                 .add_entity_request_handler(Self::handle_language_server_show_document_request);
+            remote_proto.add_entity_request_handler(Self::handle_open_remote_cli_paths);
+            remote_proto.add_entity_message_handler(Self::handle_cancel_remote_cli_request);
             remote_proto.add_entity_message_handler(Self::handle_hide_toast);
             remote_proto.add_entity_request_handler(Self::handle_update_buffer_from_remote_server);
             remote_proto.add_entity_request_handler(Self::handle_trust_worktrees);
@@ -1922,6 +1972,7 @@ impl Project {
                 snippets,
                 fs,
                 remote_client: None,
+                remote_cli_requests: Default::default(),
                 settings_observer: settings_observer.clone(),
                 client_subscriptions: Default::default(),
                 _subscriptions: vec![cx.on_release(Self::release)],
@@ -2025,6 +2076,9 @@ impl Project {
     }
 
     fn release(&mut self, cx: &mut App) {
+        // Workspace release can finish a directory wait just as its project shuts down the
+        // server. Cancel outstanding requests rather than retaining the project to send Ack.
+        self.cancel_remote_cli_requests();
         if let Some(client) = self.remote_client.take() {
             let shutdown = client.update(cx, |client, cx| {
                 client.shutdown_processes(
@@ -3925,6 +3979,7 @@ impl Project {
     ) {
         match event {
             &remote::RemoteClientEvent::Disconnected { server_not_running } => {
+                self.cancel_remote_cli_requests();
                 self.worktree_store.update(cx, |store, cx| {
                     store.disconnected_from_host(cx);
                 });
@@ -5626,6 +5681,116 @@ impl Project {
                 .log_err();
         });
         Ok(())
+    }
+
+    pub fn open_remote_cli_paths(
+        &mut self,
+        request: proto::OpenRemoteCliPaths,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        if request.paths.is_empty() {
+            return Task::ready(Err(anyhow!("remote CLI request has no paths")));
+        }
+        if self.remote_connection_state(cx) == Some(remote::ConnectionState::Disconnected) {
+            return Task::ready(Err(anyhow!("remote project is disconnected")));
+        }
+        for path in &request.paths {
+            if !is_absolute(&path.path, self.path_style(cx)) {
+                return Task::ready(Err(anyhow!(
+                    "remote CLI path is not absolute: {:?}",
+                    path.path
+                )));
+            }
+        }
+
+        let (abort_handle, abort_registration) = AbortHandle::new_pair();
+        let mut requests = self.remote_cli_requests.lock();
+        if requests.contains_key(&request.request_id) {
+            return Task::ready(Err(anyhow!(
+                "duplicate remote CLI request {}",
+                request.request_id
+            )));
+        }
+        requests.insert(request.request_id, abort_handle);
+        drop(requests);
+        let guard = RemoteCliRequestGuard {
+            request_id: request.request_id,
+            requests: self.remote_cli_requests.clone(),
+        };
+        let (response, receiver) = async_channel::bounded(1);
+        cx.emit(Event::OpenRemoteCliPaths(RemoteCliRequest {
+            paths: request.paths,
+            wait: request.wait,
+            response,
+        }));
+
+        cx.spawn(async move |_, _| {
+            let _guard = guard;
+            Abortable::new(
+                async move {
+                    let task = receiver
+                        .recv()
+                        .await
+                        .context("no workspace handled the remote CLI request")?;
+                    task.await
+                },
+                abort_registration,
+            )
+            .await
+            .map_err(|_| anyhow!("remote CLI request {} was cancelled", request.request_id))?
+        })
+    }
+
+    pub fn cancel_remote_cli_request(&mut self, request_id: u64) {
+        if let Some(handle) = self.remote_cli_requests.lock().get(&request_id) {
+            handle.abort();
+        }
+    }
+
+    fn cancel_remote_cli_requests(&mut self) {
+        for handle in self.remote_cli_requests.lock().values() {
+            handle.abort();
+        }
+    }
+
+    // Register cancellation before the request future can be scheduled behind its cancel message.
+    fn handle_open_remote_cli_paths(
+        project: Entity<Self>,
+        envelope: TypedEnvelope<proto::OpenRemoteCliPaths>,
+        mut cx: AsyncApp,
+    ) -> impl Future<Output = Result<proto::Ack>> {
+        let task = project.update(&mut cx, |project, cx| {
+            project.open_remote_cli_paths(envelope.payload, cx)
+        });
+        let weak_project = project.downgrade();
+        drop(project);
+        async move {
+            task.await?;
+            weak_project
+                .read_with(&cx, |project, cx| {
+                    anyhow::ensure!(
+                        !matches!(
+                            project.remote_connection_state(cx),
+                            None | Some(remote::ConnectionState::Disconnected)
+                        ),
+                        "remote project disconnected before the CLI request completed"
+                    );
+                    Ok(())
+                })
+                .context("remote project closed before the CLI request completed")??;
+            Ok(proto::Ack {})
+        }
+    }
+
+    fn handle_cancel_remote_cli_request(
+        project: Entity<Self>,
+        envelope: TypedEnvelope<proto::CancelRemoteCliRequest>,
+        mut cx: AsyncApp,
+    ) -> Task<Result<()>> {
+        project.update(&mut cx, |project, _| {
+            project.cancel_remote_cli_request(envelope.payload.request_id);
+        });
+        Task::ready(Ok(()))
     }
 
     async fn handle_language_server_prompt_request(
