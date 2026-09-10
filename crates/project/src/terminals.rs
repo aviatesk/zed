@@ -1,11 +1,12 @@
 use anyhow::Result;
 use collections::HashMap;
-use gpui::{App, AppContext as _, Context, Entity, Task, WeakEntity};
+use gpui::{App, AppContext as _, Context, Entity, FutureExt as _, Task, WeakEntity};
 
 use futures::{FutureExt, future::Shared};
 use itertools::Itertools as _;
 use language::LanguageName;
 use remote::{Interactive, RemoteClient};
+use rpc::proto;
 use settings::{Settings, SettingsLocation};
 use std::{
     borrow::Cow,
@@ -371,13 +372,45 @@ impl Project {
         let env_task =
             self.resolve_directory_environment(&env_shell, path.clone(), remote_client.clone(), cx);
 
+        let shell_kind = ShellKind::new(&shell, path_style.is_windows());
+        let remote_cli_info_request = remote_client.as_ref().and_then(|remote_client| {
+            let remote_client = remote_client.read(cx);
+            if remote_client.remote_platform().os.is_windows()
+                || !matches!(
+                    remote_client.connection_options(),
+                    remote::RemoteConnectionOptions::Ssh(_)
+                )
+            {
+                return None;
+            }
+            if !matches!(shell_kind, ShellKind::Posix | ShellKind::Fish) {
+                log::debug!("Remote terminal CLI is not supported for shell {shell}");
+                return None;
+            }
+            Some(
+                remote_client
+                    .proto_client()
+                    .request(proto::GetRemoteCliInfo {}),
+            )
+        });
+
         let lang_registry = self.languages.clone();
         cx.spawn(async move |project, cx| {
-            let shell_kind = ShellKind::new(&shell, path_style.is_windows());
-            let mut env = env_task.await.unwrap_or_default();
+            let (env, remote_cli_info) = futures::join!(env_task, async {
+                let request = remote_cli_info_request?;
+                // Older servers may not respond to this optional request.
+                Some(
+                    request
+                        .with_timeout(Duration::from_secs(5), cx.background_executor())
+                        .await
+                        .map_err(anyhow::Error::from)
+                        .and_then(|response| response),
+                )
+            });
+            let mut env = env.unwrap_or_default();
             env.extend(settings.env);
 
-            let activation_script = maybe!(async {
+            let mut activation_script = maybe!(async {
                 for toolchain in toolchains {
                     let Some(toolchain) = toolchain.await else {
                         continue;
@@ -395,6 +428,15 @@ impl Project {
             })
             .await
             .unwrap_or_default();
+
+            if let Some(remote_cli_info) = remote_cli_info {
+                apply_remote_cli_info(
+                    remote_cli_info,
+                    shell_kind,
+                    &mut env,
+                    &mut activation_script,
+                );
+            }
 
             let builder = project
                 .update(cx, move |_, cx| {
@@ -605,6 +647,57 @@ impl Project {
     }
 }
 
+fn remote_cli_path_command(shell_kind: ShellKind, bin_path: &str) -> Option<String> {
+    // This command is typed into a PTY, so shell quoting alone cannot protect
+    // control characters. A colon cannot be represented within a PATH entry.
+    if !bin_path.starts_with('/')
+        || bin_path.contains(':')
+        || bin_path.chars().any(char::is_control)
+    {
+        return None;
+    }
+    let bin_path = shell_kind.try_quote(bin_path)?;
+    match shell_kind {
+        ShellKind::Posix => Some(format!("export PATH={bin_path}:\"$PATH\"")),
+        ShellKind::Fish => Some(format!("set -gx PATH {bin_path} $PATH")),
+        _ => None,
+    }
+}
+
+fn apply_remote_cli_info(
+    remote_cli_info: Result<proto::RemoteCliInfo>,
+    shell_kind: ShellKind,
+    env: &mut HashMap<String, String>,
+    activation_script: &mut Vec<String>,
+) {
+    let remote_cli_info = match remote_cli_info {
+        Ok(remote_cli_info) => remote_cli_info,
+        Err(error) => {
+            log::warn!("Failed to get remote terminal CLI information: {error:#}");
+            return;
+        }
+    };
+    if remote_cli_info.socket_path.is_empty() || remote_cli_info.bin_path.is_empty() {
+        log::debug!("Remote server does not support the terminal CLI");
+        return;
+    }
+    if !remote_cli_info.socket_path.starts_with('/')
+        || remote_cli_info.socket_path.chars().any(char::is_control)
+    {
+        log::warn!("Remote terminal CLI socket path is not supported");
+        return;
+    }
+    let Some(command) = remote_cli_path_command(shell_kind, &remote_cli_info.bin_path) else {
+        log::warn!("Remote terminal CLI shell or bin path is not supported");
+        return;
+    };
+
+    env.insert("ZED_REMOTE_CLI_SOCKET".into(), remote_cli_info.socket_path);
+    env.insert("ZED_REMOTE_CLI_BIN".into(), remote_cli_info.bin_path);
+    // Login startup files and toolchain activation can overwrite PATH.
+    activation_script.push(command);
+}
+
 fn create_remote_shell(
     spawn_command: Option<(&String, &Vec<String>)>,
     mut env: HashMap<String, String>,
@@ -712,6 +805,171 @@ fn quote_cmd_command_arg_for_outer_shell(arg: &str, shell_kind: ShellKind) -> Op
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn formats_remote_cli_path_commands() {
+        for shell in ["/bin/sh", "/bin/bash", "/bin/zsh", "/bin/dash", "/bin/ksh"] {
+            assert_eq!(
+                remote_cli_path_command(ShellKind::new(shell, false), "/remote/cli bin"),
+                Some("export PATH='/remote/cli bin':\"$PATH\"".to_string()),
+            );
+        }
+        assert_eq!(
+            remote_cli_path_command(ShellKind::Fish, "/remote/cli bin"),
+            Some("set -gx PATH '/remote/cli bin' $PATH".to_string()),
+        );
+    }
+
+    #[test]
+    fn quotes_remote_cli_path_commands() {
+        let bin_path = "/remote/$(touch marker); $HOME/bin";
+        assert_eq!(
+            remote_cli_path_command(ShellKind::Posix, bin_path),
+            Some("export PATH='/remote/$(touch marker); $HOME/bin':\"$PATH\"".to_string()),
+        );
+        assert_eq!(
+            remote_cli_path_command(ShellKind::Fish, bin_path),
+            Some("set -gx PATH '/remote/$(touch marker); $HOME/bin' $PATH".to_string()),
+        );
+
+        let bin_path = r#"/remote/it's "quoted"; $(touch marker) `echo marker` \bin"#;
+        let command = remote_cli_path_command(ShellKind::Posix, bin_path)
+            .expect("POSIX path command should be supported");
+        assert_eq!(
+            ShellKind::Posix.split(&command),
+            Some(vec!["export".to_string(), format!("PATH={bin_path}:$PATH")]),
+        );
+        let command = remote_cli_path_command(ShellKind::Fish, bin_path)
+            .expect("fish path command should be supported");
+        assert_eq!(
+            ShellKind::Fish.split(&command),
+            Some(vec![
+                "set".to_string(),
+                "-gx".to_string(),
+                "PATH".to_string(),
+                bin_path.to_string(),
+                "$PATH".to_string(),
+            ]),
+        );
+    }
+
+    #[test]
+    fn rejects_remote_cli_paths_unsafe_for_pty_input_or_path_entries() {
+        for bin_path in [
+            "",
+            "relative/bin",
+            "~/bin",
+            "/remote/bin:other",
+            "/remote/\0bin",
+            "/remote/\nbin",
+            "/remote/\rbin",
+            "/remote/\tbin",
+            "/remote/\x1bbin",
+            "/remote/\x7fbin",
+        ] {
+            for shell_kind in [ShellKind::Posix, ShellKind::Fish] {
+                assert_eq!(remote_cli_path_command(shell_kind, bin_path), None);
+            }
+        }
+    }
+
+    #[test]
+    fn skips_unsupported_remote_cli_shells() {
+        for shell_kind in [
+            ShellKind::Csh,
+            ShellKind::Tcsh,
+            ShellKind::Rc,
+            ShellKind::PowerShell,
+            ShellKind::Pwsh,
+            ShellKind::Nushell,
+            ShellKind::Cmd,
+            ShellKind::Xonsh,
+            ShellKind::Elvish,
+        ] {
+            let mut env = HashMap::default();
+            let mut activation_script = Vec::new();
+            apply_remote_cli_info(
+                Ok(proto::RemoteCliInfo {
+                    socket_path: "/remote/cli.sock".to_string(),
+                    bin_path: "/remote/bin".to_string(),
+                }),
+                shell_kind,
+                &mut env,
+                &mut activation_script,
+            );
+            assert!(env.is_empty());
+            assert!(activation_script.is_empty());
+        }
+    }
+
+    #[test]
+    fn applies_remote_cli_info_after_environment_and_toolchain_activation() {
+        for shell_kind in [ShellKind::Posix, ShellKind::Fish] {
+            let mut env = HashMap::from_iter([
+                ("PATH".to_string(), "/toolchain/bin:/usr/bin".to_string()),
+                (
+                    "ZED_REMOTE_CLI_SOCKET".to_string(),
+                    "old socket".to_string(),
+                ),
+                ("ZED_REMOTE_CLI_BIN".to_string(), "old bin".to_string()),
+            ]);
+            let mut activation_script = vec!["source /toolchain/activate".to_string()];
+            let socket_path = "/remote/session's socket.sock";
+            let bin_path = "/remote/session's bin";
+            apply_remote_cli_info(
+                Ok(proto::RemoteCliInfo {
+                    socket_path: socket_path.to_string(),
+                    bin_path: bin_path.to_string(),
+                }),
+                shell_kind,
+                &mut env,
+                &mut activation_script,
+            );
+            assert_eq!(
+                env,
+                HashMap::from_iter([
+                    ("PATH".to_string(), "/toolchain/bin:/usr/bin".to_string()),
+                    ("ZED_REMOTE_CLI_SOCKET".to_string(), socket_path.to_string()),
+                    ("ZED_REMOTE_CLI_BIN".to_string(), bin_path.to_string()),
+                ]),
+            );
+            assert_eq!(
+                activation_script,
+                vec![
+                    "source /toolchain/activate".to_string(),
+                    remote_cli_path_command(shell_kind, bin_path)
+                        .expect("path command should be supported"),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_remote_cli_info_preserves_terminal_preparation() {
+        let mut responses = vec![Err(anyhow::anyhow!("request failed"))];
+        for (socket_path, bin_path) in [
+            ("", ""),
+            ("", "/remote/bin"),
+            ("/remote/cli.sock", ""),
+            ("relative.sock", "/remote/bin"),
+            ("/remote/\0cli.sock", "/remote/bin"),
+            ("/remote/cli.sock", "/remote/\nbin"),
+        ] {
+            responses.push(Ok(proto::RemoteCliInfo {
+                socket_path: socket_path.to_string(),
+                bin_path: bin_path.to_string(),
+            }));
+        }
+        for response in responses {
+            let original_env = HashMap::from_iter([("PATH".to_string(), "/usr/bin".to_string())]);
+            let original_activation_script = vec!["source /toolchain/activate".to_string()];
+            let mut env = original_env.clone();
+            let mut activation_script = original_activation_script.clone();
+            apply_remote_cli_info(response, ShellKind::Posix, &mut env, &mut activation_script);
+            assert_eq!(env, original_env);
+            assert_eq!(activation_script, original_activation_script);
+        }
+    }
 
     fn prepared_cmd_task(command_arg: &str) -> SpawnInTerminal {
         SpawnInTerminal {
