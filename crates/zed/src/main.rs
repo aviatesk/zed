@@ -336,6 +336,9 @@ fn main() {
             .unwrap_or("unknown"),
     );
 
+    #[cfg(unix)]
+    raise_open_file_limit();
+
     #[cfg(windows)]
     check_for_conpty_dll();
 
@@ -1847,6 +1850,57 @@ fn load_embedded_fonts(cx: &App) {
     cx.text_system()
         .add_fonts(embedded_fonts.into_inner())
         .unwrap();
+}
+
+/// Processes started by launchd on macOS inherit a soft limit of 256 open
+/// files, which a few remote workspaces and terminals exhaust. Linux desktop
+/// sessions commonly start at 1024. Raise the soft limit so that it doesn't
+/// constrain how many terminals, connections, and language servers can run.
+#[cfg(unix)]
+fn raise_open_file_limit() {
+    // macOS rejects `RLIMIT_NOFILE` soft limits above `OPEN_MAX` with `EINVAL`,
+    // and its hard limit is `RLIM_INFINITY` by default, so the hard limit can't
+    // be used as-is. The same ceiling is applied on every Unix platform so
+    // child processes don't inherit a needlessly large limit.
+    const OPEN_FILE_LIMIT: libc::rlim_t = 10240;
+
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid, writable `rlimit` for `getrlimit` to fill in.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        log::warn!(
+            "failed to read the open file limit: {}",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+
+    let desired = limit.rlim_max.min(OPEN_FILE_LIMIT);
+    if limit.rlim_cur >= desired {
+        return;
+    }
+
+    let new_limit = libc::rlimit {
+        rlim_cur: desired,
+        rlim_max: limit.rlim_max,
+    };
+    // SAFETY: `new_limit` is a valid `rlimit` for `setrlimit` to read from.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &new_limit) } != 0 {
+        log::warn!(
+            "failed to raise the open file limit from {} to {}: {}",
+            limit.rlim_cur,
+            desired,
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+    log::info!(
+        "raised the open file limit from {} to {}",
+        limit.rlim_cur,
+        desired
+    );
 }
 
 #[cfg(target_os = "linux")]
