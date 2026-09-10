@@ -46852,25 +46852,27 @@ async fn test_lsp_show_document_http_does_not_use_content_provider(cx: &mut Test
     let initial_editor = cx.editor.clone();
     let initial_item_count = cx.update_workspace(|workspace, _, cx| workspace.items(cx).count());
     for uri in ["http://zed.dev/docs", "https://zed.dev/docs"] {
-        let response = cx
-            .lsp
-            .request::<lsp::request::ShowDocument>(
-                lsp::ShowDocumentParams {
-                    uri: uri.parse().expect("valid HTTP URI"),
-                    external: None,
-                    take_focus: Some(true),
-                    selection: None,
-                },
-                DEFAULT_LSP_REQUEST_TIMEOUT,
-            )
-            .await
-            .into_response()
-            .expect("show document request should not error");
-        assert_eq!(response, lsp::ShowDocumentResult { success: false });
+        for external in [None, Some(false), Some(true)] {
+            let response = cx
+                .lsp
+                .request::<lsp::request::ShowDocument>(
+                    lsp::ShowDocumentParams {
+                        uri: uri.parse().expect("valid HTTP URI"),
+                        external,
+                        take_focus: Some(true),
+                        selection: None,
+                    },
+                    DEFAULT_LSP_REQUEST_TIMEOUT,
+                )
+                .await
+                .into_response()
+                .expect("show document request should not error");
+            assert_eq!(response, lsp::ShowDocumentResult { success: true });
+            assert_eq!(cx.opened_url().as_deref(), Some(uri));
+        }
     }
     cx.run_until_parked();
     assert!(requested_uris.lock().is_empty());
-    assert_eq!(cx.opened_url(), None);
     cx.update_workspace(|workspace, _, cx| {
         assert_eq!(workspace.active_item_as::<Editor>(cx), Some(initial_editor));
         assert_eq!(workspace.items(cx).count(), initial_item_count);

@@ -1306,10 +1306,12 @@ impl LocalLspStore {
                     let mut cx = cx.clone();
                     async move {
                         let (tx, rx) = async_channel::bounded(1);
+                        let external = params.external.unwrap_or(false)
+                            || matches!(params.uri.scheme(), "http" | "https");
                         let request = LanguageServerShowDocumentRequest {
                             server_id: Some(server_id),
                             uri: params.uri,
-                            external: params.external.unwrap_or(false),
+                            external,
                             take_focus: params.take_focus.unwrap_or(false),
                             selection: params.selection,
                             response_channel: tx,
