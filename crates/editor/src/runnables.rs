@@ -7,9 +7,13 @@ use gpui::{
     MouseButton, Task, Window,
 };
 use language::{Buffer, BufferRow, Runnable};
-use lsp::LanguageServerName;
+use lsp::{LanguageServerId, LanguageServerName};
 use multi_buffer::{Anchor, BufferOffset, MultiBufferRow, MultiBufferSnapshot, ToPoint as _};
-use project::{Location, Project, TaskSourceKind, project_settings::ProjectSettings};
+use project::{
+    Location, LocationLink, Project, TaskSourceKind,
+    lsp_store::lsp_ext_command::{CommandRunnable, CommandRunnableStatus},
+    project_settings::ProjectSettings,
+};
 use settings::Settings as _;
 use smallvec::SmallVec;
 use task::{ResolvedTask, RunnableTag, TaskContext, TaskTemplate, TaskVariables, VariableName};
@@ -129,9 +133,19 @@ impl From<workspace::tasks::ScheduledTaskResult> for RunnableTaskStatus {
     }
 }
 
+impl From<CommandRunnableStatus> for RunnableTaskStatus {
+    fn from(status: CommandRunnableStatus) -> Self {
+        match status {
+            CommandRunnableStatus::Passed => Self::Passed,
+            CommandRunnableStatus::Failed => Self::Failed,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RunnableTasks {
     pub templates: Vec<(TaskSourceKind, TaskTemplate)>,
+    pub lsp_commands: Vec<(LanguageServerId, CommandRunnable)>,
     pub offset: multi_buffer::Anchor,
     // We need the column at which the task context evaluation should take place (when we're spawning it via gutter).
     pub column: u32,
@@ -154,9 +168,36 @@ impl RunnableTasks {
     }
 }
 
+fn lsp_runnable_tasks_at<'a>(
+    tasks_by_rows: &'a mut HashMap<(BufferId, BufferRow), RunnableTasks>,
+    multi_buffer_snapshot: &MultiBufferSnapshot,
+    location: &LocationLink,
+    cx: &App,
+) -> Option<&'a mut RunnableTasks> {
+    let buffer_snapshot = location.target.buffer.read(cx).snapshot();
+    let offset = multi_buffer_snapshot.anchor_in_excerpt(location.target.range.start)?;
+    let task_buffer_range = location.target.range.to_point(&buffer_snapshot);
+    let context_buffer_range = task_buffer_range.to_offset(&buffer_snapshot);
+    let context_range =
+        BufferOffset(context_buffer_range.start)..BufferOffset(context_buffer_range.end);
+    Some(
+        tasks_by_rows
+            .entry((buffer_snapshot.remote_id(), task_buffer_range.start.row))
+            .or_insert_with(|| RunnableTasks {
+                templates: Vec::new(),
+                lsp_commands: Vec::new(),
+                offset,
+                column: task_buffer_range.start.column,
+                extra_variables: HashMap::default(),
+                context_range,
+            }),
+    )
+}
+
 #[derive(Clone)]
 pub struct ResolvedTasks {
     pub templates: SmallVec<[(TaskSourceKind, ResolvedTask); 1]>,
+    pub lsp_commands: Vec<(LanguageServerId, CommandRunnable)>,
     pub position: Anchor,
 }
 
@@ -204,15 +245,15 @@ impl Editor {
             if hide_runnables {
                 return;
             }
-            let lsp_tasks = if lsp_task_sources.is_empty() {
+            let lsp_runnables = if lsp_task_sources.is_empty() {
                 Vec::new()
             } else {
-                let Ok(lsp_tasks) = cx
-                    .update(|_, cx| crate::lsp_tasks(project.clone(), &lsp_task_sources, None, cx))
-                else {
+                let Ok(lsp_runnables) = cx.update(|_, cx| {
+                    crate::lsp_ext::lsp_runnables(project.clone(), &lsp_task_sources, None, cx)
+                }) else {
                     return;
                 };
-                lsp_tasks.await
+                lsp_runnables.await
             };
             let new_rows = {
                 let Some((multi_buffer_snapshot, multi_buffer_query_range)) = editor
@@ -253,40 +294,41 @@ impl Editor {
                 return;
             };
             let Ok(mut lsp_tasks_by_rows) = cx.update(|_, cx| {
-                lsp_tasks
-                    .into_iter()
-                    .flat_map(|(kind, tasks)| {
-                        tasks.into_iter().filter_map(move |(location, task)| {
-                            Some((kind.clone(), location?, task))
-                        })
-                    })
-                    .fold(HashMap::default(), |mut acc, (kind, location, task)| {
-                        let buffer = location.target.buffer;
-                        let buffer_snapshot = buffer.read(cx).snapshot();
-                        let offset =
-                            multi_buffer_snapshot.anchor_in_excerpt(location.target.range.start);
-                        if let Some(offset) = offset {
-                            let task_buffer_range =
-                                location.target.range.to_point(&buffer_snapshot);
-                            let context_buffer_range =
-                                task_buffer_range.to_offset(&buffer_snapshot);
-                            let context_range = BufferOffset(context_buffer_range.start)
-                                ..BufferOffset(context_buffer_range.end);
-
-                            acc.entry((buffer_snapshot.remote_id(), task_buffer_range.start.row))
-                                .or_insert_with(|| RunnableTasks {
-                                    templates: Vec::new(),
-                                    offset,
-                                    column: task_buffer_range.start.column,
-                                    extra_variables: HashMap::default(),
-                                    context_range,
-                                })
+                let mut lsp_tasks_by_rows = HashMap::default();
+                for (kind, runnables) in lsp_runnables {
+                    for (location, task) in runnables.tasks {
+                        let Some(location) = location else {
+                            continue;
+                        };
+                        if let Some(tasks) = lsp_runnable_tasks_at(
+                            &mut lsp_tasks_by_rows,
+                            &multi_buffer_snapshot,
+                            &location,
+                            cx,
+                        ) {
+                            tasks
                                 .templates
-                                .push((kind, task.original_task().clone()));
+                                .push((kind.clone(), task.original_task().clone()));
                         }
-
-                        acc
-                    })
+                    }
+                    let TaskSourceKind::Lsp { server, .. } = kind else {
+                        continue;
+                    };
+                    for (location, command) in runnables.commands {
+                        let Some(location) = location else {
+                            continue;
+                        };
+                        if let Some(tasks) = lsp_runnable_tasks_at(
+                            &mut lsp_tasks_by_rows,
+                            &multi_buffer_snapshot,
+                            &location,
+                            cx,
+                        ) {
+                            tasks.lsp_commands.push((server, command));
+                        }
+                    }
+                }
+                lsp_tasks_by_rows
             }) else {
                 return;
             };
@@ -318,6 +360,7 @@ impl Editor {
 
                         if let Some(lsp_tasks) = lsp_tasks_by_rows.remove(&(buffer_id, row)) {
                             new_tasks.templates.extend(lsp_tasks.templates);
+                            new_tasks.lsp_commands.extend(lsp_tasks.lsp_commands);
                         }
                         editor.insert_runnables(
                             buffer_id,
@@ -365,6 +408,12 @@ impl Editor {
         };
 
         let buffer_id = buffer.read(cx).remote_id();
+        if tasks.templates.is_empty() {
+            if let Some((server_id, runnable)) = tasks.lsp_commands.first().cloned() {
+                self.run_command_runnable(server_id, runnable, Some((buffer_id, buffer_row)), cx);
+            }
+            return;
+        }
         let editor = cx.weak_entity();
         let reveal_strategy = action.reveal;
         let task_context = Self::build_tasks_context(&project, &buffer, buffer_row, &tasks, cx);
@@ -424,6 +473,57 @@ impl Editor {
         }
         self.runnables.invalidate_buffer_data.clear();
         self.runnables.runnables_update_task = Task::ready(());
+    }
+
+    /// Sends `runnable`'s command to the server that provided it, and shows the run's
+    /// outcome for `task_key`'s row once the server responds.
+    pub(crate) fn run_command_runnable(
+        &mut self,
+        server_id: LanguageServerId,
+        runnable: CommandRunnable,
+        task_key: Option<(BufferId, BufferRow)>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self.project.clone() else {
+            return;
+        };
+        let lsp::Command {
+            command, arguments, ..
+        } = runnable.command;
+        let lsp_store = project.read(cx).lsp_store();
+        let request = lsp_store.update(cx, |lsp_store, cx| {
+            lsp_store.execute_long_running_lsp_command(
+                server_id,
+                command,
+                arguments.unwrap_or_default(),
+                cx,
+            )
+        });
+        if let Some((buffer_id, buffer_row)) = task_key {
+            self.set_runnable_task_status(buffer_id, buffer_row, RunnableTaskStatus::Running, cx);
+        }
+        cx.spawn(async move |editor, cx| {
+            let result = request.await;
+            if let Some((buffer_id, buffer_row)) = task_key {
+                editor.update(cx, |editor, cx| {
+                    let status = match &result {
+                        Ok(response) => {
+                            CommandRunnableStatus::from_command_result(response.as_ref())
+                                .map(RunnableTaskStatus::from)
+                        }
+                        Err(_) => Some(RunnableTaskStatus::Failed),
+                    };
+                    match status {
+                        Some(status) => {
+                            editor.set_runnable_task_status(buffer_id, buffer_row, status, cx)
+                        }
+                        None => editor.clear_runnable_task_status(buffer_id, buffer_row, cx),
+                    }
+                })?;
+            }
+            result.map(drop)
+        })
+        .detach_and_log_err(cx);
     }
 
     pub(crate) fn runnable_task_status(
@@ -574,11 +674,7 @@ impl Editor {
         buffers
             .into_iter()
             .filter_map(|buffer| {
-                let lsp_tasks_source = buffer
-                    .read(cx)
-                    .language()?
-                    .context_provider()?
-                    .lsp_task_source()?;
+                let lsp_tasks_source = buffer.read(cx).language()?.lsp_task_source()?;
                 if lsp_settings
                     .get(&lsp_tasks_source)
                     .is_none_or(|s| s.enable_lsp_tasks)
@@ -757,6 +853,7 @@ impl Editor {
                     (runnable.buffer_id, row),
                     RunnableTasks {
                         templates: tasks,
+                        lsp_commands: Vec::new(),
                         offset: run_range.start,
                         context_range,
                         column: point.column,
@@ -858,7 +955,7 @@ mod tests {
     use futures::StreamExt as _;
     use gpui::{AppContext as _, Entity, Task, TestAppContext};
     use indoc::indoc;
-    use language::{ContextProvider, FakeLspAdapter};
+    use language::{ContextProvider, FakeLspAdapter, Language, LanguageConfig, LanguageMatcher};
     use languages::rust_lang;
     use lsp::LanguageServerName;
     use multi_buffer::{MultiBuffer, PathKey};
@@ -874,6 +971,7 @@ mod tests {
     use util::path;
     use util::rel_path::rel_path;
 
+    use super::RunnableTaskStatus;
     use crate::{
         Editor, UPDATE_DEBOUNCE, editor_tests::init_test, scroll::scroll_amount::ScrollAmount,
         test::build_editor_with_project,
@@ -946,6 +1044,21 @@ mod tests {
         )
     }
 
+    fn julia_lang_with_lsp_task_source() -> Arc<language::Language> {
+        Arc::new(Language::new(
+            LanguageConfig {
+                name: "Julia".into(),
+                matcher: Arc::new(LanguageMatcher {
+                    path_suffixes: vec!["jl".to_string()],
+                    ..LanguageMatcher::default()
+                }),
+                lsp_task_source: Some(FAKE_LSP_NAME.into()),
+                ..LanguageConfig::default()
+            },
+            None,
+        ))
+    }
+
     fn collect_runnable_labels(
         editor: &Editor,
     ) -> Vec<(text::BufferId, language::BufferRow, Vec<String>)> {
@@ -959,6 +1072,12 @@ mod tests {
                         .templates
                         .iter()
                         .map(|(_, template)| template.label.clone())
+                        .chain(
+                            runnable_tasks
+                                .lsp_commands
+                                .iter()
+                                .map(|(_, runnable)| runnable.label.clone()),
+                        )
                         .collect();
                     labels.sort();
                     (*buffer_id, *row, labels)
@@ -1322,6 +1441,215 @@ mod tests {
         assert!(
             !labels.is_empty(),
             "Runnables should appear after the buffer is saved to disk"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_lsp_runnables_from_language_config(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                "test.jl": indoc! {"
+                    @testset \"one\" begin
+                        @test true
+                    end
+                "},
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+        language_registry.add(julia_lang_with_lsp_task_source());
+
+        let mut fake_servers = language_registry.register_fake_lsp(
+            "Julia",
+            FakeLspAdapter {
+                name: FAKE_LSP_NAME,
+                ..FakeLspAdapter::default()
+            },
+        );
+
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(path!("/project/test.jl"), cx)
+            })
+            .await
+            .unwrap();
+        let buffer_id = buffer.read_with(cx, |buffer, _| buffer.remote_id());
+
+        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer.clone(), cx));
+        let editor = cx.add_window(|window, cx| {
+            build_editor_with_project(project.clone(), multi_buffer, window, cx)
+        });
+
+        let fake_server = fake_servers.next().await.expect("fake LSP server");
+
+        use project::lsp_store::lsp_ext_command::Runnables;
+        fake_server.set_request_handler::<Runnables, _, _>(move |params, _| async move {
+            let range = lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(2, 3));
+            Ok(vec![Runnable {
+                label: "Run testset one".into(),
+                location: Some(lsp::LocationLink {
+                    origin_selection_range: None,
+                    target_uri: params.text_document.uri,
+                    target_range: range,
+                    target_selection_range: range,
+                }),
+                args: RunnableArgs::Shell(ShellRunnableArgs {
+                    environment: Default::default(),
+                    cwd: path!("/project").into(),
+                    program: "julia".into(),
+                    args: vec!["test.jl".into()],
+                }),
+            }])
+        });
+
+        editor
+            .update(cx, |editor, window, cx| {
+                editor.refresh_runnables(None, window, cx);
+            })
+            .expect("editor update");
+        cx.executor().advance_clock(UPDATE_DEBOUNCE);
+        cx.executor().run_until_parked();
+
+        let labels = editor
+            .update(cx, |editor, _, _| collect_runnable_labels(editor))
+            .expect("editor update");
+        assert_eq!(
+            labels,
+            vec![(buffer_id, 0, vec!["Run testset one".to_string()])],
+            "LSP runnables should be requested from the server named in the language config"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_lsp_command_runnable_reports_status(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+
+        const RUN_TESTSET_COMMAND: &str = "fake.runTestset";
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                "test.jl": indoc! {"
+                    @testset \"one\" begin
+                        @test false
+                    end
+                "},
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+        language_registry.add(julia_lang_with_lsp_task_source());
+
+        let mut fake_servers = language_registry.register_fake_lsp(
+            "Julia",
+            FakeLspAdapter {
+                name: FAKE_LSP_NAME,
+                capabilities: lsp::ServerCapabilities {
+                    execute_command_provider: Some(lsp::ExecuteCommandOptions {
+                        commands: vec![RUN_TESTSET_COMMAND.to_string()],
+                        ..lsp::ExecuteCommandOptions::default()
+                    }),
+                    ..lsp::ServerCapabilities::default()
+                },
+                ..FakeLspAdapter::default()
+            },
+        );
+
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(path!("/project/test.jl"), cx)
+            })
+            .await
+            .unwrap();
+        let buffer_id = buffer.read_with(cx, |buffer, _| buffer.remote_id());
+
+        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer.clone(), cx));
+        let editor = cx.add_window(|window, cx| {
+            build_editor_with_project(project.clone(), multi_buffer, window, cx)
+        });
+
+        let fake_server = fake_servers.next().await.expect("fake LSP server");
+
+        use project::lsp_store::lsp_ext_command::Runnables;
+        fake_server.set_request_handler::<Runnables, _, _>(move |params, _| async move {
+            let range = lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(2, 3));
+            Ok(vec![Runnable {
+                label: "Run testset one".into(),
+                location: Some(lsp::LocationLink {
+                    origin_selection_range: None,
+                    target_uri: params.text_document.uri,
+                    target_range: range,
+                    target_selection_range: range,
+                }),
+                args: RunnableArgs::Command(lsp::Command {
+                    title: "Run testset one".into(),
+                    command: RUN_TESTSET_COMMAND.into(),
+                    arguments: Some(vec![json!("one")]),
+                }),
+            }])
+        });
+        fake_server.set_request_handler::<lsp::request::ExecuteCommand, _, _>(
+            move |params, _| async move {
+                let status = if params.command == RUN_TESTSET_COMMAND
+                    && params.arguments == vec![json!("one")]
+                {
+                    "failed"
+                } else {
+                    "passed"
+                };
+                Ok(Some(json!({ "status": status })))
+            },
+        );
+
+        editor
+            .update(cx, |editor, window, cx| {
+                editor.refresh_runnables(None, window, cx);
+            })
+            .expect("editor update");
+        cx.executor().advance_clock(UPDATE_DEBOUNCE);
+        cx.executor().run_until_parked();
+
+        let labels = editor
+            .update(cx, |editor, _, _| collect_runnable_labels(editor))
+            .expect("editor update");
+        assert_eq!(
+            labels,
+            vec![(buffer_id, 0, vec!["Run testset one".to_string()])],
+            "Command runnables should be shown in the gutter"
+        );
+
+        let (server_id, runnable) = editor
+            .update(cx, |editor, _, _| {
+                editor
+                    .runnables
+                    .runnables((buffer_id, 0))
+                    .and_then(|tasks| tasks.lsp_commands.first().cloned())
+            })
+            .expect("editor update")
+            .expect("command runnable on the first row");
+        editor
+            .update(cx, |editor, _, cx| {
+                editor.run_command_runnable(server_id, runnable, Some((buffer_id, 0)), cx);
+            })
+            .expect("editor update");
+        cx.executor().run_until_parked();
+
+        let status = editor
+            .update(cx, |editor, _, _| editor.runnable_task_status(buffer_id, 0))
+            .expect("editor update");
+        assert_eq!(
+            status,
+            Some(RunnableTaskStatus::Failed),
+            "The status in the executeCommand response should be shown in the gutter"
         );
     }
 

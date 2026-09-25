@@ -989,6 +989,7 @@ message ExecuteLspCommand {
   uint64 language_server_id = 2;
   string command = 3;
   repeated string arguments = 4;
+  bool no_timeout = 5;
 }
 
 message ExecuteLspCommandResponse {
@@ -1133,10 +1134,16 @@ message LspExtRunnables {
 
 message LspExtRunnablesResponse {
   repeated LspRunnable runnables = 1;
+  repeated LspCommandRunnable commands = 2;
 }
 
 message LspRunnable {
   bytes task_template = 1;
+  optional LocationLink location = 2;
+}
+
+message LspCommandRunnable {
+  bytes runnable = 1;
   optional LocationLink location = 2;
 }
 

@@ -145,6 +145,10 @@ pub struct LanguageConfig {
     /// A list of preferred debuggers for this language.
     #[serde(default)]
     pub debuggers: IndexSet<SharedString>,
+    /// The name of a language server that provides runnables for this language
+    /// via the `experimental/runnables` LSP extension request.
+    #[serde(default)]
+    pub lsp_task_source: Option<SharedString>,
 }
 
 impl LanguageConfig {
@@ -197,6 +201,7 @@ impl Default for LanguageConfig {
             completion_query_characters: Default::default(),
             linked_edit_characters: Default::default(),
             debuggers: Default::default(),
+            lsp_task_source: None,
         }
     }
 }

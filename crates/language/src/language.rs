@@ -1123,6 +1123,18 @@ impl Language {
         self.context_provider.clone()
     }
 
+    pub fn lsp_task_source(&self) -> Option<LanguageServerName> {
+        self.context_provider
+            .as_ref()
+            .and_then(|context_provider| context_provider.lsp_task_source())
+            .or_else(|| {
+                self.config
+                    .lsp_task_source
+                    .clone()
+                    .map(LanguageServerName)
+            })
+    }
+
     pub fn toolchain_lister(&self) -> Option<Arc<dyn ToolchainLister>> {
         self.toolchain.clone()
     }
