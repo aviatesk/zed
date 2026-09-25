@@ -8,11 +8,12 @@ use gpui::{
 use itertools::Itertools;
 use language::CodeLabel;
 use language::{Buffer, LanguageName, LanguageRegistry};
-use lsp::{CompletionItemKind, CompletionItemTag};
+use lsp::{CompletionItemKind, CompletionItemTag, LanguageServerId};
 use markdown::{CopyButtonVisibility, Markdown, MarkdownElement};
 use multi_buffer::Anchor;
 use ordered_float::OrderedFloat;
 use project::lsp_store::CompletionDocumentation;
+use project::lsp_store::lsp_ext_command::CommandRunnable;
 use project::{CodeAction, Completion, CompletionGroup, TaskSourceKind};
 use project::{CompletionDisplayOptions, CompletionSource};
 use task::DebugScenario;
@@ -1876,7 +1877,10 @@ impl CodeActionContents {
     }
 
     fn len(&self) -> usize {
-        let tasks_len = self.tasks.as_ref().map_or(0, |tasks| tasks.templates.len());
+        let tasks_len = self
+            .tasks
+            .as_ref()
+            .map_or(0, |tasks| tasks.templates.len() + tasks.lsp_commands.len());
         let code_actions_len = self.actions.as_ref().map_or(0, |actions| actions.len());
         tasks_len + code_actions_len + self.debug_scenarios.len()
     }
@@ -1893,6 +1897,12 @@ impl CodeActionContents {
                     .templates
                     .iter()
                     .map(|(kind, task)| CodeActionsItem::Task(kind.clone(), task.clone()))
+                    .chain(tasks.lsp_commands.iter().map(|(server_id, runnable)| {
+                        CodeActionsItem::LspCommand {
+                            server_id: *server_id,
+                            runnable: runnable.clone(),
+                        }
+                    }))
             })
             .chain(self.actions.iter().flat_map(|actions| {
                 actions.iter().map(|available| CodeActionsItem::CodeAction {
@@ -1914,6 +1924,14 @@ impl CodeActionContents {
                 return Some(CodeActionsItem::Task(kind.clone(), task.clone()));
             } else {
                 index -= tasks.templates.len();
+            }
+            if let Some((server_id, runnable)) = tasks.lsp_commands.get(index) {
+                return Some(CodeActionsItem::LspCommand {
+                    server_id: *server_id,
+                    runnable: runnable.clone(),
+                });
+            } else {
+                index -= tasks.lsp_commands.len();
             }
         }
         if let Some(actions) = &self.actions {
@@ -1937,6 +1955,10 @@ impl CodeActionContents {
 #[derive(Clone)]
 pub enum CodeActionsItem {
     Task(TaskSourceKind, ResolvedTask),
+    LspCommand {
+        server_id: LanguageServerId,
+        runnable: CommandRunnable,
+    },
     CodeAction {
         action: CodeAction,
         provider: Rc<dyn CodeActionProvider>,
@@ -1949,6 +1971,7 @@ impl CodeActionsItem {
         match self {
             Self::CodeAction { action, .. } => action.lsp_action.title().to_owned(),
             Self::Task(_, task) => task.resolved_label.clone(),
+            Self::LspCommand { runnable, .. } => runnable.label.clone(),
             Self::DebugScenario(scenario) => scenario.label.to_string(),
         }
     }
@@ -1957,6 +1980,7 @@ impl CodeActionsItem {
         match self {
             Self::CodeAction { action, .. } => action.lsp_action.title().replace("\n", ""),
             Self::Task(_, task) => task.resolved_label.replace("\n", ""),
+            Self::LspCommand { runnable, .. } => runnable.label.replace("\n", ""),
             Self::DebugScenario(scenario) => format!("debug: {}", scenario.label),
         }
     }
@@ -2109,6 +2133,7 @@ impl CodeActionsMenu {
                 .enumerate()
                 .max_by_key(|(_, action)| match action {
                     CodeActionsItem::Task(_, task) => task.resolved_label.chars().count(),
+                    CodeActionsItem::LspCommand { runnable, .. } => runnable.label.chars().count(),
                     CodeActionsItem::CodeAction { action, .. } => {
                         action.lsp_action.title().chars().count()
                     }
