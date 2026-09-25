@@ -4,7 +4,7 @@ use clock::Global;
 use collections::{HashMap, HashSet};
 use gpui::{
     App, AppContext as _, AsyncWindowContext, ClickEvent, Context, Entity, Focusable as _,
-    MouseButton, Task, Window,
+    MouseButton, Task, TaskExt, Window,
 };
 use language::{Buffer, BufferRow, Runnable};
 use lsp::{LanguageServerId, LanguageServerName};
