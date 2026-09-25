@@ -87,6 +87,7 @@ impl Editor {
                                 .zip(task_context.clone())
                                 .map(|(tasks, task_context)| ResolvedTasks {
                                     templates: tasks.resolve(&task_context).collect(),
+                                    lsp_commands: tasks.lsp_commands.clone(),
                                     position: snapshot.buffer_snapshot().anchor_before(Point::new(
                                         multibuffer_point.row,
                                         tasks.column,
@@ -133,7 +134,7 @@ impl Editor {
                 let spawn_straight_away = quick_launch
                     && resolved_tasks
                         .as_ref()
-                        .is_some_and(|tasks| tasks.templates.len() == 1)
+                        .is_some_and(|tasks| tasks.templates.len() + tasks.lsp_commands.len() == 1)
                     && code_actions
                         .as_ref()
                         .is_none_or(|actions| actions.is_empty())
@@ -255,6 +256,13 @@ impl Editor {
 
                     Some(Task::ready(Ok(())))
                 })
+            }
+            CodeActionsItem::LspCommand {
+                server_id,
+                runnable,
+            } => {
+                self.run_command_runnable(server_id, runnable, runnable_task_key, cx);
+                Some(Task::ready(Ok(())))
             }
             CodeActionsItem::CodeAction { action, provider } => {
                 if code_lens::try_handle_client_command(&action, self, &workspace, window, cx) {

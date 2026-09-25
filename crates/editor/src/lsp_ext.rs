@@ -14,7 +14,7 @@ use project::LanguageServerToQuery;
 use project::LocationLink;
 use project::Project;
 use project::TaskSourceKind;
-use project::lsp_store::lsp_ext_command::GetLspRunnables;
+use project::lsp_store::lsp_ext_command::{CommandRunnable, GetLspRunnables};
 use task::ResolvedTask;
 use task::TaskContext;
 use text::BufferId;
@@ -96,12 +96,35 @@ async fn lsp_task_context(
     })
 }
 
+#[derive(Default)]
+pub(crate) struct LspRunnablesForSource {
+    pub tasks: Vec<(Option<LocationLink>, ResolvedTask)>,
+    pub commands: Vec<(Option<LocationLink>, CommandRunnable)>,
+}
+
 pub fn lsp_tasks(
     project: Entity<Project>,
     task_sources: &HashMap<LanguageServerName, Vec<BufferId>>,
     for_position: Option<text::Anchor>,
     cx: &mut App,
 ) -> Task<Vec<(TaskSourceKind, Vec<(Option<LocationLink>, ResolvedTask)>)>> {
+    let lsp_runnables = lsp_runnables(project, task_sources, for_position, cx);
+    cx.spawn(async move |_| {
+        lsp_runnables
+            .await
+            .into_iter()
+            .filter(|(_, runnables)| !runnables.tasks.is_empty())
+            .map(|(source_kind, runnables)| (source_kind, runnables.tasks))
+            .collect()
+    })
+}
+
+pub(crate) fn lsp_runnables(
+    project: Entity<Project>,
+    task_sources: &HashMap<LanguageServerName, Vec<BufferId>>,
+    for_position: Option<text::Anchor>,
+    cx: &mut App,
+) -> Task<Vec<(TaskSourceKind, LspRunnablesForSource)>> {
     let lsp_task_sources = task_sources
         .iter()
         .filter_map(|(name, buffer_ids)| {
@@ -125,9 +148,10 @@ pub fn lsp_tasks(
 
     cx.spawn(async move |cx| {
         cx.spawn(async move |cx| {
-            let mut lsp_tasks = HashMap::default();
+            let mut lsp_runnables = HashMap::<TaskSourceKind, LspRunnablesForSource>::default();
             for (server_id, buffers) in lsp_task_sources {
                 let mut new_lsp_tasks = Vec::new();
+                let mut new_lsp_commands = Vec::new();
                 for buffer in buffers {
                     let source_kind = match buffer.update(cx, |buffer, _| {
                         buffer.language().map(|language| language.name())
@@ -164,16 +188,16 @@ pub fn lsp_tasks(
                                 Some((location, resolved_task))
                             },
                         ));
+                        new_lsp_commands.extend(new_runnables.commands);
                     }
-                    if !new_lsp_tasks.is_empty() {
-                        lsp_tasks
-                            .entry(source_kind)
-                            .or_insert_with(Vec::new)
-                            .append(&mut new_lsp_tasks);
+                    if !new_lsp_tasks.is_empty() || !new_lsp_commands.is_empty() {
+                        let runnables = lsp_runnables.entry(source_kind).or_default();
+                        runnables.tasks.append(&mut new_lsp_tasks);
+                        runnables.commands.append(&mut new_lsp_commands);
                     }
                 }
             }
-            lsp_tasks.into_iter().collect()
+            lsp_runnables.into_iter().collect()
         })
         .with_timeout(Duration::from_millis(200), &cx.background_executor())
         .unwrap_or_else(|_| {

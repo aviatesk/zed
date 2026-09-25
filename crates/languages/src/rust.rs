@@ -735,7 +735,7 @@ impl LspAdapter for RustLspAdapter {
                 let runnable =
                     serde_json::from_value::<lsp_ext_command::Runnable>(first_arg.clone()).ok()?;
                 let template =
-                    lsp_ext_command::runnable_to_task_template(runnable.label, runnable.args);
+                    lsp_ext_command::runnable_to_task_template(runnable.label, runnable.args)?;
                 Some(ClientCommand::ScheduleTask(template))
             }
             _ => None,
