@@ -36168,6 +36168,7 @@ async fn test_find_enclosing_node_with_task(cx: &mut TestAppContext) {
             buffer.read(cx).version(),
             RunnableTasks {
                 templates: Vec::new(),
+                lsp_commands: Vec::new(),
                 offset: snapshot.anchor_before(MultiBufferOffset(43)),
                 column: 0,
                 extra_variables: HashMap::default(),
@@ -36180,6 +36181,7 @@ async fn test_find_enclosing_node_with_task(cx: &mut TestAppContext) {
             buffer.read(cx).version(),
             RunnableTasks {
                 templates: Vec::new(),
+                lsp_commands: Vec::new(),
                 offset: snapshot.anchor_before(MultiBufferOffset(86)),
                 column: 0,
                 extra_variables: HashMap::default(),
@@ -36269,6 +36271,7 @@ async fn test_toggle_code_actions_build_tasks_context_error_notifies(cx: &mut Te
             buffer.read(cx).version(),
             RunnableTasks {
                 templates: Vec::new(),
+                lsp_commands: Vec::new(),
                 offset: snapshot.anchor_before(MultiBufferOffset(0)),
                 column: 0,
                 extra_variables: HashMap::default(),
