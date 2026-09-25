@@ -340,6 +340,8 @@ To tag a task, add the runnable tag name to the `tags` field on the task templat
 
 In doing so, you can change which task is shown in the runnables indicator.
 
+Some languages also get runnables from their language server, such as Rust through rust-analyzer. These can be turned off with the `enable_lsp_tasks` setting of that language server, or preferred over the language's own runnables with `tasks.prefer_lsp`. Language extensions can opt into this as described in [Runnables from language servers](./extensions/languages.md#runnables-from-language-servers).
+
 ## Keybindings to run tasks bound to runnables
 
 When you have a task definition that is bound to the runnable, you can quickly run it using [Code Actions](https://zed.dev/docs/configuring-languages?#code-actions) that you can trigger either via {#action editor::ToggleCodeActions} command or by the `cmd-.`/`ctrl-.` shortcut. Your task will be the first in the dropdown. The task will run immediately if there are no additional Code Actions for this line.
