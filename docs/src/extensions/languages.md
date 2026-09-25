@@ -33,6 +33,7 @@ line_comments = ["# "]
 - `hard_tabs` whether to indent with tabs (`true`) or spaces (`false`, the default).
 - `first_line_pattern` is a regular expression that can be used alongside `path_suffixes` (above) or `file_types` in settings to match files that should use this language. For example, Zed uses this to identify Shell Scripts by matching [shebang lines](https://github.com/zed-industries/zed/blob/main/crates/languages/src/bash/config.toml) in the first line of a script.
 - `debuggers` is an array of strings that are used to identify debuggers in the language. When launching a debugger's `New Process Modal`, Zed will order available debuggers by the order of entries in this array.
+- `lsp_task_source` is the name of a language server that provides runnables for this language. See [Runnables from language servers](#runnables-from-language-servers).
 
 <!--
 TBD: Document `language_name/config.toml` keys
@@ -468,6 +469,83 @@ The `@run` capture specifies where the run button should appear in the editor. O
 <!--
 TBD: `#set! tag`
 -->
+
+### Runnables from language servers
+
+Runnables can also come from a language server. To enable this, set `lsp_task_source` in the language's `config.toml` to the name of a language server that your extension provides, as listed under `language_servers` in `extension.toml`:
+
+```toml
+lsp_task_source = "my-language-server"
+```
+
+Zed then sends that server rust-analyzer's [`experimental/runnables`](https://rust-analyzer.github.io/book/contributing/lsp-extensions.html#runnables) request. The method name is fixed, and the server must implement it with the same parameters and response. Zed sends the request without `position` to fill the gutter, and with the cursor position when the task modal is opened.
+
+The response is a list of runnables. Use the `shell` kind, whose `args` become the task's command, arguments, working directory, and environment. The `cargo` kind is specific to rust-analyzer.
+
+```json
+[
+  {
+    "label": "Run test one",
+    "location": {
+      "targetUri": "file:///project/test/runtests.jl",
+      "targetRange": {
+        "start": { "line": 0, "character": 0 },
+        "end": { "line": 2, "character": 3 }
+      },
+      "targetSelectionRange": {
+        "start": { "line": 0, "character": 0 },
+        "end": { "line": 0, "character": 8 }
+      }
+    },
+    "kind": "shell",
+    "args": {
+      "cwd": "/project",
+      "program": "julia",
+      "args": ["--project", "test/runtests.jl"],
+      "environment": {}
+    }
+  }
+]
+```
+
+A runnable can instead use the `command` kind, which is specific to Zed. Its `args` is an LSP [`Command`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#command), and rather than spawning a task, Zed sends it back to the server with `workspace/executeCommand` so that the server runs it itself, for example to report progress and publish diagnostics for the results:
+
+```json
+{
+  "label": "Run test one",
+  "location": {
+    "targetUri": "file:///project/test/runtests.jl",
+    "targetRange": {
+      "start": { "line": 0, "character": 0 },
+      "end": { "line": 2, "character": 3 }
+    },
+    "targetSelectionRange": {
+      "start": { "line": 0, "character": 0 },
+      "end": { "line": 0, "character": 8 }
+    }
+  },
+  "kind": "command",
+  "args": {
+    "title": "Run test one",
+    "command": "my-language-server.runTest",
+    "arguments": ["file:///project/test/runtests.jl", 1]
+  }
+}
+```
+
+The command must be listed in the server's `executeCommandProvider` capability. Zed waits for the response without the usual request timeout, and shows the outcome on the run button if the server responds with `{ "status": "passed" }` or `{ "status": "failed" }` once the run finishes. Any other response resets the run button, and an error response is shown as a failure. Command runnables are not listed in the task modal, so they need a `location`.
+
+The run button is shown on the first line of `location.targetSelectionRange`. Runnables without a `location` only appear in the task modal. They are shown alongside those from `runnables.scm`, unless the user enables `tasks.prefer_lsp` for the language. Users can turn off the request entirely with the `enable_lsp_tasks` setting of the language server:
+
+```json [settings]
+{
+  "lsp": {
+    "my-language-server": {
+      "enable_lsp_tasks": false
+    }
+  }
+}
+```
 
 ## Language Servers
 

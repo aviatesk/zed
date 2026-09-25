@@ -7029,6 +7029,30 @@ impl LspStore {
         arguments: Vec<serde_json::Value>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Option<serde_json::Value>>> {
+        self.execute_lsp_command_inner(server_id, command, arguments, false, cx)
+    }
+
+    /// Like [`Self::execute_lsp_command`], but waits for the response without the LSP
+    /// request timeout, for commands that respond only after long-running work
+    /// finishes, such as [`lsp_ext_command::CommandRunnable`]s.
+    pub fn execute_long_running_lsp_command(
+        &self,
+        server_id: LanguageServerId,
+        command: String,
+        arguments: Vec<serde_json::Value>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Option<serde_json::Value>>> {
+        self.execute_lsp_command_inner(server_id, command, arguments, true, cx)
+    }
+
+    fn execute_lsp_command_inner(
+        &self,
+        server_id: LanguageServerId,
+        command: String,
+        arguments: Vec<serde_json::Value>,
+        no_timeout: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Option<serde_json::Value>>> {
         if let Some((upstream_client, project_id)) = self.upstream_client() {
             let request = upstream_client.request(proto::ExecuteLspCommand {
                 project_id,
@@ -7038,6 +7062,7 @@ impl LspStore {
                     .iter()
                     .map(|argument| argument.to_string())
                     .collect(),
+                no_timeout,
             });
             cx.background_spawn(async move {
                 let response = request.await?;
@@ -7062,9 +7087,13 @@ impl LspStore {
                     "command {command} is not advertised by the language server"
                 )));
             }
-            let request_timeout = ProjectSettings::get_global(cx)
-                .global_lsp_settings
-                .get_request_timeout();
+            let request_timeout = if no_timeout {
+                Duration::MAX
+            } else {
+                ProjectSettings::get_global(cx)
+                    .global_lsp_settings
+                    .get_request_timeout()
+            };
             cx.background_spawn(async move {
                 server
                     .request::<lsp::request::ExecuteCommand>(
@@ -12103,7 +12132,13 @@ impl LspStore {
             .context("deserializing executeCommand arguments")?;
         let result = lsp_store
             .update(&mut cx, |lsp_store, cx| {
-                lsp_store.execute_lsp_command(server_id, envelope.payload.command, arguments, cx)
+                lsp_store.execute_lsp_command_inner(
+                    server_id,
+                    envelope.payload.command,
+                    arguments,
+                    envelope.payload.no_timeout,
+                    cx,
+                )
             })
             .await?;
         Ok(proto::ExecuteLspCommandResponse {
