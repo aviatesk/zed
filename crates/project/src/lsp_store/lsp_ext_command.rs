@@ -591,6 +591,10 @@ pub struct Runnable {
 pub enum RunnableArgs {
     Cargo(CargoRunnableArgs),
     Shell(ShellRunnableArgs),
+    /// Not part of rust-analyzer's schema: the server runs the command itself when the
+    /// client sends it back with `workspace/executeCommand`, instead of the client
+    /// spawning a task.
+    Command(lsp::Command),
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -633,9 +637,42 @@ pub struct GetLspRunnables {
 #[derive(Debug, Default)]
 pub struct LspRunnables {
     pub runnables: Vec<(Option<LocationLink>, TaskTemplate)>,
+    pub commands: Vec<(Option<LocationLink>, CommandRunnable)>,
 }
 
-pub fn runnable_to_task_template(label: String, args: RunnableArgs) -> TaskTemplate {
+/// A runnable of the `command` kind, run by sending `command` to the server that
+/// provided it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CommandRunnable {
+    pub label: String,
+    pub command: lsp::Command,
+}
+
+/// The outcome a server reports for a [`CommandRunnable`] by responding to
+/// `workspace/executeCommand` with `{ "status": "passed" | "failed" }` once the run
+/// finishes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CommandRunnableStatus {
+    Passed,
+    Failed,
+}
+
+impl CommandRunnableStatus {
+    pub fn from_command_result(result: Option<&serde_json::Value>) -> Option<Self> {
+        #[derive(Deserialize)]
+        struct CommandRunnableResult {
+            status: CommandRunnableStatus,
+        }
+
+        serde_json::from_value::<CommandRunnableResult>(result?.clone())
+            .ok()
+            .map(|result| result.status)
+    }
+}
+
+/// Returns `None` for [`RunnableArgs::Command`], which is not run as a task.
+pub fn runnable_to_task_template(label: String, args: RunnableArgs) -> Option<TaskTemplate> {
     let mut task_template = TaskTemplate::default();
     task_template.label = label;
     match args {
@@ -681,8 +718,9 @@ pub fn runnable_to_task_template(label: String, args: RunnableArgs) -> TaskTempl
             task_template.env = shell.environment;
             task_template.cwd = Some(shell.cwd.to_string_lossy().into_owned());
         }
+        RunnableArgs::Command(_) => return None,
     }
-    task_template
+    Some(task_template)
 }
 
 #[async_trait(?Send)]
@@ -726,7 +764,7 @@ impl LspCommand for GetLspRunnables {
         server_id: LanguageServerId,
         mut cx: AsyncApp,
     ) -> Result<LspRunnables> {
-        let mut runnables = Vec::with_capacity(lsp_runnables.len());
+        let mut runnables = LspRunnables::default();
 
         for runnable in lsp_runnables {
             let location = match runnable.location {
@@ -736,11 +774,25 @@ impl LspCommand for GetLspRunnables {
                 ),
                 None => None,
             };
-            let task_template = runnable_to_task_template(runnable.label, runnable.args);
-            runnables.push((location, task_template));
+            match runnable.args {
+                RunnableArgs::Command(command) => {
+                    runnables.commands.push((
+                        location,
+                        CommandRunnable {
+                            label: runnable.label,
+                            command,
+                        },
+                    ));
+                }
+                args => {
+                    if let Some(task_template) = runnable_to_task_template(runnable.label, args) {
+                        runnables.runnables.push((location, task_template));
+                    }
+                }
+            }
         }
 
-        Ok(LspRunnables { runnables })
+        Ok(runnables)
     }
 
     fn to_proto(&self, project_id: u64, buffer: &Buffer) -> proto::LspExtRunnables {
@@ -784,6 +836,15 @@ impl LspCommand for GetLspRunnables {
                     task_template: serde_json::to_vec(&task_template).unwrap(),
                 })
                 .collect(),
+            commands: response
+                .commands
+                .into_iter()
+                .map(|(location, runnable)| proto::LspCommandRunnable {
+                    location: location
+                        .map(|location| location_link_to_proto(location, lsp_store, peer_id, cx)),
+                    runnable: serde_json::to_vec(&runnable).unwrap(),
+                })
+                .collect(),
         }
     }
 
@@ -794,9 +855,7 @@ impl LspCommand for GetLspRunnables {
         _: Entity<Buffer>,
         mut cx: AsyncApp,
     ) -> Result<LspRunnables> {
-        let mut runnables = LspRunnables {
-            runnables: Vec::new(),
-        };
+        let mut runnables = LspRunnables::default();
 
         for lsp_runnable in message.runnables {
             let location = match lsp_runnable.location {
@@ -808,6 +867,18 @@ impl LspCommand for GetLspRunnables {
             let task_template = serde_json::from_slice(&lsp_runnable.task_template)
                 .context("deserializing task template from proto")?;
             runnables.runnables.push((location, task_template));
+        }
+
+        for command_runnable in message.commands {
+            let location = match command_runnable.location {
+                Some(location) => {
+                    Some(location_link_from_proto(location, lsp_store.clone(), &mut cx).await?)
+                }
+                None => None,
+            };
+            let runnable = serde_json::from_slice(&command_runnable.runnable)
+                .context("deserializing command runnable from proto")?;
+            runnables.commands.push((location, runnable));
         }
 
         Ok(runnables)
@@ -903,5 +974,47 @@ mod tests {
             vec!["test", "--package", "my-crate", "--lib"]
         );
         assert_eq!(cargo.executable_args, vec!["my_test", "--exact"]);
+    }
+
+    #[test]
+    fn command_runnable_deserializes_as_command() {
+        let json = serde_json::json!({
+            "label": "Run @testset \"one\"",
+            "kind": "command",
+            "args": {
+                "title": "Run @testset \"one\"",
+                "command": "jetls.testrunner.run@testset",
+                "arguments": ["file:///project/test/runtests.jl", 1, "\"one\""]
+            }
+        });
+
+        let runnable: Runnable =
+            serde_json::from_value(json).expect("command runnable should deserialize");
+        let RunnableArgs::Command(command) = &runnable.args else {
+            panic!("expected Command variant, got {:?}", runnable.args);
+        };
+        assert_eq!(command.command, "jetls.testrunner.run@testset");
+        assert_eq!(command.arguments.as_ref().map(Vec::len), Some(3));
+        assert_eq!(
+            runnable_to_task_template(runnable.label, runnable.args),
+            None
+        );
+    }
+
+    #[test]
+    fn command_runnable_status_from_command_result() {
+        let status =
+            |result: serde_json::Value| CommandRunnableStatus::from_command_result(Some(&result));
+        assert_eq!(
+            status(serde_json::json!({"status": "passed"})),
+            Some(CommandRunnableStatus::Passed)
+        );
+        assert_eq!(
+            status(serde_json::json!({"status": "failed"})),
+            Some(CommandRunnableStatus::Failed)
+        );
+        assert_eq!(status(serde_json::json!({"status": "cancelled"})), None);
+        assert_eq!(status(serde_json::json!(null)), None);
+        assert_eq!(CommandRunnableStatus::from_command_result(None), None);
     }
 }
