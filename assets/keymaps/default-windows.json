@@ -1605,6 +1605,7 @@
       "ctrl-alt-shift-backspace": "branch_picker::ForceDeleteBranch",
       "ctrl-shift-i": "branch_picker::CycleBranchFilter",
       "ctrl-k": "branch_picker::ToggleFilterMenu",
+      "ctrl-shift-v": "branch_picker::ShowBranchDiff",
     },
   },
   {
