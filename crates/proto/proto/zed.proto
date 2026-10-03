@@ -526,7 +526,8 @@ message Envelope {
     TrashGlobalSkill trash_global_skill = 501;
     ResolveGlobalSkillPath resolve_global_skill_path = 502;
     ResolveGlobalSkillPathResponse resolve_global_skill_path_response = 503;
-    ApplyGlobalSkillFileOperation apply_global_skill_file_operation = 504; // current max
+    ApplyGlobalSkillFileOperation apply_global_skill_file_operation = 504;
+    LoadMergeBaseDiff load_merge_base_diff = 505; // current max
   }
 
   reserved 87 to 88;
