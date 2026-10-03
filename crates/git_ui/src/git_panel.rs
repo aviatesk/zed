@@ -49,10 +49,10 @@ use git::{
 };
 use gpui::{
     AbsoluteLength, Action, Anchor, AnyElement, AsyncApp, AsyncWindowContext, ClickEvent,
-    ClipboardItem, DismissEvent, Empty, Entity, EventEmitter, FocusHandle, Focusable, KeyContext,
-    MouseButton, MouseDownEvent, Pixels, Point, PromptLevel, ScrollStrategy, Subscription, Task,
-    TaskExt, TextStyle, UniformListScrollHandle, WeakEntity, actions, anchored, deferred,
-    uniform_list,
+    ClipboardItem, DismissEvent, Empty, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
+    KeyContext, MouseButton, MouseDownEvent, Pixels, Point, PromptLevel, ScrollStrategy,
+    Subscription, Task, TaskExt, TextStyle, UniformListScrollHandle, WeakEntity, actions, anchored,
+    deferred, uniform_list,
 };
 use itertools::Itertools;
 use language::{Buffer, BufferEvent, File};
@@ -113,6 +113,7 @@ const UPDATE_DEBOUNCE: Duration = Duration::from_millis(50);
 // TODO: We should revise this part. It seems the indentation width is not aligned with the one in project panel
 const TREE_INDENT: f32 = 16.0;
 const MAX_HISTORY_TAG_CHIPS: usize = 3;
+const RECENT_COMMIT_COUNT: usize = 3;
 // Horizontal offset that aligns the tree indent guides with the row icon column.
 const INDENT_GUIDE_LEFT_OFFSET: gpui::Pixels = gpui::px(19.);
 
@@ -1186,6 +1187,7 @@ pub struct GitPanel {
     history_keyboard_nav: bool,
     _commit_message_buffer_subscription: Option<Subscription>,
     _repo_subscriptions: Vec<Subscription>,
+    recent_commits_subscriptions: Option<(EntityId, Vec<Subscription>)>,
     _settings_subscription: Subscription,
     git_access: Option<GitAccess>,
     commit_menu_handle: PopoverMenuHandle<ContextMenu>,
@@ -1523,6 +1525,7 @@ impl GitPanel {
                 history_keyboard_nav: false,
                 _commit_message_buffer_subscription: None,
                 _repo_subscriptions: Vec::new(),
+                recent_commits_subscriptions: None,
                 _settings_subscription,
                 git_access: None,
                 commit_menu_handle: PopoverMenuHandle::default(),
@@ -5346,6 +5349,7 @@ impl GitPanel {
             }
         }
         self.active_repository = new_active_repository;
+        self.observe_recent_commits(cx);
         self.reopen_commit_buffer(window, cx);
         self.preload_commit_history(cx);
         if self.active_tab == GitPanelTab::History {
@@ -5486,6 +5490,7 @@ impl GitPanel {
         let active_repository = self.project.read(cx).active_repository(cx);
         if active_repository != self.active_repository {
             self.active_repository = active_repository;
+            self.observe_recent_commits(cx);
             self.git_access = None;
             self.clear_marks();
         }
@@ -7070,86 +7075,173 @@ impl GitPanel {
             )
     }
 
-    fn render_previous_commit(
+    /// The commits listed below HEAD come from the commit history that
+    /// `preload_commit_history` already loads for the History tab, so they
+    /// need no extra git calls; this keeps the panel re-rendering as that
+    /// history and the commits' subjects finish loading.
+    fn observe_recent_commits(&mut self, cx: &mut Context<Self>) {
+        let Some(repository) = self.active_repository.clone() else {
+            self.recent_commits_subscriptions = None;
+            return;
+        };
+        if self
+            .recent_commits_subscriptions
+            .as_ref()
+            .is_some_and(|(observed_id, _)| *observed_id == repository.entity_id())
+        {
+            return;
+        }
+        let subscriptions = vec![
+            cx.subscribe(&repository, |_, _, event, cx| {
+                if matches!(event, RepositoryEvent::GraphEvent(_, _)) {
+                    cx.notify();
+                }
+            }),
+            cx.observe(&repository, |_, _, cx| cx.notify()),
+        ];
+        self.recent_commits_subscriptions = Some((repository.entity_id(), subscriptions));
+    }
+
+    /// Returns the loaded subjects of the commits preceding HEAD, stopping at
+    /// the first one that is still loading so the rows never reorder.
+    fn older_recent_commits(
+        active_repository: &Entity<Repository>,
+        head_sha: &str,
+        cx: &mut App,
+    ) -> Vec<(Oid, SharedString)> {
+        let Some(log_source) = Self::commit_history_log_source(active_repository, cx) else {
+            return Vec::new();
+        };
+        active_repository.update(cx, |repository, cx| {
+            let shas = repository
+                .graph_data(log_source, LogOrder::DateOrder, 0..RECENT_COMMIT_COUNT, cx)
+                .commits
+                .iter()
+                .map(|commit| commit.sha)
+                .filter(|sha| sha.to_string() != head_sha)
+                .take(RECENT_COMMIT_COUNT - 1)
+                .collect::<Vec<_>>();
+            shas.into_iter()
+                .map_while(|sha| match repository.fetch_commit_data(sha, false, cx) {
+                    CommitDataState::Loaded(data) => Some((sha, data.subject.clone())),
+                    CommitDataState::Loading(_) => None,
+                })
+                .collect()
+        })
+    }
+
+    fn render_recent_commit_subject(
+        &self,
+        id: ElementId,
+        sha: SharedString,
+        subject: SharedString,
+        active_repository: &Entity<Repository>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let workspace = self.workspace.clone();
+        let this = cx.entity();
+        div()
+            .id(id)
+            .cursor_pointer()
+            .px_1()
+            .rounded_sm()
+            .line_clamp(1)
+            .hover(|s| s.bg(cx.theme().colors().element_hover))
+            .child(Label::new(subject).size(LabelSize::Small).truncate())
+            .on_click({
+                let sha = sha.clone();
+                let repo = active_repository.downgrade();
+                move |_, window, cx| {
+                    CommitView::open(
+                        sha.to_string(),
+                        repo.clone(),
+                        workspace.clone(),
+                        None,
+                        None,
+                        window,
+                        cx,
+                    );
+                }
+            })
+            .hoverable_tooltip({
+                let repo = active_repository.clone();
+                move |window, cx| {
+                    GitPanelMessageTooltip::new(this.clone(), sha.clone(), repo.clone(), window, cx)
+                        .into()
+                }
+            })
+    }
+
+    fn render_recent_commits(
         &self,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
-        let active_repository = self.active_repository.as_ref()?;
-        let branch = active_repository.read(cx).branch.as_ref()?;
-        let commit = branch.most_recent_commit.as_ref()?.clone();
-        let workspace = self.workspace.clone();
-        let this = cx.entity();
+        let active_repository = self.active_repository.clone()?;
+        let head_commit = active_repository
+            .read(cx)
+            .branch
+            .as_ref()?
+            .most_recent_commit
+            .clone()?;
+        let older_commits = Self::older_recent_commits(&active_repository, &head_commit.sha, cx);
+        let has_unstaged = self.has_unstaged_changes();
 
         Some(
-            h_flex()
-                .p_1p5()
-                .gap_1p5()
-                .justify_between()
+            v_flex()
+                .py_1()
                 .border_t_1()
                 .border_color(cx.theme().colors().border.opacity(0.8))
                 .child(
-                    div()
-                        .id("commit-msg-hover")
-                        .cursor_pointer()
-                        .px_1()
-                        .rounded_sm()
-                        .line_clamp(1)
-                        .hover(|s| s.bg(cx.theme().colors().element_hover))
-                        .child(
-                            Label::new(commit.subject.clone())
-                                .size(LabelSize::Small)
-                                .truncate(),
-                        )
-                        .on_click({
-                            let commit = commit.clone();
-                            let repo = active_repository.downgrade();
-                            move |_, window, cx| {
-                                CommitView::open(
-                                    commit.sha.to_string(),
-                                    repo.clone(),
-                                    workspace.clone(),
-                                    None,
-                                    None,
-                                    window,
-                                    cx,
-                                );
-                            }
-                        })
-                        .hoverable_tooltip({
-                            let repo = active_repository.clone();
-                            move |window, cx| {
-                                GitPanelMessageTooltip::new(
-                                    this.clone(),
-                                    commit.sha.clone(),
-                                    repo.clone(),
-                                    window,
-                                    cx,
-                                )
-                                .into()
-                            }
+                    h_flex()
+                        .px_1p5()
+                        .gap_1p5()
+                        .justify_between()
+                        .child(self.render_recent_commit_subject(
+                            "commit-msg-hover".into(),
+                            head_commit.sha.clone(),
+                            head_commit.subject.clone(),
+                            &active_repository,
+                            cx,
+                        ))
+                        .when(head_commit.has_parent, |this| {
+                            this.child(
+                                IconButton::new("undo", IconName::Undo)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(move |_window, cx| {
+                                        Tooltip::with_meta(
+                                            "Uncommit",
+                                            Some(&git::Uncommit),
+                                            if has_unstaged {
+                                                "git reset HEAD^ --soft"
+                                            } else {
+                                                "git reset HEAD^"
+                                            },
+                                            cx,
+                                        )
+                                    })
+                                    .on_click(
+                                        cx.listener(|this, _, window, cx| {
+                                            this.uncommit(window, cx)
+                                        }),
+                                    ),
+                            )
                         }),
                 )
-                .when(commit.has_parent, |this| {
-                    let has_unstaged = self.has_unstaged_changes();
-                    this.child(
-                        IconButton::new("undo", IconName::Undo)
-                            .icon_size(IconSize::Small)
-                            .tooltip(move |_window, cx| {
-                                Tooltip::with_meta(
-                                    "Uncommit",
-                                    Some(&git::Uncommit),
-                                    if has_unstaged {
-                                        "git reset HEAD^ --soft"
-                                    } else {
-                                        "git reset HEAD^"
-                                    },
-                                    cx,
-                                )
-                            })
-                            .on_click(cx.listener(|this, _, window, cx| this.uncommit(window, cx))),
-                    )
-                }),
+                .children(
+                    older_commits
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, (sha, subject))| {
+                            h_flex().px_1p5().child(self.render_recent_commit_subject(
+                                ("recent-commit", index).into(),
+                                sha.to_string().into(),
+                                subject,
+                                &active_repository,
+                                cx,
+                            ))
+                        }),
+                ),
         )
     }
 
@@ -7418,10 +7510,6 @@ impl GitPanel {
                     }
                 },
             ));
-            self._repo_subscriptions
-                .push(cx.observe(&active_repository, |_this, _repo, cx| {
-                    cx.notify();
-                }));
         }
 
         self.fetch_commit_history_entries(cx);
@@ -9410,7 +9498,7 @@ impl Render for GitPanel {
                                 this.child(self.render_pending_amend(cx))
                             })
                             .when(!self.amend_pending, |this| {
-                                this.children(self.render_previous_commit(window, cx))
+                                this.children(self.render_recent_commits(window, cx))
                             }),
                         GitPanelTab::History => this.child(self.render_history_tab(window, cx)),
                     })
@@ -10855,6 +10943,79 @@ mod tests {
                 }]))
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_recent_commits_list_commits_preceding_head(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree("/root", json!({ "project": { ".git": {} } }))
+            .await;
+
+        let dot_git = Path::new(path!("/root/project/.git"));
+        let shas: [Oid; 4] = [
+            "4444444444444444444444444444444444444444",
+            "3333333333333333333333333333333333333333",
+            "2222222222222222222222222222222222222222",
+            "1111111111111111111111111111111111111111",
+        ]
+        .map(|sha| sha.parse().unwrap());
+        fs.with_git_state(dot_git, false, |state| {
+            state.current_branch_name = None;
+            state.refs.insert("HEAD".into(), shas[0].to_string());
+            state.graph_commits = shas
+                .iter()
+                .enumerate()
+                .map(|(index, sha)| {
+                    Arc::new(git::repository::InitialGraphCommitData {
+                        sha: *sha,
+                        parents: shas.get(index + 1).copied().into_iter().collect(),
+                        ref_names: Vec::new(),
+                    })
+                })
+                .collect();
+        })
+        .unwrap();
+        fs.set_commit_data(
+            dot_git,
+            shas.iter().enumerate().map(|(index, sha)| {
+                (
+                    git::repository::CommitData {
+                        sha: *sha,
+                        parents: shas.get(index + 1).copied().into_iter().collect(),
+                        author_name: "Author".into(),
+                        author_email: "author@example.com".into(),
+                        commit_timestamp: 1_700_000_000 - index as i64,
+                        subject: format!("Commit {}", shas.len() - index).into(),
+                        message: format!("Commit {}", shas.len() - index).into(),
+                    },
+                    false,
+                )
+            }),
+        );
+
+        let panel = history_panel_for_project(fs.clone(), cx).await;
+        let repository = panel.read_with(cx, |panel, _| {
+            panel
+                .active_repository
+                .clone()
+                .expect("project should have an active repository")
+        });
+
+        let mut older_commits = Vec::new();
+        for _ in 0..3 {
+            older_commits = cx
+                .update(|cx| GitPanel::older_recent_commits(&repository, &shas[0].to_string(), cx));
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            older_commits,
+            vec![
+                (shas[1], SharedString::from("Commit 3")),
+                (shas[2], SharedString::from("Commit 2")),
+            ]
+        );
     }
 
     #[gpui::test]
