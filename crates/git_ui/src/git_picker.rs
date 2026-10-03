@@ -14,7 +14,7 @@ use workspace::{ModalView, Workspace, pane};
 
 use crate::branch_picker::{
     self, BranchList, CycleBranchFilter, DeleteBranch, ForceDeleteBranch, ShowAllBranches,
-    ShowLocalBranches, ShowRemoteBranches,
+    ShowBranchDiff, ShowLocalBranches, ShowRemoteBranches,
 };
 use crate::stash_picker::{self, DropStashItem, ShowStashItem, StashList};
 
@@ -364,6 +364,19 @@ impl GitPicker {
         }
     }
 
+    fn handle_show_branch_diff(
+        &mut self,
+        _: &ShowBranchDiff,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(branch_list) = &self.branch_list {
+            branch_list.update(cx, |list, cx| {
+                list.handle_show_branch_diff(&ShowBranchDiff, window, cx);
+            });
+        }
+    }
+
     fn handle_drop_stash(
         &mut self,
         _: &DropStashItem,
@@ -475,6 +488,7 @@ impl Render for GitPicker {
                     .on_action(cx.listener(Self::handle_show_local_branches))
                     .on_action(cx.listener(Self::handle_show_remote_branches))
                     .on_action(cx.listener(Self::handle_cycle_branch_filter))
+                    .on_action(cx.listener(Self::handle_show_branch_diff))
             })
             .when(self.tab == GitPickerTab::Stashes, |el| {
                 el.on_action(cx.listener(Self::handle_drop_stash))
