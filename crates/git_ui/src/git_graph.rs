@@ -2,7 +2,7 @@ pub use crate::commit_context_menu::{CopyCommitSha, CopyCommitTag, OpenCommitVie
 use crate::{
     commit_context_menu::{
         CUSTOM_GIT_COMMANDS_DOCS_SLUG, CommitContextMenuData, CommitContextMenuSource,
-        commit_context_menu, git_context_menu_tasks, git_task_context,
+        commit_context_menu, git_context_menu_tasks, git_task_context, open_branch_changes,
     },
     commit_tooltip::CommitAvatar,
     commit_view::CommitView,
@@ -1389,9 +1389,26 @@ struct GitGraphContextMenu {
     _subscription: Subscription,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum GraphRef {
+    Branch(SharedString),
+    Tag(SharedString),
+}
+
+impl GraphRef {
+    fn name(&self) -> &SharedString {
+        match self {
+            Self::Branch(name) | Self::Tag(name) => name,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct RefMenuEntry {
-    ref_name: Option<SharedString>,
+    sha: Oid,
+    reference: Option<GraphRef>,
+    repository: Option<WeakEntity<Repository>>,
+    workspace: WeakEntity<Workspace>,
     git_tasks: Vec<(TaskSourceKind, ResolvedTask)>,
 }
 
@@ -1402,7 +1419,25 @@ impl RefMenuEntry {
         git_graph: &Entity<GitGraph>,
         window: &mut Window,
     ) -> ContextMenu {
-        if let Some(ref_name) = self.ref_name {
+        if let Some(GraphRef::Branch(branch_ref)) = &self.reference {
+            let sha = self.sha;
+            let branch_ref = branch_ref.clone();
+            let repository = self.repository.clone();
+            let workspace = self.workspace.clone();
+            menu = menu.entry("View Branch Changes", None, move |window, cx| {
+                open_branch_changes(
+                    sha,
+                    branch_ref.clone(),
+                    repository.clone(),
+                    workspace.clone(),
+                    window,
+                    cx,
+                );
+            });
+        }
+
+        if let Some(reference) = self.reference {
+            let ref_name = reference.name().clone();
             menu = menu.entry("Copy Ref Name", None, move |_window, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(ref_name.to_string()));
             });
@@ -1874,17 +1909,17 @@ impl GitGraph {
         })
     }
 
-    /// Extracts a ref name (branch, remote ref, or tag) from a decoration in
-    /// git's `%D` format, returning `None` for a detached `HEAD`.
-    fn ref_name_from_decoration(decoration: &str) -> Option<SharedString> {
-        let name = decoration
-            .strip_prefix("tag: ")
-            .or_else(|| decoration.strip_prefix("HEAD -> "))
-            .unwrap_or(decoration);
-        if name.is_empty() || name == "HEAD" {
+    /// Extracts a branch or tag from a ref decoration, returning `None` for a detached `HEAD`.
+    fn graph_ref_from_decoration(decoration: &str) -> Option<GraphRef> {
+        if let Some(tag_name) = decoration.strip_prefix("tag: ") {
+            return (!tag_name.is_empty()).then(|| GraphRef::Tag(tag_name.to_string().into()));
+        }
+
+        let branch_name = decoration.strip_prefix("HEAD -> ").unwrap_or(decoration);
+        if branch_name.is_empty() || branch_name == "HEAD" {
             return None;
         }
-        Some(SharedString::from(name.to_string()))
+        Some(GraphRef::Branch(branch_name.to_string().into()))
     }
 
     /// Renders a ref chip for the commit at `commit_idx`. Chips get a
@@ -2720,17 +2755,27 @@ impl GitGraph {
     /// (its short name and any custom git command tasks). Kept separate so the
     /// same entries can be rendered both as a standalone menu and as a submenu.
     fn ref_menu_entry(&self, sha: Oid, name: &SharedString, cx: &App) -> RefMenuEntry {
-        let ref_name = Self::ref_name_from_decoration(name);
+        let reference = Self::graph_ref_from_decoration(name);
         let repository = self
             .get_repository(cx)
             .map(|repository| repository.downgrade());
         let git_tasks = git_context_menu_tasks(
-            git_task_context(&repository, sha, ref_name.as_deref(), cx),
+            git_task_context(
+                &repository,
+                sha,
+                reference
+                    .as_ref()
+                    .map(|reference| reference.name().as_ref()),
+                cx,
+            ),
             &self.workspace,
             cx,
         );
         RefMenuEntry {
-            ref_name,
+            sha,
+            reference,
+            repository,
+            workspace: self.workspace.clone(),
             git_tasks,
         }
     }
@@ -8105,6 +8150,110 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_ref_context_menu_views_branch_changes_only_for_branches(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+
+        let commit_sha = Oid::try_from("abcdef1234567890abcdef1234567890abcdef12")
+            .expect("commit SHA should be valid");
+        fs.set_graph_commits(
+            Path::new("/project/.git"),
+            vec![Arc::new(InitialGraphCommitData {
+                sha: commit_sha,
+                parents: SmallVec::new(),
+                ref_names: vec!["HEAD -> feature-x".into(), "tag: v1.0".into()],
+            })],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("project should have an active repository")
+        });
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(&*cx, |multi_workspace, _| {
+            multi_workspace.workspace().clone()
+        });
+        let workspace_weak = workspace.downgrade();
+        let git_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace_weak,
+                None,
+                window,
+                cx,
+            )
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(git_graph.clone()), None, true, window, cx);
+        });
+        cx.run_until_parked();
+
+        let confirm_first_ref_menu_entry = |decoration: &str, cx: &mut gpui::VisualTestContext| {
+            git_graph.update_in(cx, |git_graph, window, cx| {
+                git_graph.deploy_ref_context_menu(
+                    point(px(20.), px(20.)),
+                    0,
+                    SharedString::from(decoration.to_string()),
+                    window,
+                    cx,
+                );
+            });
+            cx.run_until_parked();
+            let context_menu = git_graph.read_with(&*cx, |git_graph, _| {
+                git_graph
+                    .context_menu
+                    .as_ref()
+                    .expect("context menu should be open")
+                    .menu
+                    .clone()
+            });
+            context_menu.update_in(cx, |context_menu, window, cx| {
+                context_menu.select_first(&menu::SelectFirst, window, cx);
+                context_menu.confirm(&menu::Confirm, window, cx);
+            });
+            cx.run_until_parked();
+        };
+        let commit_view_count = |cx: &mut gpui::VisualTestContext| {
+            workspace.read_with(&*cx, |workspace, cx| {
+                workspace.items_of_type::<CommitView>(cx).count()
+            })
+        };
+
+        confirm_first_ref_menu_entry("tag: v1.0", cx);
+        assert_eq!(commit_view_count(cx), 0);
+        assert_eq!(
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("v1.0"),
+            "a tag's first ref menu entry should copy its name"
+        );
+
+        confirm_first_ref_menu_entry("HEAD -> feature-x", cx);
+        assert_eq!(
+            commit_view_count(cx),
+            1,
+            "a branch's first ref menu entry should open its changes"
+        );
+    }
+
+    #[gpui::test]
     async fn test_global_git_command_task_runs_from_ref_context_menu(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -8231,24 +8380,24 @@ mod tests {
     }
 
     #[test]
-    fn test_ref_name_from_decoration() {
+    fn test_graph_ref_from_decoration() {
         assert_eq!(
-            GitGraph::ref_name_from_decoration("HEAD -> main"),
-            Some("main".into())
+            GitGraph::graph_ref_from_decoration("HEAD -> main"),
+            Some(GraphRef::Branch("main".into()))
         );
         assert_eq!(
-            GitGraph::ref_name_from_decoration("main"),
-            Some("main".into())
+            GitGraph::graph_ref_from_decoration("main"),
+            Some(GraphRef::Branch("main".into()))
         );
         assert_eq!(
-            GitGraph::ref_name_from_decoration("origin/main"),
-            Some("origin/main".into())
+            GitGraph::graph_ref_from_decoration("origin/main"),
+            Some(GraphRef::Branch("origin/main".into()))
         );
         assert_eq!(
-            GitGraph::ref_name_from_decoration("tag: v1.0"),
-            Some("v1.0".into())
+            GitGraph::graph_ref_from_decoration("tag: v1.0"),
+            Some(GraphRef::Tag("v1.0".into()))
         );
-        assert_eq!(GitGraph::ref_name_from_decoration("HEAD"), None);
+        assert_eq!(GitGraph::graph_ref_from_decoration("HEAD"), None);
     }
 
     #[gpui::test]
