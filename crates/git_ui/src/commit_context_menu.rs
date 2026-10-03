@@ -1,4 +1,5 @@
 use crate::{commit_view::CommitView, create_tag_at_commit};
+use anyhow::Context as _;
 use git::Oid;
 use gpui::{Action, ClipboardItem, Entity, FocusHandle, SharedString, WeakEntity, Window, actions};
 use project::{GIT_COMMAND_TASK_TAG, git_store::Repository};
@@ -6,7 +7,7 @@ use project::{GIT_COMMAND_TASK_TAG, git_store::Repository};
 use task::{TaskContext, TaskVariables, VariableName};
 use ui::{Color, ContextMenu, ContextMenuEntry, IconName, IconPosition, prelude::*};
 use util::ResultExt as _;
-use workspace::Workspace;
+use workspace::{Workspace, notifications::NotifyTaskExt};
 
 actions!(
     git_graph,
@@ -192,6 +193,42 @@ pub(crate) fn commit_context_menu(
                 menu
             })
     })
+}
+
+pub(crate) fn open_branch_changes(
+    head_sha: Oid,
+    branch_ref: SharedString,
+    repository: Option<WeakEntity<Repository>>,
+    workspace: WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(repository) = repository else {
+        return;
+    };
+    let default_branch = repository.update(cx, |repository, _| repository.default_branch(true));
+    let workspace_for_errors = workspace.clone();
+
+    window
+        .spawn(cx, async move |cx| {
+            let base_ref = default_branch?
+                .await??
+                .context("Could not determine the default branch")?;
+            let open_task = cx.update(|window, cx| {
+                CommitView::open_branch_diff(
+                    base_ref,
+                    branch_ref.clone(),
+                    branch_ref,
+                    head_sha.to_string(),
+                    repository,
+                    workspace,
+                    window,
+                    cx,
+                )
+            })?;
+            open_task.await
+        })
+        .detach_and_notify_err(workspace_for_errors, window, cx);
 }
 
 pub(crate) fn git_task_context(
