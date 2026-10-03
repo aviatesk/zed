@@ -12,10 +12,10 @@ use git::{
     Oid, RunHook,
     blame::Blame,
     repository::{
-        AskPassDelegate, Branch, CommitData, CommitDataReader, CommitDetails, CommitOptions,
-        CreateWorktreeTarget, FetchOptions, FileHistoryChangedFileSets, GRAPH_CHUNK_SIZE,
-        GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData, LogOrder, LogSource,
-        PushOptions, RefEdit, Remote, RepoPath, ResetMode, SearchCommitArgs, Worktree,
+        AskPassDelegate, Branch, CommitData, CommitDataReader, CommitDetails, CommitDiff,
+        CommitFile, CommitOptions, CreateWorktreeTarget, FetchOptions, FileHistoryChangedFileSets,
+        GRAPH_CHUNK_SIZE, GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData, LogOrder,
+        LogSource, PushOptions, RefEdit, Remote, RepoPath, ResetMode, SearchCommitArgs, Worktree,
         commit_hash_search_query,
     },
     stash::GitStash,
@@ -296,6 +296,52 @@ impl GitRepository for FakeGitRepository {
                 is_shallow_boundary: false,
             })
         }
+        .boxed()
+    }
+
+    fn load_merge_base_diff(
+        &self,
+        _base: String,
+        _head: String,
+        _cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<CommitDiff>> {
+        self.with_state_async(false, |state| {
+            let paths = state
+                .merge_base_contents
+                .keys()
+                .chain(state.head_contents.keys())
+                .cloned()
+                .collect::<HashSet<_>>();
+            let mut files = Vec::new();
+            for path in paths {
+                let old_content = state
+                    .merge_base_contents
+                    .get(&path)
+                    .map(|oid| {
+                        state
+                            .oids
+                            .get(oid)
+                            .cloned()
+                            .context("merge-base blob is missing")
+                    })
+                    .transpose()?;
+                let new_content = state.head_contents.get(&path).cloned();
+                if old_content == new_content {
+                    continue;
+                }
+                files.push(CommitFile {
+                    path,
+                    old_content,
+                    new_content,
+                    is_binary: false,
+                });
+            }
+            files.sort_by(|left, right| left.path.cmp(&right.path));
+            Ok(CommitDiff {
+                files,
+                is_shallow_boundary: false,
+            })
+        })
         .boxed()
     }
 
