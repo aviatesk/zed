@@ -310,6 +310,17 @@ pub struct DocumentDiagnostics {
 struct DocumentSelectorContext {
     language_id: String,
     scheme: String,
+    path: DocumentSelectorPath,
+}
+
+#[derive(Clone, Debug)]
+enum DocumentSelectorPath {
+    /// The context stands for every document of a language (e.g. for per-language caches),
+    /// so `pattern` filters cannot be evaluated and are not considered.
+    Unknown,
+    /// The document has no file system path, so no `pattern` filter matches it.
+    Absent,
+    Present(PathBuf),
 }
 #[derive(Debug, Clone)]
 pub(crate) struct BufferUriState {
@@ -1569,9 +1580,9 @@ impl LocalLspStore {
 
     fn language_servers_for_buffer<'a>(
         &'a self,
-        buffer: &'a Buffer,
-        cx: &'a mut App,
-    ) -> impl Iterator<Item = (&'a Arc<CachedLspAdapter>, &'a Arc<LanguageServer>)> {
+        buffer: &Buffer,
+        cx: &mut App,
+    ) -> impl Iterator<Item = (&'a Arc<CachedLspAdapter>, &'a Arc<LanguageServer>)> + use<'a> {
         self.language_server_ids_for_buffer(buffer, cx)
             .into_iter()
             .filter_map(|server_id| match self.language_servers.get(&server_id)? {
@@ -2105,6 +2116,7 @@ impl LocalLspStore {
                                                 buffer_snapshot,
                                                 adapter,
                                                 server,
+                                                cx,
                                             )
                                         });
                                     if range_formatter.is_some() {
@@ -2119,6 +2131,7 @@ impl LocalLspStore {
                                                 buffer_snapshot,
                                                 adapter,
                                                 server,
+                                                cx,
                                             )
                                         })
                                     } else {
@@ -2131,11 +2144,13 @@ impl LocalLspStore {
                                             buffer_snapshot,
                                             adapter,
                                             server,
+                                            cx,
                                         ) || buffer_supports_lsp_range_formatting(
                                             local,
                                             buffer_snapshot,
                                             adapter,
                                             server,
+                                            cx,
                                         )
                                     })
                                 };
@@ -2640,6 +2655,7 @@ impl LocalLspStore {
                     buffer_handle.read(cx),
                     adapter,
                     language_server,
+                    cx,
                 )
             })
         })?;
@@ -2787,12 +2803,13 @@ impl LocalLspStore {
                 Some(local) => {
                     let buffer = buffer.read(cx);
                     (
-                        buffer_supports_lsp_formatting(local, buffer, adapter, language_server),
+                        buffer_supports_lsp_formatting(local, buffer, adapter, language_server, cx),
                         buffer_supports_lsp_range_formatting(
                             local,
                             buffer,
                             adapter,
                             language_server,
+                            cx,
                         ),
                     )
                 }
@@ -3080,6 +3097,7 @@ impl LocalLspStore {
                         server.server_id(),
                         &adapter,
                         buffer,
+                        cx,
                     ),
                     cx,
                 );
@@ -3474,6 +3492,7 @@ impl LocalLspStore {
                         server.server_id(),
                         &adapter,
                         buffer,
+                        cx,
                     ),
                     cx,
                 );
@@ -6312,6 +6331,7 @@ impl LspStore {
         &self,
         server_id: LanguageServerId,
         language: Option<&LanguageName>,
+        path: DocumentSelectorPath,
     ) -> Option<DocumentSelectorContext> {
         let language = language?;
         let server_name = &self.language_server_statuses.get(&server_id)?.name;
@@ -6326,6 +6346,7 @@ impl LspStore {
         Some(DocumentSelectorContext {
             language_id,
             scheme: "file".to_string(),
+            path,
         })
     }
 
@@ -6338,8 +6359,14 @@ impl LspStore {
         cx: &App,
     ) -> bool {
         let registration_method = text_document_registration_method(method);
-        let language = buffer.read(cx).language().map(|language| language.name());
-        let context = self.remote_document_selector_context(server_id, language.as_ref());
+        let buffer = buffer.read(cx);
+        let language = buffer.language().map(|language| language.name());
+        // The guest only guesses the host's URI scheme, so do not rule out pattern filters
+        // for documents it cannot place.
+        let path = File::from_dyn(buffer.file()).map_or(DocumentSelectorPath::Unknown, |file| {
+            DocumentSelectorPath::Present(file.abs_path(cx))
+        });
+        let context = self.remote_document_selector_context(server_id, language.as_ref(), path);
         remote_text_document_capabilities_match(
             self.lsp_server_initial_capabilities.get(&server_id),
             self.lsp_server_capabilities.get(&server_id),
@@ -6367,7 +6394,7 @@ impl LspStore {
                 else {
                     return false;
                 };
-                text_document_capabilities_for_buffer(local, method, buffer, adapter, server)
+                text_document_capabilities_for_buffer(local, method, buffer, adapter, server, cx)
                     .any(&mut check)
             });
         }
@@ -6400,8 +6427,10 @@ impl LspStore {
                 })
                 .any(|(adapter, server)| {
                     let server_name = server.name();
-                    text_document_capabilities_for_buffer(local, method, buffer, adapter, server)
-                        .any(|capabilities| check(&server_name, capabilities))
+                    text_document_capabilities_for_buffer(
+                        local, method, buffer, adapter, server, cx,
+                    )
+                    .any(|capabilities| check(&server_name, capabilities))
                 });
         }
 
@@ -6546,6 +6575,7 @@ impl LspStore {
                             buffer,
                             adapter,
                             language_server,
+                            cx,
                         )
                         .peekable();
                     if applicable_capabilities.peek().is_some() {
@@ -8337,7 +8367,7 @@ impl LspStore {
                 local
                     .language_servers_for_buffer(buffer, cx)
                     .filter(|(adapter, server)| {
-                        lsp_command_allowed_for_buffer(local, &request, buffer, adapter, server)
+                        lsp_command_allowed_for_buffer(local, &request, buffer, adapter, server, cx)
                     })
                     .filter(|(adapter, _)| {
                         scope
@@ -9037,6 +9067,7 @@ impl LspStore {
                                     registration,
                                     buffer.read(cx),
                                     &adapter,
+                                    cx,
                                 ) {
                                     continue;
                                 }
@@ -11113,7 +11144,7 @@ impl LspStore {
             local
                 .language_servers_for_buffer(buffer, cx)
                 .filter(|(adapter, server)| {
-                    lsp_command_allowed_for_buffer(local, request, buffer, adapter, server)
+                    lsp_command_allowed_for_buffer(local, request, buffer, adapter, server, cx)
                 })
                 .map(|(_, server)| server.server_id())
                 .filter(|server_id| {
@@ -11167,7 +11198,7 @@ impl LspStore {
             local
                 .language_servers_for_buffer(buffer, cx)
                 .filter(|(adapter, server)| {
-                    lsp_command_allowed_for_buffer(local, &request, buffer, adapter, server)
+                    lsp_command_allowed_for_buffer(local, &request, buffer, adapter, server, cx)
                 })
                 .filter(|(adapter, _)| {
                     scope
@@ -15093,6 +15124,7 @@ impl LspStore {
         buffer: &Buffer,
         server_id: LanguageServerId,
         registration_id: &Option<SharedString>,
+        cx: &App,
     ) -> bool {
         let Some(local) = self.as_local() else {
             return false;
@@ -15129,6 +15161,7 @@ impl LspStore {
                 registration,
                 buffer,
                 adapter,
+                cx,
             )
     }
 
@@ -15220,7 +15253,7 @@ impl LspStore {
                     // Document pulls take precedence only while this server and registration
                     // are responsible for the buffer. A buffer can outlive its LSP registration.
                     let use_document_diagnostics = self.buffer_store.read(cx).get_by_path(&project_path)
-                        .is_some_and(|buffer| self.buffer_uses_document_diagnostics(buffer.read(cx), server_id, &new_registration_id));
+                        .is_some_and(|buffer| self.buffer_uses_document_diagnostics(buffer.read(cx), server_id, &new_registration_id, cx));
                     if !use_document_diagnostics {
                         let (updates, result_ids) = acc.entry(server_id)
                             .or_insert_with(HashMap::default)
@@ -15839,20 +15872,27 @@ fn document_selector_context_for_buffer(
     local: &LocalLspStore,
     buffer: &Buffer,
     adapter: &CachedLspAdapter,
+    cx: &App,
 ) -> Option<DocumentSelectorContext> {
     let language = buffer.language()?;
-    let scheme = if buffer.file().is_some() {
-        "file"
+    let (scheme, path) = if buffer.file().is_some() {
+        let path = File::from_dyn(buffer.file()).map_or(DocumentSelectorPath::Absent, |file| {
+            DocumentSelectorPath::Present(file.abs_path(cx))
+        });
+        ("file", path)
+    } else if let Some(state) = local.buffer_uris.get(&buffer.remote_id()) {
+        let path = state
+            .uri
+            .to_file_path()
+            .map_or(DocumentSelectorPath::Absent, DocumentSelectorPath::Present);
+        (state.uri.scheme(), path)
     } else {
-        local
-            .buffer_uris
-            .get(&buffer.remote_id())
-            .map(|state| state.uri.scheme())
-            .unwrap_or("untitled")
+        ("untitled", DocumentSelectorPath::Absent)
     };
     Some(DocumentSelectorContext {
         language_id: adapter.language_id(&language.name()),
         scheme: scheme.to_string(),
+        path,
     })
 }
 
@@ -15863,6 +15903,7 @@ fn document_selector_context_for_language(
     DocumentSelectorContext {
         language_id: adapter.language_id(language),
         scheme: "file".to_string(),
+        path: DocumentSelectorPath::Unknown,
     }
 }
 
@@ -15891,8 +15932,57 @@ fn document_selector_matches(
             return false;
         }
 
+        // Checked last, since it compiles the glob.
+        if let Some(pattern) = &filter.pattern {
+            match &context.path {
+                DocumentSelectorPath::Unknown => {}
+                DocumentSelectorPath::Absent => return false,
+                DocumentSelectorPath::Present(path) => {
+                    if !document_filter_pattern_matches(pattern, path) {
+                        return false;
+                    }
+                }
+            }
+        }
+
         true
     })
+}
+
+fn document_filter_pattern_matcher(
+    pattern: &lsp::GlobPattern,
+) -> Result<(Option<PathBuf>, GlobMatcher)> {
+    let (base_path, pattern) = match pattern {
+        lsp::GlobPattern::String(pattern) => (None, pattern),
+        lsp::GlobPattern::Relative(relative_pattern) => {
+            let base_uri = match &relative_pattern.base_uri {
+                OneOf::Left(workspace_folder) => &workspace_folder.uri,
+                OneOf::Right(base_uri) => base_uri,
+            };
+            let base_path = base_uri
+                .to_file_path()
+                .map_err(|()| anyhow!("relative pattern base URI {base_uri} is not a file path"))?;
+            (Some(base_path), &relative_pattern.pattern)
+        }
+    };
+    // In LSP glob patterns, `*` and `?` never match a path separator.
+    let matcher = GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .build()?
+        .compile_matcher();
+    Ok((base_path, matcher))
+}
+
+fn document_filter_pattern_matches(pattern: &lsp::GlobPattern, path: &Path) -> bool {
+    let Some((base_path, matcher)) = document_filter_pattern_matcher(pattern).log_err() else {
+        return false;
+    };
+    match base_path {
+        Some(base_path) => path
+            .strip_prefix(&base_path)
+            .is_ok_and(|relative_path| matcher.is_match(relative_path)),
+        None => matcher.is_match(path),
+    }
 }
 
 fn remote_text_document_capabilities_match(
@@ -15938,8 +16028,9 @@ fn dynamic_text_document_registration_allows_buffer(
     registration: &dynamic_registration::DynamicTextDocumentRegistration,
     buffer: &Buffer,
     adapter: &CachedLspAdapter,
+    cx: &App,
 ) -> bool {
-    let Some(context) = document_selector_context_for_buffer(local, buffer, adapter) else {
+    let Some(context) = document_selector_context_for_buffer(local, buffer, adapter, cx) else {
         return true;
     };
 
@@ -15960,10 +16051,11 @@ fn text_document_registration_method(method: &str) -> &str {
 fn text_document_capabilities_for_buffer<'a>(
     local: &'a LocalLspStore,
     method: &str,
-    buffer: &'a Buffer,
-    adapter: &'a CachedLspAdapter,
+    buffer: &Buffer,
+    adapter: &CachedLspAdapter,
     server: &'a LanguageServer,
-) -> impl Iterator<Item = AdapterServerCapabilities<'a>> {
+    cx: &App,
+) -> impl Iterator<Item = AdapterServerCapabilities<'a>> + use<'a> {
     let code_action_kinds = server.code_action_kinds();
     let static_capabilities = local
         .initial_server_capabilities
@@ -15974,6 +16066,7 @@ fn text_document_capabilities_for_buffer<'a>(
         });
 
     let registration_method = text_document_registration_method(method);
+    let context = document_selector_context_for_buffer(local, buffer, adapter, cx);
     let dynamic_capabilities = local
         .language_server_dynamic_registrations
         .get(&server.server_id())
@@ -15981,7 +16074,9 @@ fn text_document_capabilities_for_buffer<'a>(
         .into_iter()
         .flat_map(|registrations| registrations.values())
         .filter(move |registration| {
-            dynamic_text_document_registration_allows_buffer(local, registration, buffer, adapter)
+            context.as_ref().is_none_or(|context| {
+                document_selector_matches(registration.document_selector.as_ref(), context)
+            })
         })
         .map(move |registration| AdapterServerCapabilities {
             server_capabilities: &registration.server_capabilities,
@@ -15994,10 +16089,11 @@ fn text_document_capabilities_for_buffer<'a>(
 fn applicable_lsp_command_capabilities_for_buffer<'a, R>(
     local: &'a LocalLspStore,
     request: &'a R,
-    buffer: &'a Buffer,
-    adapter: &'a CachedLspAdapter,
+    buffer: &Buffer,
+    adapter: &CachedLspAdapter,
     server: &'a LanguageServer,
-) -> impl Iterator<Item = AdapterServerCapabilities<'a>>
+    cx: &App,
+) -> impl Iterator<Item = AdapterServerCapabilities<'a>> + use<'a, R>
 where
     R: LspCommand,
 {
@@ -16007,6 +16103,7 @@ where
         buffer,
         adapter,
         server,
+        cx,
     )
     .filter(move |capabilities| request.check_capabilities(*capabilities))
 }
@@ -16017,11 +16114,12 @@ fn lsp_command_allowed_for_buffer<R>(
     buffer: &Buffer,
     adapter: &CachedLspAdapter,
     server: &LanguageServer,
+    cx: &App,
 ) -> bool
 where
     R: LspCommand,
 {
-    applicable_lsp_command_capabilities_for_buffer(local, request, buffer, adapter, server)
+    applicable_lsp_command_capabilities_for_buffer(local, request, buffer, adapter, server, cx)
         .next()
         .is_some()
 }
@@ -16031,11 +16129,17 @@ fn buffer_supports_lsp_formatting(
     buffer: &Buffer,
     adapter: &CachedLspAdapter,
     server: &LanguageServer,
+    cx: &App,
 ) -> bool {
-    text_document_capabilities_for_buffer(local, "textDocument/formatting", buffer, adapter, server)
-        .any(|capabilities| {
-            server_capabilities_support_formatting(capabilities.server_capabilities)
-        })
+    text_document_capabilities_for_buffer(
+        local,
+        "textDocument/formatting",
+        buffer,
+        adapter,
+        server,
+        cx,
+    )
+    .any(|capabilities| server_capabilities_support_formatting(capabilities.server_capabilities))
 }
 
 fn buffer_supports_lsp_range_formatting(
@@ -16043,6 +16147,7 @@ fn buffer_supports_lsp_range_formatting(
     buffer: &Buffer,
     adapter: &CachedLspAdapter,
     server: &LanguageServer,
+    cx: &App,
 ) -> bool {
     text_document_capabilities_for_buffer(
         local,
@@ -16050,6 +16155,7 @@ fn buffer_supports_lsp_range_formatting(
         buffer,
         adapter,
         server,
+        cx,
     )
     .any(|capabilities| {
         server_capabilities_support_range_formatting(capabilities.server_capabilities)
@@ -16061,6 +16167,7 @@ fn completion_trigger_characters_for_buffer(
     server_id: LanguageServerId,
     adapter: &CachedLspAdapter,
     buffer: &Buffer,
+    cx: &App,
 ) -> BTreeSet<String> {
     fn extend_triggers(triggers: &mut BTreeSet<String>, options: &lsp::CompletionOptions) {
         if let Some(characters) = &options.trigger_characters {
@@ -16087,6 +16194,7 @@ fn completion_trigger_characters_for_buffer(
                 registration,
                 buffer,
                 adapter,
+                cx,
             ) && let Some(options) = registration
                 .server_capabilities
                 .completion_provider
@@ -18403,7 +18511,109 @@ mod tests {
         DocumentSelectorContext {
             language_id: "rust".to_string(),
             scheme: "file".to_string(),
+            path: DocumentSelectorPath::Unknown,
         }
+    }
+
+    fn toml_file_context(path: DocumentSelectorPath) -> DocumentSelectorContext {
+        DocumentSelectorContext {
+            language_id: "toml".to_string(),
+            scheme: "file".to_string(),
+            path,
+        }
+    }
+
+    fn pattern_selector(
+        language: Option<&str>,
+        pattern: lsp::GlobPattern,
+    ) -> Option<lsp::DocumentSelector> {
+        Some(vec![lsp::DocumentFilter::Text(lsp::TextDocumentFilter {
+            language: language.map(str::to_string),
+            scheme: None,
+            pattern: Some(pattern),
+        })])
+    }
+
+    #[test]
+    fn document_selector_pattern_matches_document_path() {
+        let selector = pattern_selector(
+            Some("toml"),
+            lsp::GlobPattern::String("**/Project.toml".to_string()),
+        );
+        let present = |path: &str| DocumentSelectorPath::Present(PathBuf::from(path));
+
+        assert!(document_selector_matches(
+            selector.as_ref(),
+            &toml_file_context(present(util::path!("/root/Project.toml"))),
+        ));
+        assert!(!document_selector_matches(
+            selector.as_ref(),
+            &toml_file_context(present(util::path!("/root/Manifest.toml"))),
+        ));
+        assert!(
+            !document_selector_matches(
+                selector.as_ref(),
+                &toml_file_context(DocumentSelectorPath::Absent),
+            ),
+            "a document without a path cannot match a pattern filter",
+        );
+        assert!(
+            document_selector_matches(
+                selector.as_ref(),
+                &toml_file_context(DocumentSelectorPath::Unknown),
+            ),
+            "per-language contexts do not evaluate pattern filters",
+        );
+
+        let mut context = toml_file_context(present(util::path!("/root/Project.toml")));
+        context.language_id = "julia".to_string();
+        assert!(
+            !document_selector_matches(selector.as_ref(), &context),
+            "the pattern must not override a mismatching language",
+        );
+    }
+
+    #[test]
+    fn document_selector_pattern_wildcard_does_not_cross_separators() {
+        let selector =
+            pattern_selector(None, lsp::GlobPattern::String("**/root/*.toml".to_string()));
+        let context =
+            |path: &str| toml_file_context(DocumentSelectorPath::Present(PathBuf::from(path)));
+
+        assert!(document_selector_matches(
+            selector.as_ref(),
+            &context(util::path!("/root/Project.toml")),
+        ));
+        assert!(!document_selector_matches(
+            selector.as_ref(),
+            &context(util::path!("/root/sub/Project.toml")),
+        ));
+    }
+
+    #[test]
+    fn document_selector_relative_pattern_matches_below_base() {
+        let selector = pattern_selector(
+            None,
+            lsp::GlobPattern::Relative(lsp::RelativePattern {
+                base_uri: OneOf::Right(lsp::Uri::from_file_path(util::path!("/root")).unwrap()),
+                pattern: "sub/*.toml".to_string(),
+            }),
+        );
+        let context =
+            |path: &str| toml_file_context(DocumentSelectorPath::Present(PathBuf::from(path)));
+
+        assert!(document_selector_matches(
+            selector.as_ref(),
+            &context(util::path!("/root/sub/Project.toml")),
+        ));
+        assert!(!document_selector_matches(
+            selector.as_ref(),
+            &context(util::path!("/other/sub/Project.toml")),
+        ));
+        assert!(!document_selector_matches(
+            selector.as_ref(),
+            &context(util::path!("/root/Project.toml")),
+        ));
     }
 
     fn rename_registrations(
