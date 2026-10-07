@@ -1477,6 +1477,129 @@ async fn test_remote_lsp(cx: &mut TestAppContext, server_cx: &mut TestAppContext
 }
 
 #[gpui::test]
+async fn test_remote_requests_for_documents_opened_by_registrations(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(
+        path!("/code/project"),
+        json!({ "lib.rs": "", "notes.md": "# notes" }),
+    )
+    .await;
+    let (project, headless) = init_test(&fs, cx, server_cx).await;
+    let capabilities = lsp::ServerCapabilities {
+        code_action_provider: Some(lsp::CodeActionProviderCapability::Simple(true)),
+        ..lsp::ServerCapabilities::default()
+    };
+    project.update(cx, |project, _| {
+        project.languages().add(rust_lang());
+        project.languages().register_test_language(LanguageConfig {
+            name: "Markdown".into(),
+            matcher: LanguageMatcher {
+                path_suffixes: vec!["md".into()],
+                ..LanguageMatcher::default()
+            }
+            .into(),
+            ..LanguageConfig::default()
+        });
+        project.languages().register_fake_lsp_adapter(
+            "Rust",
+            FakeLspAdapter {
+                name: "rust-analyzer",
+                capabilities: capabilities.clone(),
+                ..FakeLspAdapter::default()
+            },
+        );
+    });
+    let (code_action_uris_tx, code_action_uris) = smol::channel::unbounded();
+    let mut fake_servers = server_cx.update(|cx| {
+        headless.read(cx).languages.register_fake_lsp_server(
+            LanguageServerName(SharedString::from("rust-analyzer")),
+            capabilities,
+            Some(Box::new(move |fake_server| {
+                let code_action_uris_tx = code_action_uris_tx.clone();
+                fake_server.set_request_handler::<lsp::request::CodeActionRequest, _, _>(
+                    move |params, _| {
+                        code_action_uris_tx
+                            .try_send(params.text_document.uri)
+                            .unwrap();
+                        async move { Ok(None) }
+                    },
+                );
+            })),
+        )
+    });
+    let worktree_id = project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/code/project"), true, cx)
+        })
+        .await
+        .expect("worktree should open")
+        .0
+        .read_with(cx, |worktree, _| worktree.id());
+    let (_rust_buffer, _rust_handle) = project
+        .update(cx, |project, cx| {
+            project.open_buffer_with_lsp((worktree_id, rel_path("lib.rs")), cx)
+        })
+        .await
+        .expect("buffer should open with LSP");
+    let fake_server = fake_servers.next().await.expect("LSP should start");
+    let (notes_buffer, _notes_handle) = project
+        .update(cx, |project, cx| {
+            project.open_buffer_with_lsp((worktree_id, rel_path("notes.md")), cx)
+        })
+        .await
+        .expect("buffer should open with LSP");
+    cx.run_until_parked();
+
+    let register = async |method: &str, id: &str| {
+        fake_server
+            .request::<lsp::request::RegisterCapability>(
+                lsp::RegistrationParams {
+                    registrations: vec![lsp::Registration {
+                        id: id.to_string(),
+                        method: method.to_string(),
+                        register_options: Some(
+                            json!({ "documentSelector": [{ "language": "markdown" }] }),
+                        ),
+                    }],
+                },
+                DEFAULT_LSP_REQUEST_TIMEOUT,
+            )
+            .await
+            .into_response()
+            .unwrap();
+    };
+    let request_code_actions = async |cx: &mut TestAppContext| {
+        project
+            .update(cx, |project, cx| {
+                project.code_actions(&notes_buffer, 0..0, None, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        std::iter::from_fn(|| code_action_uris.try_recv().ok()).collect::<Vec<_>>()
+    };
+
+    register("textDocument/didOpen", "open-notes").await;
+    cx.run_until_parked();
+    assert_eq!(
+        request_code_actions(cx).await,
+        Vec::new(),
+        "expected the static code action capability not to cover a document opened by registrations",
+    );
+
+    register("textDocument/codeAction", "code-actions-for-notes").await;
+    cx.run_until_parked();
+    assert_eq!(
+        request_code_actions(cx).await,
+        vec![lsp::Uri::from_file_path(path!("/code/project/notes.md")).unwrap()],
+        "expected the remote client to request code actions from the server whose registrations select the document",
+    );
+}
+
+#[gpui::test]
 async fn test_remote_completion_resolve_edit_ranges(
     cx: &mut TestAppContext,
     server_cx: &mut TestAppContext,
