@@ -3760,6 +3760,156 @@ async fn test_documents_opened_by_registrations_close_only_when_registered(
     );
 }
 
+#[gpui::test]
+async fn test_documents_opened_by_registrations_only_use_selecting_registrations(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+    let (project, fake_server) = setup_dynamic_registration_test(
+        cx,
+        lsp::ServerCapabilities {
+            completion_provider: Some(lsp::CompletionOptions {
+                trigger_characters: Some(vec![".".to_string()]),
+                ..lsp::CompletionOptions::default()
+            }),
+            code_action_provider: Some(lsp::CodeActionProviderCapability::Simple(true)),
+            diagnostic_provider: Some(lsp::DiagnosticServerCapabilities::Options(
+                lsp::DiagnosticOptions::default(),
+            )),
+            ..lsp::ServerCapabilities::default()
+        },
+    )
+    .await;
+    let fs = project.read_with(cx, |project, _| project.fs().as_fake());
+    fs.insert_tree(path!("/the-root"), json!({ "package.json": "{}" }))
+        .await;
+    project.read_with(cx, |project, _| project.languages().add(json_lang()));
+    cx.executor().run_until_parked();
+
+    let requested_uris = Arc::new(Mutex::new(Vec::new()));
+    fake_server.set_request_handler::<lsp::request::CodeActionRequest, _, _>({
+        let requested_uris = requested_uris.clone();
+        move |params, _| {
+            requested_uris
+                .lock()
+                .push(format!("codeAction {}", params.text_document.uri));
+            async move { Ok(None) }
+        }
+    });
+    fake_server.set_request_handler::<lsp::request::DocumentDiagnosticRequest, _, _>({
+        let requested_uris = requested_uris.clone();
+        move |params, _| {
+            requested_uris
+                .lock()
+                .push(format!("diagnostic {}", params.text_document.uri));
+            async move {
+                Ok(lsp::DocumentDiagnosticReportResult::Report(
+                    lsp::DocumentDiagnosticReport::Full(
+                        lsp::RelatedFullDocumentDiagnosticReport::default(),
+                    ),
+                ))
+            }
+        }
+    });
+
+    let (manifest_buffer, _manifest_handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/the-root/package.json"), cx)
+        })
+        .await
+        .unwrap();
+    register_capability(
+        &fake_server,
+        "textDocument/didOpen",
+        "open-manifests",
+        Some(json!({ "documentSelector": [{ "language": "json" }] })),
+    )
+    .await;
+    // Registrations without a selector cover the languages the server serves, like its static
+    // capabilities.
+    register_capability(
+        &fake_server,
+        "textDocument/completion",
+        "complete-served-languages",
+        Some(json!({ "triggerCharacters": ["!"] })),
+    )
+    .await;
+    cx.executor().run_until_parked();
+    assert!(buffer_opened_in_server(
+        &project,
+        &manifest_buffer,
+        fake_server.server.server_id(),
+        cx
+    ));
+
+    let manifest_uri = lsp::Uri::from_file_path(path!("/the-root/package.json")).unwrap();
+    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
+    let request_features = async |cx: &mut gpui::TestAppContext| {
+        project
+            .update(cx, |project, cx| {
+                project.code_actions(&manifest_buffer, 0..0, None, cx)
+            })
+            .await
+            .unwrap();
+        lsp_store
+            .update(cx, |lsp_store, cx| {
+                lsp_store.pull_diagnostics_for_buffer(manifest_buffer.clone(), cx)
+            })
+            .await
+            .unwrap();
+        cx.executor().run_until_parked();
+        (
+            manifest_buffer.read_with(cx, |buffer, _| buffer.completion_triggers().clone()),
+            std::mem::take(&mut *requested_uris.lock()),
+        )
+    };
+
+    assert_eq!(
+        request_features(cx).await,
+        (BTreeSet::new(), Vec::new()),
+        "expected neither static capabilities nor registrations without a selector to apply to a document opened by registrations",
+    );
+
+    let selector = json!([{ "language": "json" }]);
+    register_capability(
+        &fake_server,
+        "textDocument/completion",
+        "complete-manifests",
+        Some(json!({ "documentSelector": selector, "triggerCharacters": [":"] })),
+    )
+    .await;
+    register_capability(
+        &fake_server,
+        "textDocument/codeAction",
+        "code-actions-for-manifests",
+        Some(json!({ "documentSelector": selector })),
+    )
+    .await;
+    register_capability(
+        &fake_server,
+        "textDocument/diagnostic",
+        "diagnose-manifests",
+        Some(json!({
+            "documentSelector": selector,
+            "interFileDependencies": false,
+            "workspaceDiagnostics": false,
+        })),
+    )
+    .await;
+    cx.executor().run_until_parked();
+    assert_eq!(
+        request_features(cx).await,
+        (
+            BTreeSet::from([":".to_string()]),
+            vec![
+                format!("codeAction {manifest_uri}"),
+                format!("diagnostic {manifest_uri}"),
+            ],
+        ),
+        "expected the registrations selecting the document to apply to it",
+    );
+}
+
 fn buffer_opened_in_server(
     project: &Entity<Project>,
     buffer: &Entity<Buffer>,
