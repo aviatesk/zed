@@ -271,7 +271,9 @@ impl LspStore {
         document_selector: Option<lsp::DocumentSelector>,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
-        validate_document_selector(document_selector.as_ref())?;
+        let document_selector = document_selector
+            .map(CompiledDocumentSelector::new)
+            .transpose()?;
         let local = self
             .as_local_mut()
             .context("Expected LSP Store to be local")?;
