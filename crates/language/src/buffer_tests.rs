@@ -5832,7 +5832,7 @@ fn test_chunks_seek_out_of_unnecessary_diagnostic(cx: &mut TestAppContext) {
             diagnostics: true,
         },
     );
-    let unnecessary_chunk = chunks.find(|chunk| chunk.is_unnecessary);
+    let unnecessary_chunk = chunks.find(|chunk| chunk.unnecessary_severity.is_some());
     assert_eq!(
         unnecessary_chunk.map(|chunk| chunk.text),
         Some("unused"),
@@ -5841,7 +5841,7 @@ fn test_chunks_seek_out_of_unnecessary_diagnostic(cx: &mut TestAppContext) {
 
     chunks.seek(first_row.len()..snapshot.len());
     let chunks_after_seek = chunks
-        .map(|chunk| (chunk.text, chunk.is_unnecessary))
+        .map(|chunk| (chunk.text, chunk.unnecessary_severity.is_some()))
         .collect::<Vec<_>>();
     assert_eq!(
         chunks_after_seek,
