@@ -14,8 +14,8 @@ use picker::popover_menu::PickerPopoverMenu;
 use picker::{Picker, PickerDelegate};
 use settings::{AgentConfigOptionValue, SettingsStore};
 use ui::{
-    ElevationIndex, IconButton, KeyBinding, ListItem, ListItemSpacing, PopoverMenuHandle, Switch,
-    SwitchLabelPosition, ToggleState, Tooltip, prelude::*,
+    ContextMenu, ContextMenuEntry, ElevationIndex, IconButton, IconPosition, KeyBinding, ListItem,
+    ListItemSpacing, PopoverMenu, PopoverMenuHandle, Tooltip, prelude::*,
 };
 use unicode_segmentation::UnicodeSegmentation;
 use util::ResultExt as _;
@@ -250,12 +250,7 @@ impl ConfigOptionsView {
         config_options
             .config_options()
             .into_iter()
-            .filter(|option| {
-                matches!(
-                    &option.kind,
-                    acp::SessionConfigKind::Select(_) | acp::SessionConfigKind::Boolean(_)
-                )
-            })
+            .filter(|option| matches!(&option.kind, acp::SessionConfigKind::Select(_)))
             .map(|option| {
                 let config_options = config_options.clone();
                 let agent_server = agent_server.clone();
@@ -277,7 +272,8 @@ impl ConfigOptionsView {
 
 impl Render for ConfigOptionsView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        if self.selectors.is_empty() {
+        let boolean_options_menu = self.render_boolean_options_menu();
+        if self.selectors.is_empty() && boolean_options_menu.is_none() {
             return div().into_any_element();
         }
 
@@ -285,16 +281,148 @@ impl Render for ConfigOptionsView {
             .min_w_0()
             .flex_wrap()
             .gap_1()
+            .children(boolean_options_menu)
             .children(self.selectors.iter().cloned())
             .into_any_element()
+    }
+}
+
+struct BooleanConfigOption {
+    config_id: acp::SessionConfigId,
+    name: SharedString,
+    description: Option<SharedString>,
+    enabled: bool,
+}
+
+fn boolean_config_options(
+    config_options: &Rc<dyn AgentSessionConfigOptions>,
+) -> Vec<BooleanConfigOption> {
+    config_options
+        .config_options()
+        .into_iter()
+        .filter_map(|option| match option.kind {
+            acp::SessionConfigKind::Boolean(boolean) => Some(BooleanConfigOption {
+                config_id: option.config_id,
+                name: option.name.into(),
+                description: option.description.map(Into::into),
+                enabled: boolean.current_value,
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+impl ConfigOptionsView {
+    // Boolean options are collapsed into a single icon so that verbose agent-provided
+    // labels don't crowd the message editor toolbar.
+    fn render_boolean_options_menu(&self) -> Option<AnyElement> {
+        let boolean_options = boolean_config_options(&self.config_options);
+        if boolean_options.is_empty() {
+            return None;
+        }
+
+        let enabled_names = boolean_options
+            .iter()
+            .filter(|option| option.enabled)
+            .map(|option| option.name.as_ref())
+            .collect::<Vec<_>>();
+        let (icon_color, summary): (_, SharedString) = if enabled_names.is_empty() {
+            (Color::Muted, "All options are off".into())
+        } else {
+            (
+                Color::Accent,
+                format!("Enabled: {}", enabled_names.join(", ")).into(),
+            )
+        };
+        let tooltip = move |_window: &mut Window, cx: &mut App| {
+            Tooltip::with_meta("Agent Options", None, summary.clone(), cx)
+        };
+
+        if self.config_options.is_read_only() {
+            return Some(
+                div()
+                    .id("config-option-booleans")
+                    .px_1()
+                    .child(
+                        Icon::new(IconName::Settings)
+                            .size(IconSize::Small)
+                            .color(icon_color),
+                    )
+                    .tooltip(tooltip)
+                    .into_any_element(),
+            );
+        }
+
+        let config_options = self.config_options.clone();
+        let agent_server = self.agent_server.clone();
+        let fs = self.fs.clone();
+        Some(
+            PopoverMenu::new("config-option-booleans")
+                .trigger_with_tooltip(
+                    IconButton::new("config-option-booleans-trigger", IconName::Settings)
+                        .icon_size(IconSize::Small)
+                        .icon_color(icon_color),
+                    tooltip,
+                )
+                .anchor(gpui::Anchor::BottomRight)
+                .menu(move |window, cx| {
+                    let config_options = config_options.clone();
+                    let agent_server = agent_server.clone();
+                    let fs = fs.clone();
+                    Some(ContextMenu::build(
+                        window,
+                        cx,
+                        move |mut menu, _window, cx| {
+                            let documentation_side = documentation_aside_side(cx);
+                            for option in boolean_config_options(&config_options) {
+                                let config_options = config_options.clone();
+                                let agent_server = agent_server.clone();
+                                let fs = fs.clone();
+                                let config_id = option.config_id;
+                                let next_value = !option.enabled;
+                                let entry = ContextMenuEntry::new(option.name)
+                                    .toggleable(IconPosition::Start, option.enabled)
+                                    .when_some(option.description, |entry, description| {
+                                        entry.documentation_aside(documentation_side, move |_| {
+                                            Label::new(description.clone()).into_any_element()
+                                        })
+                                    })
+                                    .handler(move |_window, cx| {
+                                        let still_boolean =
+                                            config_options.config_options().iter().any(|option| {
+                                                option.config_id == config_id
+                                                    && matches!(
+                                                        &option.kind,
+                                                        acp::SessionConfigKind::Boolean(_)
+                                                    )
+                                            });
+                                        if !still_boolean {
+                                            return;
+                                        }
+                                        set_config_option_and_default(
+                                            config_options.clone(),
+                                            agent_server.clone(),
+                                            config_id.clone(),
+                                            acp::SessionConfigOptionValue::boolean(next_value),
+                                            fs.clone(),
+                                            cx,
+                                        )
+                                        .detach_and_log_err(cx);
+                                    });
+                                menu = menu.item(entry);
+                            }
+                            menu
+                        },
+                    ))
+                })
+                .into_any_element(),
+        )
     }
 }
 
 struct ConfigOptionSelector {
     config_options: Rc<dyn AgentSessionConfigOptions>,
     config_id: acp::SessionConfigId,
-    agent_server: Rc<dyn AgentServer>,
-    fs: Arc<dyn Fs>,
     picker_handle: Option<PopoverMenuHandle<Picker<ConfigOptionPickerDelegate>>>,
     picker: Option<Entity<Picker<ConfigOptionPickerDelegate>>>,
     setting_value: bool,
@@ -326,8 +454,6 @@ impl ConfigOptionSelector {
         let (picker_handle, picker) = if is_select {
             let config_options = config_options.clone();
             let config_id = config_id.clone();
-            let agent_server = agent_server.clone();
-            let fs = fs.clone();
             let picker = cx.new(move |picker_cx| {
                 let delegate = ConfigOptionPickerDelegate::new(
                     config_options,
@@ -354,8 +480,6 @@ impl ConfigOptionSelector {
         Self {
             config_options,
             config_id,
-            agent_server,
-            fs,
             picker_handle,
             picker,
             setting_value: false,
@@ -434,12 +558,17 @@ impl ConfigOptionSelector {
         };
 
         let value_name = self.current_value_name();
-        let mut graphemes = value_name.graphemes(true);
-        let truncated = graphemes.by_ref().take(32).collect::<String>();
-        let display_name = if graphemes.next().is_some() {
-            format!("{truncated}…")
+        let trigger_icon = trigger_icon(&option);
+        let display_name = if trigger_icon.as_ref().is_some_and(|icon| icon.hide_label) {
+            String::new()
         } else {
-            truncated
+            let mut graphemes = value_name.graphemes(true);
+            let truncated = graphemes.by_ref().take(32).collect::<String>();
+            if graphemes.next().is_some() {
+                format!("{truncated}…")
+            } else {
+                truncated
+            }
         };
 
         Button::new(
@@ -448,6 +577,14 @@ impl ConfigOptionSelector {
         )
         .label_size(LabelSize::Small)
         .color(Color::Muted)
+        .aria_label(format!("{}: {}", option.name, value_name))
+        .when_some(trigger_icon, |button, trigger_icon| {
+            button.start_icon(
+                Icon::new(trigger_icon.icon)
+                    .size(IconSize::Small)
+                    .color(trigger_icon.color),
+            )
+        })
         .end_icon(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
         .disabled(self.setting_value)
     }
@@ -460,24 +597,34 @@ impl Render for ConfigOptionSelector {
         };
 
         if self.config_options.is_read_only() {
-            let value = match &option.kind {
-                acp::SessionConfigKind::Select(_) => self.current_value_name(),
-                acp::SessionConfigKind::Boolean(boolean) => {
-                    format!(
-                        "{}: {}",
-                        option.name,
-                        if boolean.current_value { "On" } else { "Off" }
-                    )
-                }
-                _ => return div().into_any_element(),
+            if !matches!(&option.kind, acp::SessionConfigKind::Select(_)) {
+                return div().into_any_element();
+            }
+            let value = self.current_value_name();
+            let trigger_icon = trigger_icon(&option);
+            let hide_label = trigger_icon.as_ref().is_some_and(|icon| icon.hide_label);
+            let tooltip = if hide_label {
+                format!("{}: {}", option.name, value)
+            } else {
+                option.description.unwrap_or(option.name)
             };
-            return div()
+            return h_flex()
                 .id(ElementId::Name(
                     format!("config-option-{}", option.config_id.0).into(),
                 ))
                 .px_1()
-                .child(Label::new(value).size(LabelSize::Small).color(Color::Muted))
-                .tooltip(Tooltip::text(option.description.unwrap_or(option.name)))
+                .gap_1()
+                .when_some(trigger_icon, |this, trigger_icon| {
+                    this.child(
+                        Icon::new(trigger_icon.icon)
+                            .size(IconSize::Small)
+                            .color(trigger_icon.color),
+                    )
+                })
+                .when(!hide_label, |this| {
+                    this.child(Label::new(value).size(LabelSize::Small).color(Color::Muted))
+                })
+                .tooltip(Tooltip::text(tooltip))
                 .into_any_element();
         }
 
@@ -496,7 +643,11 @@ impl Render for ConfigOptionSelector {
                     .as_ref()
                     .is_some_and(|category| self.handles_category_keybindings(category));
                 let option_category = option.category.clone();
-                let option_name = option.name.clone();
+                let option_name = if trigger_icon(&option).is_some_and(|icon| icon.hide_label) {
+                    format!("{}: {}", option.name, self.current_value_name())
+                } else {
+                    option.name.clone()
+                };
                 let option_description: Option<SharedString> =
                     option.description.clone().map(Into::into);
 
@@ -573,76 +724,46 @@ impl Render for ConfigOptionSelector {
                 .render(window, cx)
                 .into_any_element()
             }
-            acp::SessionConfigKind::Boolean(boolean) => {
-                let option_id = option.config_id.clone();
-                let option_name: SharedString = option.name.clone().into();
-                let option_description: Option<SharedString> =
-                    option.description.clone().map(Into::into);
-                let tooltip_name = option_name.clone();
-                let tooltip = Tooltip::element(move |_window, _cx| {
-                    let mut content = v_flex().gap_1().child(Label::new(tooltip_name.clone()));
-                    if let Some(desc) = option_description.as_ref() {
-                        content = content.child(
-                            Label::new(desc.clone())
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        );
-                    }
-                    content.into_any()
-                });
-
-                let config_id = self.config_id.clone();
-                let config_options = self.config_options.clone();
-                let agent_server = self.agent_server.clone();
-                let fs = self.fs.clone();
-                let current_value = boolean.current_value;
-                let toggle_state = if current_value {
-                    ToggleState::Selected
-                } else {
-                    ToggleState::Unselected
-                };
-
-                h_flex()
-                    .id(ElementId::Name(
-                        format!("config-option-{}", option_id.0).into(),
-                    ))
-                    .pr_1()
-                    .tooltip(tooltip)
-                    .child(
-                        Switch::new(
-                            ElementId::Name(format!("config-option-{}-switch", option_id.0).into()),
-                            toggle_state,
-                        )
-                        .label(option_name)
-                        .label_position(SwitchLabelPosition::Start)
-                        .label_size(LabelSize::Small)
-                        .label_color(Color::Muted)
-                        .disabled(self.setting_value)
-                        .on_click(move |state, _window, cx| {
-                            if !config_options.config_options().iter().any(|option| {
-                                option.config_id == config_id
-                                    && matches!(&option.kind, acp::SessionConfigKind::Boolean(_))
-                            }) {
-                                return;
-                            }
-
-                            let next_value = matches!(state, ToggleState::Selected);
-                            set_config_option_and_default(
-                                config_options.clone(),
-                                agent_server.clone(),
-                                config_id.clone(),
-                                acp::SessionConfigOptionValue::boolean(next_value),
-                                fs.clone(),
-                                cx,
-                            )
-                            .detach_and_log_err(cx);
-                        }),
-                    )
-                    .into_any_element()
-            }
             _ => div().into_any_element(),
         }
     }
+}
+
+// claude-agent-acp spells these values out in full (e.g. "Bypass permissions", or "Default"
+// for the agent persona picker, which is meaningless without its option name), so they are
+// shown as icons instead. The full value remains available in the tooltip.
+const BYPASS_PERMISSIONS_MODE_ID: &str = "bypassPermissions";
+const AGENT_CONFIG_ID: &str = "agent";
+const DEFAULT_AGENT_ID: &str = "default";
+
+struct TriggerIcon {
+    icon: IconName,
+    color: Color,
+    hide_label: bool,
+}
+
+fn trigger_icon(option: &acp::SessionConfigOption) -> Option<TriggerIcon> {
+    let acp::SessionConfigKind::Select(select) = &option.kind else {
+        return None;
+    };
+    let current_value = select.current_value.0.as_ref();
+    if option.category == Some(acp::SessionConfigOptionCategory::Mode)
+        && current_value == BYPASS_PERMISSIONS_MODE_ID
+    {
+        return Some(TriggerIcon {
+            icon: IconName::Warning,
+            color: Color::Warning,
+            hide_label: true,
+        });
+    }
+    if option.category.is_none() && option.config_id.0.as_ref() == AGENT_CONFIG_ID {
+        return Some(TriggerIcon {
+            icon: IconName::Person,
+            color: Color::Muted,
+            hide_label: current_value == DEFAULT_AGENT_ID,
+        });
+    }
+    None
 }
 
 #[derive(Clone)]
@@ -1650,6 +1771,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn verbose_select_values_are_shown_as_icons() {
+        let mode = |current: &str| {
+            acp::SessionConfigOption::select(
+                "mode",
+                "Mode",
+                current.to_string(),
+                vec![
+                    acp::SessionConfigSelectOption::new("default", "Manual"),
+                    acp::SessionConfigSelectOption::new(
+                        BYPASS_PERMISSIONS_MODE_ID,
+                        "Bypass permissions",
+                    ),
+                ],
+            )
+            .category(acp::SessionConfigOptionCategory::Mode)
+        };
+        assert!(trigger_icon(&mode("default")).is_none());
+        assert!(
+            trigger_icon(&mode(BYPASS_PERMISSIONS_MODE_ID)).is_some_and(|icon| icon.hide_label)
+        );
+
+        let agent = |current: &str| {
+            acp::SessionConfigOption::select(
+                AGENT_CONFIG_ID,
+                "Agent",
+                current.to_string(),
+                vec![
+                    acp::SessionConfigSelectOption::new(DEFAULT_AGENT_ID, "Default"),
+                    acp::SessionConfigSelectOption::new("reviewer", "reviewer"),
+                ],
+            )
+        };
+        assert!(trigger_icon(&agent(DEFAULT_AGENT_ID)).is_some_and(|icon| icon.hide_label));
+        assert!(trigger_icon(&agent("reviewer")).is_some_and(|icon| !icon.hide_label));
+    }
+
     #[gpui::test]
     async fn read_only_config_options_do_not_set_values_or_defaults(cx: &mut TestAppContext) {
         let agent_server = Rc::new(TestAgentServer::default());
@@ -1682,7 +1840,7 @@ mod tests {
         });
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
-                assert_eq!(view.selectors.len(), 2);
+                assert_eq!(view.selectors.len(), 1);
                 assert!(!view.toggle_category_picker(
                     acp::SessionConfigOptionCategory::Model,
                     window,
@@ -1717,13 +1875,11 @@ mod tests {
             "fast", "Fast", false,
         )]);
         cx.run_until_parked();
-        view.read_with(cx, |view, cx| {
-            assert_eq!(view.selectors.len(), 1);
-            assert!(matches!(
-                view.selectors.first().expect("updated selector").read(cx).current_option()
-                    .expect("updated option").kind,
-                acp::SessionConfigKind::Boolean(boolean) if !boolean.current_value
-            ));
+        view.read_with(cx, |view, _cx| {
+            assert!(view.selectors.is_empty());
+            let boolean_options = boolean_config_options(&view.config_options);
+            assert_eq!(boolean_options.len(), 1);
+            assert!(boolean_options.iter().all(|option| !option.enabled));
         });
     }
 
