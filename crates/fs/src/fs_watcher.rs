@@ -531,6 +531,27 @@ fn path_is_under(path: &SanitizedPath, root: &SanitizedPath, case_insensitive: b
     }
 }
 
+/// Spells the part of `path` that lies within `root` the way `root` does, given
+/// that [`path_is_under`] placed `path` beneath `root`.
+///
+/// On case-insensitive volumes, a recursive backend watch installed under one
+/// spelling also serves registrations made under other spellings, and the
+/// backend reports event paths with the spelling the watch was installed with.
+/// Consumers compare event paths against the spelling they registered, so they
+/// would otherwise drop events reported under another one.
+fn respell_under_root(path: &SanitizedPath, root: &SanitizedPath) -> std::path::PathBuf {
+    if path.starts_with(root) {
+        return path.as_path().to_path_buf();
+    }
+    let mut respelled = root.as_path().to_path_buf();
+    respelled.extend(
+        path.as_path()
+            .components()
+            .skip(root.as_path().components().count()),
+    );
+    respelled
+}
+
 /// Lookup key for a watch path, shared by add, remove, and dispatch so they all
 /// agree on whether two spellings denote the same directory.
 ///
@@ -731,7 +752,7 @@ fn push_notify_event(
         .filter_map(|event_path| {
             let event_path = SanitizedPath::new(event_path);
             path_is_under(event_path, root_path, case_insensitive).then(|| PathEvent {
-                path: event_path.as_path().to_path_buf(),
+                path: respell_under_root(event_path, root_path),
                 kind,
             })
         })
@@ -2391,6 +2412,28 @@ mod tests {
 
         // The child is covered by the recursive parent despite the case mismatch.
         assert_eq!(backend.lock().watch_calls, vec![PathBuf::from("/Repo")]);
+    }
+
+    #[test]
+    fn events_from_differently_cased_covering_watch_use_registered_spelling() {
+        let (tx, _rx) = async_channel::unbounded();
+        let pending_path_events = Arc::new(Mutex::new(Vec::new()));
+        let root = SanitizedPath::new(Path::new("/Users/me/Project"));
+
+        // Reported with the spelling of a covering watch installed as `/users/me`.
+        push_notify_event(
+            &tx,
+            &pending_path_events,
+            root,
+            true,
+            root.as_path(),
+            &modify_event("/users/me/Project/.git/index"),
+        );
+
+        assert_eq!(
+            *pending_path_events.lock(),
+            vec![changed("/Users/me/Project/.git/index")]
+        );
     }
 
     #[test]
