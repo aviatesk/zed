@@ -392,6 +392,9 @@ actions!(
         ScrollOutputToPreviousMessage,
         /// Scroll the output to the next user message.
         ScrollOutputToNextMessage,
+        /// Toggles a searchable list of the user prompts in the current thread
+        /// for jumping between them.
+        TogglePromptOutline,
         /// Toggles in-thread search over the current agent thread's contents.
         ToggleSearch,
         /// Import agent threads from other Zed release channels (e.g. Preview, Nightly).

@@ -1,5 +1,6 @@
 use crate::{
     CycleResponseSpeed, DEFAULT_THREAD_TITLE, SelectPermissionGranularity,
+    conversation_view::prompt_outline::PromptOutlineDelegate,
     conversation_view::thread_search_bar::{ThreadSearchBar, ThreadSearchBarEvent},
     entry_view_state::TERMINAL_CONTENT_TOP_PADDING,
     open_abs_path_at_point, project_path_for_file_link,
@@ -22,6 +23,7 @@ use agent_settings::UserAgentsMd;
 use agent_skills::MAX_SKILL_DESCRIPTION_LEN;
 use cloud_api_types::{SubmitAgentThreadFeedbackBody, SubmitAgentThreadFeedbackCommentsBody};
 use editor::actions::OpenExcerpts;
+use picker::Picker;
 use sandbox::{SandboxFsPolicy, SandboxNetPolicy, SandboxPolicy};
 
 use crate::completion_provider::{AvailableSkill, PromptLocalCommand, pluralize};
@@ -931,6 +933,7 @@ pub struct ThreadView {
     dismissed_skill_loading_issues: HashSet<SkillLoadingIssue>,
     pub(crate) thread_search_bar: Option<Entity<super::thread_search_bar::ThreadSearchBar>>,
     pub(crate) thread_search_visible: bool,
+    prompt_outline_menu_handle: PopoverMenuHandle<Picker<PromptOutlineDelegate>>,
 }
 impl Focusable for ThreadView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -1470,6 +1473,7 @@ impl ThreadView {
             dismissed_skill_loading_issues: HashSet::default(),
             thread_search_bar: None,
             thread_search_visible: false,
+            prompt_outline_menu_handle: PopoverMenuHandle::default(),
         };
 
         this.sync_reported_activity(cx);
@@ -8755,20 +8759,7 @@ impl ThreadView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let thread = self.thread.read(cx);
-        let entries = thread.entries();
-        let current_ix = self.list_state.logical_scroll_top().item_ix;
-        if let Some(target_ix) = (0..current_ix).rev().find(|&i| {
-            entries
-                .get(i)
-                .is_some_and(|entry| thread.is_user_authored_scroll_target(entry))
-        }) {
-            self.list_state.scroll_to(ListOffset {
-                item_ix: target_ix,
-                offset_in_item: px(0.),
-            });
-            cx.notify();
-        }
+        self.scroll_to_previous_user_message(cx);
     }
 
     fn scroll_output_to_next_message(
@@ -8777,20 +8768,157 @@ impl ThreadView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.scroll_to_next_user_message(cx);
+    }
+
+    pub(crate) fn scroll_to_previous_user_message(&mut self, cx: &mut Context<Self>) {
+        let scroll_top = self.list_state.logical_scroll_top();
+        // A message whose start is scrolled out of view is revealed first rather
+        // than skipped, so going back never jumps past the message being read.
+        let search_end = if scroll_top.offset_in_item > px(0.) {
+            scroll_top.item_ix + 1
+        } else {
+            scroll_top.item_ix
+        };
         let thread = self.thread.read(cx);
         let entries = thread.entries();
-        let current_ix = self.list_state.logical_scroll_top().item_ix;
-        if let Some(target_ix) = (current_ix + 1..entries.len()).find(|&i| {
+        let target_ix = (0..search_end).rev().find(|&ix| {
             entries
-                .get(i)
+                .get(ix)
                 .is_some_and(|entry| thread.is_user_authored_scroll_target(entry))
-        }) {
-            self.list_state.scroll_to(ListOffset {
-                item_ix: target_ix,
-                offset_in_item: px(0.),
-            });
-            cx.notify();
+        });
+        if let Some(target_ix) = target_ix {
+            self.scroll_to_entry(target_ix, cx);
         }
+    }
+
+    pub(crate) fn scroll_to_next_user_message(&mut self, cx: &mut Context<Self>) {
+        let current_ix = self.list_state.logical_scroll_top().item_ix;
+        let thread = self.thread.read(cx);
+        let entries = thread.entries();
+        let target_ix = (current_ix + 1..entries.len()).find(|&ix| {
+            entries
+                .get(ix)
+                .is_some_and(|entry| thread.is_user_authored_scroll_target(entry))
+        });
+        if let Some(target_ix) = target_ix {
+            self.scroll_to_entry(target_ix, cx);
+        }
+    }
+
+    fn render_prompt_navigation(&self, cx: &Context<Self>) -> Option<impl IntoElement> {
+        let thread = self.thread.read(cx);
+        if !thread
+            .entries()
+            .iter()
+            .any(|entry| thread.is_user_authored_scroll_target(entry))
+        {
+            return None;
+        }
+
+        let thread_view = cx.weak_entity();
+        let prompt_outline = PopoverMenu::new("prompt-outline")
+            .with_handle(self.prompt_outline_menu_handle.clone())
+            .menu(move |window, cx| {
+                let thread_view = thread_view.upgrade()?;
+                let delegate = {
+                    let this = thread_view.read(cx);
+                    PromptOutlineDelegate::new(
+                        thread_view.downgrade(),
+                        this.thread.read(cx),
+                        this.list_state.logical_scroll_top().item_ix,
+                        cx,
+                    )
+                };
+                Some(cx.new(|cx| {
+                    Picker::uniform_list(delegate, window, cx)
+                        .popover()
+                        .show_scrollbar(true)
+                        .initial_width(rems(28.))
+                        .reopenable(false, cx)
+                }))
+            })
+            .trigger_with_tooltip(
+                IconButton::new("prompt-outline-trigger", IconName::ListTree)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted),
+                |_window, cx| Tooltip::for_action("Prompt Outline", &TogglePromptOutline, cx),
+            )
+            .anchor(gpui::Anchor::TopRight)
+            .attach(gpui::Anchor::TopLeft)
+            .offset(gpui::point(px(-6.), px(0.)));
+
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .right_3()
+                .flex()
+                .items_center()
+                .child(
+                    v_flex()
+                        .id("prompt-navigation")
+                        .p_0p5()
+                        .gap_0p5()
+                        .elevation_2(cx)
+                        // Blocking the mouse would also stop the conversation's hover
+                        // group from seeing the cursor and hide these controls, so only
+                        // keep clicks in the gaps from reaching the text underneath.
+                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        // Keep the controls up while the outline is open, since the
+                        // popover can leave the conversation's hover area.
+                        .when(!self.prompt_outline_menu_handle.is_deployed(), |this| {
+                            this.visible_on_hover(CONVERSATION_HOVER_GROUP)
+                        })
+                        .child(
+                            IconButton::new("previous-prompt", IconName::ChevronUp)
+                                .icon_size(IconSize::Small)
+                                .icon_color(Color::Muted)
+                                .tooltip(|_window, cx| {
+                                    Tooltip::for_action(
+                                        "Previous Prompt",
+                                        &ScrollOutputToPreviousMessage,
+                                        cx,
+                                    )
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.scroll_to_previous_user_message(cx);
+                                })),
+                        )
+                        .child(prompt_outline)
+                        .child(
+                            IconButton::new("next-prompt", IconName::ChevronDown)
+                                .icon_size(IconSize::Small)
+                                .icon_color(Color::Muted)
+                                .tooltip(|_window, cx| {
+                                    Tooltip::for_action(
+                                        "Next Prompt",
+                                        &ScrollOutputToNextMessage,
+                                        cx,
+                                    )
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.scroll_to_next_user_message(cx);
+                                })),
+                        )
+                        .child(
+                            IconButton::new("scroll-to-bottom", IconName::ArrowDown)
+                                .icon_size(IconSize::Small)
+                                .icon_color(Color::Muted)
+                                .tooltip(|_window, cx| {
+                                    Tooltip::for_action(
+                                        "Scroll to Bottom",
+                                        &ScrollOutputToBottom,
+                                        cx,
+                                    )
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.scroll_to_end(cx);
+                                })),
+                        ),
+                ),
+        )
     }
 
     fn refresh_thread_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -14346,6 +14474,8 @@ impl ThreadView {
     }
 }
 
+const CONVERSATION_HOVER_GROUP: &str = "thread-conversation";
+
 impl Render for ThreadView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Keep the message editor's local slash commands in sync with the
@@ -14357,6 +14487,7 @@ impl Render for ThreadView {
         let list_state = self.list_state.clone();
 
         let conversation = v_flex()
+            .group(CONVERSATION_HOVER_GROUP)
             .when(self.resumed_without_history, |this| {
                 this.child(Self::render_resume_notice(cx))
             })
@@ -14365,6 +14496,7 @@ impl Render for ThreadView {
                     this.flex_1()
                         .size_full()
                         .child(self.render_entries(cx))
+                        .children(self.render_prompt_navigation(cx))
                         .vertical_scrollbar_for(&list_state, window, cx)
                         .into_any()
                 } else {
@@ -14491,6 +14623,9 @@ impl Render for ThreadView {
             .on_action(cx.listener(Self::scroll_output_to_bottom))
             .on_action(cx.listener(Self::scroll_output_to_previous_message))
             .on_action(cx.listener(Self::scroll_output_to_next_message))
+            .on_action(cx.listener(|this, _: &TogglePromptOutline, window, cx| {
+                this.prompt_outline_menu_handle.toggle(window, cx);
+            }))
             .on_action(cx.listener(Self::toggle_search))
             .on_action(cx.listener(|this, _: &ToggleFastMode, window, cx| {
                 this.toggle_fast_mode(window, cx);

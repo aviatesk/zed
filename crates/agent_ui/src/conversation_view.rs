@@ -99,8 +99,8 @@ use crate::{
     ResetThreadToDefaults, SaveThreadAsDefaults, ScrollOutputLineDown, ScrollOutputLineUp,
     ScrollOutputPageDown, ScrollOutputPageUp, ScrollOutputToBottom, ScrollOutputToNextMessage,
     ScrollOutputToPreviousMessage, ScrollOutputToTop, SendImmediately, SendNextQueuedMessage,
-    ToggleFastMode, ToggleProfileSelector, ToggleSteerFirstQueuedMessage, ToggleThinkingEffortMenu,
-    ToggleThinkingMode, UndoLastReject,
+    ToggleFastMode, ToggleProfileSelector, TogglePromptOutline, ToggleSteerFirstQueuedMessage,
+    ToggleThinkingEffortMenu, ToggleThinkingMode, UndoLastReject,
 };
 
 const STOPWATCH_THRESHOLD: Duration = Duration::from_secs(30);
@@ -110,6 +110,7 @@ pub(crate) const DRAFT_PROMPT_PERSIST_DEBOUNCE: Duration = Duration::from_millis
 
 pub(crate) mod elicitation;
 mod message_queue;
+mod prompt_outline;
 mod subagent_card;
 mod thread_search_bar;
 mod thread_view;
@@ -12270,6 +12271,117 @@ pub(crate) mod tests {
             view.scroll_to_user_message_index(Some(2), cx);
             let scroll_top = view.list_state.logical_scroll_top();
             assert_eq!(scroll_top.item_ix, 2);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_prompt_navigation_and_outline(cx: &mut TestAppContext) {
+        use picker::{Picker, PickerDelegate as _};
+        use prompt_outline::PromptOutlineDelegate;
+
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread = conversation_view
+            .read_with(cx, |view, cx| {
+                view.active_thread().map(|r| r.read(cx).thread.clone())
+            })
+            .unwrap();
+
+        let prompts: [Vec<acp_v2::ContentBlock>; 3] = [
+            vec!["Review the PR".into()],
+            vec!["再度確認を頼む".into()],
+            vec![
+                "Resolve".into(),
+                acp_v2::ContentBlock::ResourceLink(acp_v2::ResourceLink::new(
+                    "main.rs",
+                    "file:///project/main.rs",
+                )),
+            ],
+        ];
+        for (ix, prompt) in prompts.into_iter().enumerate() {
+            connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+                acp_v1::ContentChunk::new(format!("Response {ix}").into()),
+            )]);
+            thread
+                .update(cx, |thread, cx| thread.send(prompt, cx))
+                .await
+                .unwrap();
+            cx.run_until_parked();
+        }
+
+        let thread_view = active_thread(&conversation_view, cx);
+        // Entries layout is: [User1, Assistant1, User2, Assistant2, User3, Assistant3]
+        thread_view.update(cx, |view, cx| {
+            view.scroll_to_top(cx);
+            view.scroll_to_next_user_message(cx);
+            assert_eq!(view.list_state.logical_scroll_top().item_ix, 2);
+            view.scroll_to_next_user_message(cx);
+            assert_eq!(view.list_state.logical_scroll_top().item_ix, 4);
+            view.scroll_to_next_user_message(cx);
+            assert_eq!(view.list_state.logical_scroll_top().item_ix, 4);
+
+            view.scroll_to_previous_user_message(cx);
+            assert_eq!(view.list_state.logical_scroll_top().item_ix, 2);
+
+            view.list_state.scroll_to(ListOffset {
+                item_ix: 2,
+                offset_in_item: px(4.),
+            });
+            view.scroll_to_previous_user_message(cx);
+            assert_eq!(
+                view.list_state.logical_scroll_top(),
+                ListOffset {
+                    item_ix: 2,
+                    offset_in_item: px(0.),
+                },
+                "going back from inside a prompt should reveal its start first"
+            );
+            view.scroll_to_previous_user_message(cx);
+            assert_eq!(view.list_state.logical_scroll_top().item_ix, 0);
+        });
+
+        let picker = cx.update(|window, cx| {
+            let delegate = {
+                let view = thread_view.read(cx);
+                PromptOutlineDelegate::new(thread_view.downgrade(), view.thread.read(cx), 3, cx)
+            };
+            cx.new(|cx| Picker::uniform_list(delegate, window, cx))
+        });
+        cx.run_until_parked();
+        picker.read_with(cx, |picker, _| {
+            assert_eq!(picker.delegate.match_count(), 3);
+            assert_eq!(
+                picker.delegate.selected_index(),
+                1,
+                "the prompt above the viewport should be selected"
+            );
+        });
+
+        let mut assert_query = |query: &str, expected_match_count: usize| {
+            picker.update_in(cx, |picker, window, cx| {
+                picker.update_matches(query.to_string(), window, cx);
+                assert_eq!(
+                    picker.delegate.match_count(),
+                    expected_match_count,
+                    "query: {query:?}"
+                );
+            });
+        };
+        assert_query("re", 2);
+        assert_query("確認", 1);
+        assert_query("@MAIN.rs", 1);
+        assert_query("missing", 0);
+        assert_query("", 3);
+
+        picker.update_in(cx, |picker, window, cx| {
+            picker.delegate.set_selected_index(2, window, cx);
+            picker.delegate.confirm(false, window, cx);
+        });
+        thread_view.read_with(cx, |view, _| {
+            assert_eq!(view.list_state.logical_scroll_top().item_ix, 4);
         });
     }
 
