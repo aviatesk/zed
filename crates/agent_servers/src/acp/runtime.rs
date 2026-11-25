@@ -213,6 +213,7 @@ mod tests {
             accepts_subagent_updates: false,
             project: WeakEntity::new_invalid(),
             code_action_store: Rc::new(RefCell::new(None)),
+            lsp_bridge_results: acp_thread::new_bridge_result_queue(),
         };
         let (mut runtime, shutdown) = ClientRuntime::new(context, &mut cx.to_async());
         let retained_sender = runtime.sender();

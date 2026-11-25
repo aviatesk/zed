@@ -92,8 +92,8 @@ pub struct AcpConnection {
     session_list: Option<Rc<AcpSessionList>>,
     debug_log: AcpDebugLog,
     _settings_subscription: Subscription,
-    lsp_bridge_url: Option<String>,
-    _lsp_bridge: Option<crate::lsp_mcp_bridge::LspMcpBridge>,
+    lsp_bridge: Option<crate::lsp_mcp_bridge::LspBridgeOffer>,
+    _lsp_bridge_server: Option<crate::lsp_mcp_bridge::LspMcpBridge>,
     bridge_result_queue: acp_thread::BridgeResultQueue,
     _runtime: runtime::ClientRuntime,
     dispatch_tx: mpsc::UnboundedSender<ForegroundWork>,
@@ -505,6 +505,23 @@ fn client_builder(
             on_request!(handle_create_elicitation),
             agent_client_protocol::on_receive_request!(),
         )
+        .on_receive_request(
+            {
+                let dispatch_sender = dispatch_sender.clone();
+                async move |request: acp::MessageMcpRequest,
+                            responder,
+                            connection: ConnectionTo<Agent>| {
+                    enqueue_request(
+                        &dispatch_sender,
+                        (request, connection),
+                        responder,
+                        handle_mcp_message,
+                    );
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
         // --- Notification handlers (agent→client) ---
         .on_receive_notification(
             on_notification!(handle_auth_status_update),
@@ -614,6 +631,7 @@ impl AcpConnection {
 
         let accepts_subagent_updates = client_capabilities.subagents.is_some();
         let auth_status = acp_beta.then(ConnectionAuthStatus::new);
+        let bridge_result_queue = acp_thread::new_bridge_result_queue();
         let dispatch_context = ClientContext {
             auth_status: auth_status.as_ref().map(Rc::downgrade).unwrap_or_default(),
             sessions: sessions.clone(),
@@ -624,6 +642,7 @@ impl AcpConnection {
             accepts_subagent_updates,
             project: project.downgrade(),
             code_action_store: Rc::new(RefCell::new(None)),
+            lsp_bridge_results: bridge_result_queue.clone(),
         };
         let (mut runtime, shutdown) = runtime::ClientRuntime::new(dispatch_context, cx);
         let dispatch_tx = runtime.sender();
@@ -761,24 +780,18 @@ impl AcpConnection {
 
         let auth_status = auth_status.filter(|_| response.agent_capabilities.auth.status.is_some());
 
-        // Failure to expose Zed's LSP tools must not prevent the agent from connecting.
-        let bridge_result_queue = acp_thread::new_bridge_result_queue();
-        let (lsp_bridge, lsp_bridge_url) = match cx.update(|cx| {
-            crate::lsp_mcp_bridge::LspMcpBridge::start(
+        let (lsp_bridge, lsp_bridge_server) = cx.update(|cx| {
+            crate::lsp_mcp_bridge::offer_lsp_bridge(
+                // v1 connections have always offered the HTTP bridge without checking
+                // whether the agent advertises HTTP servers.
+                true,
+                response.agent_capabilities.mcp_capabilities.acp,
+                &project,
                 dispatch_tx.clone(),
                 bridge_result_queue.clone(),
                 cx,
             )
-        }) {
-            Ok(bridge) => {
-                let url = bridge.url().to_string();
-                (Some(bridge), Some(url))
-            }
-            Err(error) => {
-                log::warn!("failed to start LSP MCP bridge: {error:#}");
-                (None, None)
-            }
-        };
+        });
 
         let result = Self {
             id: agent_id,
@@ -797,8 +810,8 @@ impl AcpConnection {
             session_list,
             debug_log,
             _settings_subscription: settings_subscription,
-            lsp_bridge_url,
-            _lsp_bridge: lsp_bridge,
+            lsp_bridge,
+            _lsp_bridge_server: lsp_bridge_server,
             bridge_result_queue,
             _runtime: runtime,
             dispatch_tx,
@@ -851,8 +864,8 @@ impl AcpConnection {
             session_list: None,
             debug_log: AcpDebugLog::default(),
             _settings_subscription: settings_subscription,
-            lsp_bridge_url: None,
-            _lsp_bridge: None,
+            lsp_bridge: None,
+            _lsp_bridge_server: None,
             bridge_result_queue: acp_thread::new_bridge_result_queue(),
             _runtime: runtime::ClientRuntime::from_test_tasks(
                 dispatch_tx.clone(),
@@ -1448,7 +1461,7 @@ impl AgentConnection for AcpConnection {
             Err(error) => return Task::ready(Err(error)),
         };
         let name = self.id.0.clone();
-        let mcp_servers = mcp_servers_for_project(&project, self.lsp_bridge_url.as_deref(), cx);
+        let mcp_servers = mcp_servers_for_project(&project, self.lsp_bridge.as_ref(), cx);
         let sends_initial_config_options = self.agent_supports_initial_config_options(cx);
 
         cx.spawn(async move |cx| {
@@ -1643,7 +1656,7 @@ impl AgentConnection for AcpConnection {
             ))));
         }
 
-        let mcp_servers = mcp_servers_for_project(&project, self.lsp_bridge_url.as_deref(), cx);
+        let mcp_servers = mcp_servers_for_project(&project, self.lsp_bridge.as_ref(), cx);
         self.open_or_create_session(
             session_id,
             project,
@@ -1687,7 +1700,7 @@ impl AgentConnection for AcpConnection {
             ))));
         }
 
-        let mcp_servers = mcp_servers_for_project(&project, self.lsp_bridge_url.as_deref(), cx);
+        let mcp_servers = mcp_servers_for_project(&project, self.lsp_bridge.as_ref(), cx);
         self.open_or_create_session(
             session_id,
             project,
@@ -1742,7 +1755,7 @@ impl AgentConnection for AcpConnection {
         };
         // The fork is opened with the same MCP servers right after this, so an agent that
         // starts the forked session can keep it running instead of restarting it.
-        let mcp_servers = mcp_servers_for_project(&project, self.lsp_bridge_url.as_deref(), cx);
+        let mcp_servers = mcp_servers_for_project(&project, self.lsp_bridge.as_ref(), cx);
         let request = directories.into_fork_session_request(session_id, mcp_servers);
         let connection = self.connection.clone();
         cx.foreground_executor().spawn(async move {
@@ -2499,6 +2512,7 @@ pub mod test_support {
             accepts_subagent_updates: false,
             project: project.downgrade(),
             code_action_store: Rc::new(RefCell::new(None)),
+            lsp_bridge_results: acp_thread::new_bridge_result_queue(),
         };
         let dispatch_task = cx.spawn({
             let mut dispatch_rx = dispatch_rx;
@@ -7411,6 +7425,55 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    async fn lsp_bridge_is_offered_as_an_acp_mcp_server(cx: &mut gpui::TestAppContext) {
+        let (_connection, project, _, _, _, _, _keep_agent_alive) =
+            connect_fake_agent(None, cx).await;
+        let servers = cx.update(|cx| {
+            mcp_servers_for_project(
+                &project,
+                Some(&crate::lsp_mcp_bridge::LspBridgeOffer::Acp),
+                cx,
+            )
+        });
+        assert_eq!(
+            servers,
+            vec![acp::McpServer::Acp(acp::McpServerAcp::new(
+                "zed-lsp-bridge",
+                "zed-lsp-bridge"
+            ))]
+        );
+    }
+
+    #[gpui::test]
+    async fn mcp_message_requests_are_served_by_the_lsp_bridge(cx: &mut gpui::TestAppContext) {
+        let (agent_sender, agent_received) = futures::channel::oneshot::channel();
+        let (_connection, _project, _, _, _, _, _keep_agent_alive) =
+            connect_fake_agent_with_handle(None, Some(agent_sender), cx).await;
+        let agent = agent_received.await.expect("fake agent handle");
+
+        let response = agent
+            .send_request(
+                acp::MessageMcpRequest::new("zed-lsp-bridge", "call", "tools/call").params(
+                    serde_json::Map::from_iter([
+                        (
+                            "name".to_string(),
+                            serde_json::json!("lsp_list_language_servers"),
+                        ),
+                        ("arguments".to_string(), serde_json::json!({})),
+                    ]),
+                ),
+            )
+            .block_task()
+            .await
+            .expect("tool call");
+        let acp::MessageMcpResponse::Result { result, .. } = response else {
+            panic!("tools/call should succeed, got {response:?}");
+        };
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(result["isError"], false);
+    }
+
     async fn connect_session_fork_test_agent(
         supports_fork: bool,
         fork_requests: Arc<std::sync::Mutex<Vec<acp::ForkSessionRequest>>>,
@@ -8266,6 +8329,7 @@ exit 7
             auth_status: Default::default(),
             project: project.downgrade(),
             code_action_store: Rc::new(RefCell::new(None)),
+            lsp_bridge_results: acp_thread::new_bridge_result_queue(),
         };
         // `TestAppContext::spawn` hands out an `AsyncApp` by value, whereas the
         // production path uses `Context::spawn` which hands out `&mut AsyncApp`.
@@ -8654,6 +8718,7 @@ exit 7
             accepts_subagent_updates: false,
             project: WeakEntity::new_invalid(),
             code_action_store: Rc::new(RefCell::new(None)),
+            lsp_bridge_results: acp_thread::new_bridge_result_queue(),
         };
         let (dispatch_tx, mut dispatch_rx) = mpsc::unbounded::<ForegroundWork>();
         let dispatch_task = cx.spawn(move |mut cx| async move {
@@ -8813,6 +8878,7 @@ exit 7
             accepts_subagent_updates,
             project: WeakEntity::new_invalid(),
             code_action_store: Rc::new(RefCell::new(None)),
+            lsp_bridge_results: acp_thread::new_bridge_result_queue(),
         };
         let parent_id = parent_session_id.0.to_string();
 
@@ -9043,6 +9109,7 @@ exit 7
             accepts_subagent_updates: false,
             project: WeakEntity::new_invalid(),
             code_action_store: Rc::new(RefCell::new(None)),
+            lsp_bridge_results: acp_thread::new_bridge_result_queue(),
         };
         let (sender, mut receiver) = mpsc::unbounded::<ForegroundWork>();
         let cleanup = settle_after_disconnect(sender.clone()).boxed().shared();
@@ -10437,7 +10504,7 @@ exit 7
 
 fn mcp_servers_for_project(
     project: &Entity<Project>,
-    lsp_bridge_url: Option<&str>,
+    lsp_bridge: Option<&crate::lsp_mcp_bridge::LspBridgeOffer>,
     cx: &App,
 ) -> Vec<acp::McpServer> {
     let mut servers: Vec<acp::McpServer> = mcp_configurations_for_project(project, cx)
@@ -10476,11 +10543,20 @@ fn mcp_servers_for_project(
         })
         .collect();
 
-    if let Some(url) = lsp_bridge_url {
-        servers.push(acp::McpServer::Http(acp::McpServerHttp::new(
-            crate::lsp_mcp_bridge::SERVER_NAME,
-            url.to_string(),
-        )));
+    match lsp_bridge {
+        Some(crate::lsp_mcp_bridge::LspBridgeOffer::Acp) => {
+            servers.push(acp::McpServer::Acp(acp::McpServerAcp::new(
+                crate::lsp_mcp_bridge::SERVER_NAME,
+                crate::lsp_mcp_bridge::ACP_SERVER_ID,
+            )));
+        }
+        Some(crate::lsp_mcp_bridge::LspBridgeOffer::Http { url }) => {
+            servers.push(acp::McpServer::Http(acp::McpServerHttp::new(
+                crate::lsp_mcp_bridge::SERVER_NAME,
+                url.clone(),
+            )));
+        }
+        None => {}
     }
 
     servers
@@ -10633,6 +10709,46 @@ fn permission_outcome_to_v1(
             ))
         }
     }
+}
+
+fn handle_mcp_message(
+    (request, connection): (acp::MessageMcpRequest, ConnectionTo<Agent>),
+    responder: Responder<acp::MessageMcpResponse>,
+    cx: &mut AsyncApp,
+    ctx: &ClientContext,
+) {
+    let server_id = request.server_id.clone();
+    let request_id = request.request_id.clone();
+    let notifier = connection.clone();
+    super::serve_lsp_bridge_mcp_message(
+        crate::lsp_mcp_bridge::AcpMcpMessage {
+            server_id: request.server_id.0.to_string(),
+            request_id: request.request_id.0.to_string(),
+            method: request.method,
+            params: request.params,
+        },
+        responder,
+        move |method, params| {
+            notifier.send_notification(
+                acp::MessageMcpNotification::new(server_id, request_id, method).params(params),
+            )
+        },
+        async move {
+            connection.terminated().await;
+        },
+        |outcome| match outcome {
+            Ok(result) => acp::MessageMcpResponse::success(result),
+            Err(error) => {
+                let mut mcp_error = acp::McpError::new(error.code, error.message);
+                if let Some(data) = error.data {
+                    mcp_error = mcp_error.data(data);
+                }
+                acp::MessageMcpResponse::error(mcp_error)
+            }
+        },
+        cx,
+        ctx,
+    );
 }
 
 fn handle_request_permission(

@@ -208,7 +208,7 @@ pub struct AcpV2Connection {
     pending_session_updates: Rc<RefCell<PendingSessionUpdates>>,
     session_owners: Rc<RefCell<HashMap<acp::SessionId, SessionOwner>>>,
     runtime: Rc<RefCell<Option<ConnectionRuntime>>>,
-    lsp_bridge_url: Option<String>,
+    lsp_bridge: Option<crate::lsp_mcp_bridge::LspBridgeOffer>,
     bridge_result_queue: acp_thread::BridgeResultQueue,
 }
 
@@ -218,7 +218,7 @@ struct ConnectionRuntime {
     _wait_task: Option<Task<()>>,
     _child: Option<transport::OwnedChild>,
     _quit_subscription: Option<gpui::Subscription>,
-    _lsp_bridge: Option<crate::lsp_mcp_bridge::LspMcpBridge>,
+    _lsp_bridge_server: Option<crate::lsp_mcp_bridge::LspMcpBridge>,
 }
 
 struct StdioStartup {
@@ -348,6 +348,7 @@ impl AcpV2Connection {
         let auth_status = cx
             .update(|cx| cx.has_flag::<AcpBetaFeatureFlag>())
             .then(ConnectionAuthStatus::new);
+        let bridge_result_queue = acp_thread::new_bridge_result_queue();
         let context = ClientContext {
             auth_status: auth_status.as_ref().map(Rc::downgrade).unwrap_or_default(),
             sessions: sessions.clone(),
@@ -356,8 +357,9 @@ impl AcpV2Connection {
             request_elicitations: request_elicitations.clone(),
             active_request_scopes: Some(RefCell::new(Default::default())),
             accepts_subagent_updates: true,
-            project,
+            project: project.clone(),
             code_action_store: Rc::new(RefCell::new(None)),
+            lsp_bridge_results: bridge_result_queue.clone(),
         };
         let (mut client_runtime, shutdown) = runtime::ClientRuntime::new(context, cx);
         let dispatch_tx = client_runtime.sender();
@@ -385,7 +387,7 @@ impl AcpV2Connection {
             _wait_task: None,
             _child: child,
             _quit_subscription: None,
-            _lsp_bridge: None,
+            _lsp_bridge_server: None,
         });
         let quit = cx.update(|cx| {
             cx.on_app_quit({
@@ -463,23 +465,30 @@ impl AcpV2Connection {
                 .is_some_and(|auth| auth.status.is_some())
         });
 
-        // Failure to expose Zed's LSP tools must not prevent the agent from connecting.
-        let bridge_result_queue = acp_thread::new_bridge_result_queue();
-        let lsp_bridge = cx
-            .update(|cx| {
-                crate::lsp_mcp_bridge::LspMcpBridge::start(
+        let mcp = initialize_response
+            .capabilities
+            .session
+            .as_ref()
+            .and_then(|session| session.mcp.as_ref());
+        let accepts_http_servers = mcp.is_some_and(|mcp| mcp.http.is_some());
+        let accepts_acp_servers = mcp.is_some_and(|mcp| mcp.acp.is_some());
+        let (lsp_bridge, lsp_bridge_server) = match project.upgrade() {
+            Some(project) => cx.update(|cx| {
+                crate::lsp_mcp_bridge::offer_lsp_bridge(
+                    accepts_http_servers,
+                    accepts_acp_servers,
+                    &project,
                     dispatch_tx.clone(),
                     bridge_result_queue.clone(),
                     cx,
                 )
-            })
-            .inspect_err(|error| log::warn!("failed to start LSP MCP bridge: {error:#}"))
-            .ok();
-        let lsp_bridge_url = lsp_bridge.as_ref().map(|bridge| bridge.url().to_string());
+            }),
+            None => (None, None),
+        };
         if let Some(runtime) = runtime.borrow_mut().as_mut() {
-            // The runtime owns the bridge so that shutting the connection down also
-            // stops serving its tools.
-            runtime._lsp_bridge = lsp_bridge;
+            // The runtime owns the bridge's server so that shutting the connection down
+            // also stops serving its tools.
+            runtime._lsp_bridge_server = lsp_bridge_server;
         }
 
         let result = Self {
@@ -496,7 +505,7 @@ impl AcpV2Connection {
             pending_session_updates,
             session_owners: Rc::new(RefCell::new(HashMap::default())),
             runtime,
-            lsp_bridge_url,
+            lsp_bridge,
             bridge_result_queue,
         };
         cx.update(|cx| result.refresh_auth_status(cx));
@@ -730,16 +739,25 @@ impl AcpV2Connection {
                 _ => {}
             }
         }
-        if let Some(url) = &self.lsp_bridge_url
-            && capabilities
-                .mcp
-                .as_ref()
-                .is_some_and(|mcp| mcp.http.is_some())
-        {
-            servers.push(acp::McpServer::Http(acp::McpServerHttp::new(
-                crate::lsp_mcp_bridge::SERVER_NAME,
-                url.clone(),
-            )));
+        match &self.lsp_bridge {
+            Some(crate::lsp_mcp_bridge::LspBridgeOffer::Acp) => {
+                servers.push(acp::McpServer::Acp(acp::McpServerAcp::new(
+                    crate::lsp_mcp_bridge::SERVER_NAME,
+                    crate::lsp_mcp_bridge::ACP_SERVER_ID,
+                )));
+            }
+            Some(crate::lsp_mcp_bridge::LspBridgeOffer::Http { url })
+                if capabilities
+                    .mcp
+                    .as_ref()
+                    .is_some_and(|mcp| mcp.http.is_some()) =>
+            {
+                servers.push(acp::McpServer::Http(acp::McpServerHttp::new(
+                    crate::lsp_mcp_bridge::SERVER_NAME,
+                    url.clone(),
+                )));
+            }
+            Some(crate::lsp_mcp_bridge::LspBridgeOffer::Http { .. }) | None => {}
         }
         Ok(SessionContext {
             cwd: cwd.into(),
@@ -2247,6 +2265,7 @@ mod tests {
         project: Entity<Project>,
         prompts: async_channel::Receiver<(acp::PromptRequest, Responder<acp::PromptResponse>)>,
         cancellations: async_channel::Receiver<acp::CancelSessionNotification>,
+        mcp_notifications: async_channel::Receiver<acp::MessageMcpNotification>,
         new_requests: async_channel::Receiver<(acp::NewSessionRequest, acp::RequestId)>,
         new_responses:
             async_channel::Sender<Result<acp::NewSessionResponse, agent_client_protocol::Error>>,
@@ -2323,6 +2342,7 @@ mod tests {
             let (resume_sender, resume_requests) = async_channel::unbounded();
             let (prompt_sender, prompts) = async_channel::unbounded();
             let (cancel_sender, cancellations) = async_channel::unbounded();
+            let (mcp_notification_sender, mcp_notifications) = async_channel::unbounded();
             let (sender, received) = futures::channel::oneshot::channel();
             let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
             let agent_task = cx.background_spawn(
@@ -2476,6 +2496,15 @@ mod tests {
                         },
                         agent_client_protocol::on_receive_notification!(),
                     )
+                    .on_receive_notification(
+                        async move |notification: acp::MessageMcpNotification, _| {
+                            mcp_notification_sender
+                                .try_send(notification)
+                                .expect("MCP notification receiver");
+                            Ok(())
+                        },
+                        agent_client_protocol::on_receive_notification!(),
+                    )
                     .connect_with(agent_transport, async move |agent| {
                         assert!(sender.send(agent).is_ok());
                         futures::future::pending::<Result<(), agent_client_protocol::Error>>().await
@@ -2501,6 +2530,7 @@ mod tests {
                 project,
                 prompts,
                 cancellations,
+                mcp_notifications,
                 new_requests,
                 new_responses,
                 new_replies,
@@ -7448,7 +7478,9 @@ done
             // The test executor can't start the bridge's server, so stand in its URL.
             Rc::get_mut(&mut harness.client)
                 .expect("no session holds the connection yet")
-                .lsp_bridge_url = Some(bridge_url.clone());
+                .lsp_bridge = Some(crate::lsp_mcp_bridge::LspBridgeOffer::Http {
+                url: bridge_url.clone(),
+            });
             let path_style = harness
                 .project
                 .read_with(cx, |project, cx| project.path_style(cx));
@@ -7511,6 +7543,156 @@ done
                 assert_eq!(call.kind(), &acp::ToolKind::Read);
             });
         }
+    }
+
+    #[gpui::test]
+    async fn v2_lsp_bridge_is_served_over_acp_to_agents_that_accept_it(cx: &mut TestAppContext) {
+        let harness = SessionHarness::new(
+            acp::AgentCapabilities::new().session(
+                acp::SessionCapabilities::new()
+                    .mcp(acp::McpCapabilities::new().acp(acp::McpAcpCapabilities::new())),
+            ),
+            Vec::new(),
+            Vec::new(),
+            cx,
+        )
+        .await;
+        let path_style = harness
+            .project
+            .read_with(cx, |project, cx| project.path_style(cx));
+        let context = harness
+            .client
+            .session_context(Vec::new(), &PathList::new(&[session_path("a")]), |path| {
+                path_style.is_absolute(path)
+            })
+            .expect("session context");
+        assert_eq!(
+            context.mcp_servers,
+            vec![acp::McpServer::Acp(acp::McpServerAcp::new(
+                "zed-lsp-bridge",
+                "zed-lsp-bridge"
+            ))]
+        );
+
+        let protocol_meta = |version: &str| {
+            serde_json::Map::from_iter([(
+                "_meta".to_string(),
+                json!({ "io.modelcontextprotocol/protocolVersion": version }),
+            )])
+        };
+        let request = |server_id: &str, request_id: &str, method: &str, version: &str| {
+            harness
+                .agent
+                .send_request(
+                    acp::MessageMcpRequest::new(
+                        server_id.to_string(),
+                        request_id.to_string(),
+                        method,
+                    )
+                    .params(protocol_meta(version)),
+                )
+                .block_task()
+        };
+
+        let discovery = bounded(
+            request("zed-lsp-bridge", "1", "server/discover", "2026-07-28"),
+            cx,
+        )
+        .await
+        .expect("discovery");
+        let acp::MessageMcpResponse::Result { result, .. } = discovery else {
+            panic!("discovery should succeed, got {discovery:?}");
+        };
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(result["supportedVersions"], json!(["2026-07-28"]));
+        assert_eq!(result["capabilities"], json!({ "tools": {} }));
+
+        let tools = bounded(
+            request("zed-lsp-bridge", "2", "tools/list", "2026-07-28"),
+            cx,
+        )
+        .await
+        .expect("tool list");
+        let acp::MessageMcpResponse::Result { result, .. } = tools else {
+            panic!("tools/list should succeed, got {tools:?}");
+        };
+        assert_eq!(result["resultType"], "complete");
+        let tool_names = result["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(tool_names.contains(&"read_buffer"), "{tool_names:?}");
+
+        let call = harness.agent.send_request(
+            acp::MessageMcpRequest::new("zed-lsp-bridge", "call", "tools/call").params(
+                serde_json::Map::from_iter([
+                    ("name".to_string(), json!("lsp_list_language_servers")),
+                    ("arguments".to_string(), json!({})),
+                    (
+                        "_meta".to_string(),
+                        json!({ "io.modelcontextprotocol/protocolVersion": "2026-07-28" }),
+                    ),
+                ]),
+            ),
+        );
+        let call = bounded(call.block_task(), cx).await.expect("tool call");
+        let acp::MessageMcpResponse::Result { result, .. } = call else {
+            panic!("tools/call should succeed, got {call:?}");
+        };
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(result["isError"], false);
+        assert!(
+            acp_thread::take_bridge_result_for_tool(
+                &harness.client.bridge_result_queue,
+                "lsp_list_language_servers"
+            )
+            .is_some(),
+            "the tool's result should reach the thread rewriter"
+        );
+
+        let outdated = bounded(
+            request("zed-lsp-bridge", "3", "tools/list", "2025-06-18"),
+            cx,
+        )
+        .await
+        .expect("an inner MCP error still answers the request");
+        let acp::MessageMcpResponse::Error { error, .. } = outdated else {
+            panic!("an unsupported MCP revision should fail, got {outdated:?}");
+        };
+        assert_eq!(error.code, -32022);
+
+        let unknown_server = bounded(
+            request("another-server", "4", "tools/list", "2026-07-28"),
+            cx,
+        )
+        .await
+        .expect_err("an undeclared server is a binding error");
+        assert_eq!(
+            unknown_server.code,
+            agent_client_protocol::ErrorCode::from(-33001)
+        );
+
+        let _subscription = request("zed-lsp-bridge", "5", "subscriptions/listen", "2026-07-28");
+        let acknowledgement = bounded(harness.mcp_notifications.recv(), cx)
+            .await
+            .expect("subscription acknowledgement");
+        assert_eq!(
+            acknowledgement,
+            acp::MessageMcpNotification::new(
+                "zed-lsp-bridge",
+                "5",
+                "notifications/subscriptions/acknowledged"
+            )
+            .params(serde_json::Map::from_iter([
+                (
+                    "_meta".to_string(),
+                    json!({ "io.modelcontextprotocol/subscriptionId": "5" })
+                ),
+                ("notifications".to_string(), json!({})),
+            ]))
+        );
     }
 
     #[gpui::test]

@@ -7,7 +7,10 @@
 //!    connection and serves the MCP protocol over plain HTTP JSON-RPC. The
 //!    listening URL is then injected into `NewSessionRequest.mcp_servers`
 //!    via `acp::McpServer::Http`, so the external agent treats Zed itself
-//!    as just another MCP server.
+//!    as just another MCP server. Agents that accept MCP over ACP get the
+//!    bridge as an `acp::McpServer::Acp` instead, and send its requests as
+//!    `mcp/message` over the ACP connection, which also reaches agents
+//!    running on a remote host.
 //!
 //! 2. Tool calls arriving on the HTTP server are turned into
 //!    `LspBridgeOp` work items and pushed onto the existing ACP
@@ -56,6 +59,18 @@ use tokio::net::TcpListener;
 use util::markdown::MarkdownCodeBlock;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
+/// MCP-over-ACP carries this MCP revision only.
+const ACP_PROTOCOL_VERSION: &str = "2026-07-28";
+const PROTOCOL_VERSION_META_KEY: &str = "io.modelcontextprotocol/protocolVersion";
+const SERVER_INFO_META_KEY: &str = "io.modelcontextprotocol/serverInfo";
+const SUBSCRIPTION_ID_META_KEY: &str = "io.modelcontextprotocol/subscriptionId";
+/// How long an agent may cache the bridge's discovery and tool list results. Neither
+/// changes while a connection lives.
+const ACP_RESULT_TTL_MS: u64 = 60 * 60 * 1000;
+pub(crate) const SUBSCRIPTIONS_LISTEN_METHOD: &str = "subscriptions/listen";
+/// The ID the bridge is declared under over ACP. A connection declares no other
+/// ACP-transport MCP server, so the ID doesn't need to vary.
+pub(crate) const ACP_SERVER_ID: &str = "zed-lsp-bridge";
 /// The name the bridge is offered to agents under, which also prefixes its tools'
 /// names (`mcp__zed-lsp-bridge__<tool>`).
 pub(crate) const SERVER_NAME: &str = "zed-lsp-bridge";
@@ -67,6 +82,49 @@ const SERVER_VERSION: &str = "0.1.0";
 pub struct LspMcpBridge {
     url: String,
     _server_task: Task<()>,
+}
+
+/// How a connection offers the bridge to its agent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LspBridgeOffer {
+    /// As an MCP server carried over the ACP connection itself.
+    Acp,
+    /// As an HTTP MCP server on this machine's loopback interface, which only an agent
+    /// running on this machine can reach.
+    Http { url: String },
+}
+
+/// Decides how a connection offers the bridge, starting its HTTP server if that's how.
+/// The returned server must be kept alive for as long as the connection offers it.
+pub(crate) fn offer_lsp_bridge(
+    agent_accepts_http_servers: bool,
+    agent_accepts_acp_servers: bool,
+    project: &Entity<Project>,
+    dispatch_tx: mpsc::UnboundedSender<crate::acp::ForegroundWork>,
+    result_queue: BridgeResultQueue,
+    cx: &mut App,
+) -> (Option<LspBridgeOffer>, Option<LspMcpBridge>) {
+    let acp_offer = agent_accepts_acp_servers.then_some(LspBridgeOffer::Acp);
+    // The agent of a remote project runs on the remote host, which can't reach this
+    // machine's loopback interface.
+    if !agent_accepts_http_servers || project.read(cx).is_via_remote_server() {
+        return (acp_offer, None);
+    }
+    // An agent on this machine still gets the bridge over HTTP: MCP over ACP carries only
+    // MCP 2026-07-28, which the agent's MCP client may not speak. Failure to expose
+    // Zed's LSP tools must not prevent the agent from connecting.
+    match LspMcpBridge::start(dispatch_tx, result_queue, cx) {
+        Ok(bridge) => {
+            let offer = LspBridgeOffer::Http {
+                url: bridge.url().to_string(),
+            };
+            (Some(offer), Some(bridge))
+        }
+        Err(error) => {
+            log::warn!("failed to start LSP MCP bridge: {error:#}");
+            (acp_offer, None)
+        }
+    }
 }
 
 impl LspMcpBridge {
@@ -184,9 +242,11 @@ async fn process_message(state: &BridgeState, message: Value) -> Option<Value> {
 }
 
 #[derive(Serialize)]
-struct JsonRpcError {
-    code: i32,
-    message: String,
+pub(crate) struct JsonRpcError {
+    pub(crate) code: i32,
+    pub(crate) message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) data: Option<Value>,
 }
 
 impl JsonRpcError {
@@ -194,20 +254,111 @@ impl JsonRpcError {
         Self {
             code: -32602,
             message: message.into(),
+            data: None,
         }
     }
     fn internal(message: impl Into<String>) -> Self {
         Self {
             code: -32603,
             message: message.into(),
+            data: None,
         }
     }
     fn method_not_found(message: impl Into<String>) -> Self {
         Self {
             code: -32601,
             message: message.into(),
+            data: None,
         }
     }
+    fn unsupported_protocol_version(requested: &str) -> Self {
+        Self {
+            code: -32022,
+            message: "Unsupported protocol version".to_string(),
+            data: Some(json!({
+                "supported": [ACP_PROTOCOL_VERSION],
+                "requested": requested,
+            })),
+        }
+    }
+}
+
+/// An MCP request that arrived over ACP as `mcp/message`.
+pub(crate) struct AcpMcpMessage {
+    pub(crate) server_id: String,
+    pub(crate) request_id: String,
+    pub(crate) method: String,
+    pub(crate) params: Option<serde_json::Map<String, Value>>,
+}
+
+/// Serves an MCP request that arrived over ACP, other than `subscriptions/listen`,
+/// which stays open and so needs its transport (see [`subscription_acknowledgement`]).
+pub(crate) async fn serve_acp_request(
+    message: AcpMcpMessage,
+    project: WeakEntity<Project>,
+    code_action_store: std::rc::Rc<std::cell::RefCell<Option<agent_lsp::PendingCodeActions>>>,
+    result_queue: BridgeResultQueue,
+    cx: &mut AsyncApp,
+) -> Result<Value, JsonRpcError> {
+    // Requests must name their MCP revision, but one that doesn't is served anyway: the
+    // ACP binding already fixes the revision.
+    if let Some(requested) = message
+        .params
+        .as_ref()
+        .and_then(|params| params.get("_meta"))
+        .and_then(|meta| meta.get(PROTOCOL_VERSION_META_KEY))
+        .and_then(Value::as_str)
+        && requested != ACP_PROTOCOL_VERSION
+    {
+        return Err(JsonRpcError::unsupported_protocol_version(requested));
+    }
+
+    match message.method.as_str() {
+        "server/discover" => Ok(json!({
+            "resultType": "complete",
+            "supportedVersions": [ACP_PROTOCOL_VERSION],
+            "capabilities": { "tools": {} },
+            "ttlMs": ACP_RESULT_TTL_MS,
+            "cacheScope": "private",
+            "_meta": {
+                SERVER_INFO_META_KEY: { "name": SERVER_NAME, "version": SERVER_VERSION },
+            },
+        })),
+        "tools/list" => Ok(json!({
+            "resultType": "complete",
+            "tools": tool_definitions(),
+            "ttlMs": ACP_RESULT_TTL_MS,
+            "cacheScope": "private",
+        })),
+        "tools/call" => {
+            let params = Value::Object(message.params.unwrap_or_default());
+            let (name, op) = tool_call_op(params)?;
+            let output = execute_op(project, code_action_store, op, cx).await;
+            let mut result = tool_call_result(&name, output, &result_queue);
+            if let Some(result) = result.as_object_mut() {
+                result.insert("resultType".to_string(), json!("complete"));
+            }
+            Ok(result)
+        }
+        other => Err(JsonRpcError::method_not_found(format!(
+            "method not supported: {other}"
+        ))),
+    }
+}
+
+/// The notification that must open a `subscriptions/listen` stream. The bridge offers
+/// no notifications, so it agrees to none and only holds the stream open afterwards.
+pub(crate) fn subscription_acknowledgement(
+    request_id: &str,
+) -> (&'static str, serde_json::Map<String, Value>) {
+    let params = serde_json::Map::from_iter([
+        (
+            "_meta".to_string(),
+            json!({ SUBSCRIPTION_ID_META_KEY: request_id }),
+        ),
+        ("notifications".to_string(), json!({})),
+    ]);
+    ("notifications/subscriptions/acknowledged", params)
 }
 
 fn tool_definitions() -> Vec<Value> {
@@ -507,11 +658,7 @@ pub(crate) struct BridgeDiff {
 }
 
 async fn handle_tools_call(state: &BridgeState, params: Value) -> Result<Value, JsonRpcError> {
-    let ToolsCallParams { name, arguments } = serde_json::from_value(params)
-        .map_err(|err| JsonRpcError::invalid_params(format!("invalid tools/call params: {err}")))?;
-
-    let kind_hint = kind_for_tool(&name);
-    let op = build_op(&name, arguments)?;
+    let (name, op) = tool_call_op(params)?;
     let (reply_tx, reply_rx) = oneshot::channel::<Result<ToolOutput, String>>();
 
     state
@@ -526,9 +673,26 @@ async fn handle_tools_call(state: &BridgeState, params: Value) -> Result<Value, 
         .await
         .map_err(|_| JsonRpcError::internal("foreground dispatch dropped reply"))?;
 
+    Ok(tool_call_result(&name, result, &state.result_queue))
+}
+
+fn tool_call_op(params: Value) -> Result<(String, LspBridgeOp), JsonRpcError> {
+    let ToolsCallParams { name, arguments } = serde_json::from_value(params)
+        .map_err(|err| JsonRpcError::invalid_params(format!("invalid tools/call params: {err}")))?;
+    let op = build_op(&name, arguments)?;
+    Ok((name, op))
+}
+
+/// Publishes a tool's result to the thread rewriter and returns the MCP result that
+/// the agent sees.
+fn tool_call_result(
+    name: &str,
+    result: Result<ToolOutput, String>,
+    result_queue: &BridgeResultQueue,
+) -> Value {
     let output = match result {
         Ok(output) => output,
-        Err(err) => return Ok(error_content(err)),
+        Err(err) => return error_content(err),
     };
 
     let (text, extra_meta) = match output {
@@ -544,7 +708,7 @@ async fn handle_tools_call(state: &BridgeState, params: Value) -> Result<Value, 
     // `BridgeResultQueue`.
     let mut payload = serde_json::Map::new();
     payload.insert("version".to_string(), json!(1));
-    payload.insert("kind".to_string(), json!(kind_hint));
+    payload.insert("kind".to_string(), json!(kind_for_tool(name)));
     payload.insert("tool".to_string(), json!(name));
     if name == "read_buffer" {
         payload.insert("text".to_string(), json!(text));
@@ -557,17 +721,17 @@ async fn handle_tools_call(state: &BridgeState, params: Value) -> Result<Value, 
         }
     }
     enqueue_bridge_result(
-        &state.result_queue,
+        result_queue,
         BridgeResultEntry {
-            tool: name.clone(),
+            tool: name.to_string(),
             payload: serde_json::Value::Object(payload),
         },
     );
 
-    Ok(json!({
+    json!({
         "content": [{ "type": "text", "text": text }],
         "isError": false,
-    }))
+    })
 }
 
 /// Map a bridge tool name to the `acp::ToolKind` Zed should display it as.
@@ -1304,5 +1468,44 @@ fn expand_tilde(file_path: &str) -> std::path::PathBuf {
         util::paths::home_dir().clone()
     } else {
         std::path::PathBuf::from(file_path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    #[gpui::test]
+    async fn local_agents_get_the_bridge_over_acp_when_http_is_unavailable(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+        });
+        let fs = fs::FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+
+        // Without a Tokio runtime, the test executor can't start the HTTP server.
+        for (accepts_http, accepts_acp, expected) in [
+            (true, true, Some(LspBridgeOffer::Acp)),
+            (true, false, None),
+            (false, true, Some(LspBridgeOffer::Acp)),
+            (false, false, None),
+        ] {
+            let (offer, server) = cx.update(|cx| {
+                offer_lsp_bridge(
+                    accepts_http,
+                    accepts_acp,
+                    &project,
+                    mpsc::unbounded().0,
+                    acp_thread::new_bridge_result_queue(),
+                    cx,
+                )
+            });
+            assert_eq!(offer, expected, "http: {accepts_http}, acp: {accepts_acp}");
+            assert!(server.is_none());
+        }
     }
 }

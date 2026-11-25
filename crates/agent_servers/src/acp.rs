@@ -49,6 +49,8 @@ use thiserror::Error;
 use util::ResultExt as _;
 use util::path_list::PathList;
 
+use crate::lsp_mcp_bridge;
+
 const EXIT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 fn mcp_configurations_for_project(
@@ -277,6 +279,8 @@ pub(crate) struct ClientContext {
     accepts_subagent_updates: bool,
     pub(crate) project: WeakEntity<Project>,
     pub(crate) code_action_store: Rc<RefCell<Option<agent_lsp::PendingCodeActions>>>,
+    /// Where the LSP bridge publishes the results of tools it serves over ACP.
+    pub(crate) lsp_bridge_results: acp_thread::BridgeResultQueue,
 }
 
 fn dispatch_queue_closed_error() -> agent_client_protocol::Error {
@@ -731,6 +735,23 @@ fn with_v2_client_ingress<Handler: HandleDispatchFrom<Agent>>(
             },
             agent_client_protocol::on_receive_notification!(),
         )
+        .on_receive_request(
+            {
+                let dispatch_sender = dispatch_sender.clone();
+                async move |request: acp_v2::MessageMcpRequest,
+                            responder,
+                            connection: V2ConnectionTo<Agent>| {
+                    enqueue_request(
+                        &dispatch_sender,
+                        (request, connection),
+                        responder,
+                        handle_v2_mcp_message,
+                    );
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
 }
 
 fn terminal_auth_task_id(agent_id: &AgentId, method_id: &acp_v2::AuthMethodId) -> String {
@@ -1099,6 +1120,114 @@ fn respond_result<T: JsonRpcResponse, P: Protocol>(
         }
         Err(err) => respond_err(responder, err),
     }
+}
+
+/// The ACP binding error for an `mcp/message` naming a server that isn't declared.
+const MCP_SERVER_UNAVAILABLE: i32 = -33001;
+
+/// Serves an `mcp/message` request for Zed's LSP bridge, the only MCP server Zed declares
+/// over ACP. v1 and v2 differ only in the types that carry the request.
+fn serve_lsp_bridge_mcp_message<Response, P>(
+    message: lsp_mcp_bridge::AcpMcpMessage,
+    responder: Responder<Response, P>,
+    send_notification: impl FnOnce(
+        &'static str,
+        serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), agent_client_protocol::Error>,
+    connection_terminated: impl Future<Output = ()> + 'static,
+    into_response: fn(Result<serde_json::Value, lsp_mcp_bridge::JsonRpcError>) -> Response,
+    cx: &mut AsyncApp,
+    ctx: &ClientContext,
+) where
+    Response: JsonRpcResponse + Send + 'static,
+    P: Protocol,
+{
+    if message.server_id != lsp_mcp_bridge::ACP_SERVER_ID {
+        return respond_err(
+            responder,
+            agent_client_protocol::Error::new(
+                MCP_SERVER_UNAVAILABLE,
+                format!("Zed declares no MCP server `{}`", message.server_id),
+            ),
+        );
+    }
+    if message.method == lsp_mcp_bridge::SUBSCRIPTIONS_LISTEN_METHOD {
+        let (method, params) = lsp_mcp_bridge::subscription_acknowledgement(&message.request_id);
+        if let Err(error) = send_notification(method, params) {
+            return respond_err(responder, error);
+        }
+        // The subscription stays open until the agent cancels it or the connection ends.
+        cx.spawn(async move |_| {
+            let cancellation = responder.cancellation();
+            futures::pin_mut!(connection_terminated);
+            if let futures::future::Either::Left(_) =
+                futures::future::select(Box::pin(cancellation.cancelled()), connection_terminated)
+                    .await
+            {
+                responder
+                    .respond_with_error(agent_client_protocol::Error::request_cancelled())
+                    .log_err();
+            }
+        })
+        .detach();
+        return;
+    }
+
+    let project = ctx.project.clone();
+    let code_action_store = ctx.code_action_store.clone();
+    let result_queue = ctx.lsp_bridge_results.clone();
+    cx.spawn(async move |cx| {
+        let outcome = lsp_mcp_bridge::serve_acp_request(
+            message,
+            project,
+            code_action_store,
+            result_queue,
+            cx,
+        )
+        .await;
+        respond_result(responder, Ok(into_response(outcome)));
+    })
+    .detach();
+}
+
+fn handle_v2_mcp_message(
+    (request, connection): (acp_v2::MessageMcpRequest, V2ConnectionTo<Agent>),
+    responder: V2Responder<acp_v2::MessageMcpResponse>,
+    cx: &mut AsyncApp,
+    ctx: &ClientContext,
+) {
+    let server_id = request.server_id.clone();
+    let request_id = request.request_id.clone();
+    let notifier = connection.clone();
+    serve_lsp_bridge_mcp_message(
+        lsp_mcp_bridge::AcpMcpMessage {
+            server_id: request.server_id.0.to_string(),
+            request_id: request.request_id.0.to_string(),
+            method: request.method,
+            params: request.params,
+        },
+        responder,
+        move |method, params| {
+            notifier.send_notification(
+                acp_v2::MessageMcpNotification::new(server_id, request_id, method).params(params),
+            )
+        },
+        async move {
+            connection.terminated().await;
+        },
+        |outcome| match outcome {
+            Ok(result) => acp_v2::MessageMcpResponse::success(result),
+            Err(error) => {
+                let mut mcp_error = acp_v2::McpError::new(error.code, error.message);
+                if let Some(data) = error.data {
+                    mcp_error = mcp_error.data(data);
+                }
+                acp_v2::MessageMcpResponse::error(mcp_error)
+            }
+        },
+        cx,
+        ctx,
+    );
 }
 
 fn handle_v2_request_permission(
