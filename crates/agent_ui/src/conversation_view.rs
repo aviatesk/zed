@@ -12388,6 +12388,15 @@ pub(crate) mod tests {
         thread_view.read_with(cx, |view, _| {
             assert_eq!(view.list_state.logical_scroll_top().item_ix, 4);
         });
+
+        // The agent announced no fork cursors, so asking to fork goes to the prompt instead.
+        picker.update_in(cx, |picker, window, cx| {
+            picker.delegate.set_selected_index(1, window, cx);
+            picker.delegate.confirm(true, window, cx);
+        });
+        thread_view.read_with(cx, |view, _| {
+            assert_eq!(view.list_state.logical_scroll_top().item_ix, 2);
+        });
     }
 
     #[gpui::test]

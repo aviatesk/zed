@@ -5869,6 +5869,7 @@ async fn test_fork_thread_activates_fork_next_to_source(cx: &mut TestAppContext)
         connection.take_fork_session_calls(),
         vec![(
             source_session_id.clone(),
+            None,
             PathList::new(&[Path::new("/my-project")])
         )]
     );

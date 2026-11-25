@@ -1361,9 +1361,11 @@ impl SessionDirectories {
     fn into_fork_session_request(
         self,
         session_id: acp_v2::SessionId,
+        cursor: Option<acp_v2::CursorId>,
         mcp_servers: Vec<acp::McpServer>,
     ) -> acp::ForkSessionRequest {
         acp::ForkSessionRequest::new(acp::SessionId::new(session_id.0), self.cwd)
+            .cursor_id(cursor.map(|cursor| acp::CursorId::new(cursor.0)))
             .additional_directories(self.additional_directories)
             .mcp_servers(mcp_servers)
     }
@@ -1732,6 +1734,7 @@ impl AgentConnection for AcpConnection {
     fn fork_session(
         self: Rc<Self>,
         session_id: acp_v2::SessionId,
+        cursor: Option<acp_v2::CursorId>,
         project: Entity<Project>,
         work_dirs: PathList,
         cx: &mut App,
@@ -1756,7 +1759,7 @@ impl AgentConnection for AcpConnection {
         // The fork is opened with the same MCP servers right after this, so an agent that
         // starts the forked session can keep it running instead of restarting it.
         let mcp_servers = mcp_servers_for_project(&project, self.lsp_bridge.as_ref(), cx);
-        let request = directories.into_fork_session_request(session_id, mcp_servers);
+        let request = directories.into_fork_session_request(session_id, cursor, mcp_servers);
         let connection = self.connection.clone();
         cx.foreground_executor().spawn(async move {
             let response = connection
@@ -7572,6 +7575,7 @@ mod tests {
             .update(|cx| {
                 connection.clone().fork_session(
                     acp_v2::SessionId::new("source-session"),
+                    None,
                     project.clone(),
                     work_dirs,
                     cx,
@@ -7604,6 +7608,7 @@ mod tests {
             .update(|cx| {
                 connection.clone().fork_session(
                     acp_v2::SessionId::new("source-session"),
+                    None,
                     project.clone(),
                     work_dirs,
                     cx,

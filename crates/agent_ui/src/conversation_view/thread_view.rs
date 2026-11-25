@@ -7792,6 +7792,13 @@ impl ThreadView {
                     .iter()
                     .all(acp_thread::content::can_convert_to_v1);
                 let is_editable = can_rewind && source_is_representable;
+                let can_fork_before = !is_subagent
+                    && self
+                        .thread
+                        .read(cx)
+                        .fork_cursor_before_entry(entry_ix)
+                        .is_some();
+                let hover_group = SharedString::from(format!("user-message-{entry_ix}"));
                 let agent_name = if is_subagent {
                     "subagents".into()
                 } else {
@@ -7814,6 +7821,7 @@ impl ThreadView {
                     .child(
                         div()
                             .relative()
+                            .group(hover_group.clone())
                             .child(
                                 div()
                                     .py_3()
@@ -7860,6 +7868,9 @@ impl ThreadView {
                                     .bg(cx.theme().colors().editor_background)
                                     .overflow_hidden();
 
+                                let base_container = base_container.when(can_fork_before, |this| {
+                                    this.child(Self::render_fork_before_prompt_button(entry_ix, cx))
+                                });
                                 let is_loading_contents = self.is_loading_contents;
                                 if is_editable {
                                     this.child(
@@ -7929,6 +7940,20 @@ impl ThreadView {
                                                 }))),
                                     )
                                 }
+                            })
+                            .when(!editor_focus && can_fork_before, |this| {
+                                this.child(
+                                    h_flex()
+                                        .absolute()
+                                        .top_neg_3p5()
+                                        .right_3()
+                                        .rounded_sm()
+                                        .border_1()
+                                        .border_color(cx.theme().colors().border)
+                                        .bg(cx.theme().colors().editor_background)
+                                        .visible_on_hover(hover_group)
+                                        .child(Self::render_fork_before_prompt_button(entry_ix, cx)),
+                                )
                             }),
                     )
                     .into_any()
@@ -8669,6 +8694,55 @@ impl ThreadView {
             offset_in_item: px(0.),
         });
         cx.notify();
+    }
+
+    fn render_fork_before_prompt_button(entry_ix: usize, cx: &Context<Self>) -> IconButton {
+        IconButton::new(("fork-before-prompt", entry_ix), IconName::GitBranch)
+            .icon_size(IconSize::XSmall)
+            .icon_color(Color::Muted)
+            .tooltip(Tooltip::text(
+                "Fork the thread before this prompt, with the prompt ready to edit and send again",
+            ))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.fork_before_entry(entry_ix, window, cx);
+            }))
+    }
+
+    /// Forks the thread before the prompt at `entry_ix`, if the agent accepts forking
+    /// there, and opens the fork with that prompt ready to edit and send again.
+    pub(crate) fn fork_before_entry(
+        &mut self,
+        entry_ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let thread = self.thread.read(cx);
+        let Some(cursor) = thread.fork_cursor_before_entry(entry_ix).cloned() else {
+            return;
+        };
+        let Some(AgentThreadEntry::UserMessage(message)) = thread.entries().get(entry_ix) else {
+            return;
+        };
+        let prompt = message.content.source_blocks().to_vec();
+        let session_id = thread.session_id().clone();
+        let Some(source_thread_id) = ThreadMetadataStore::try_global(cx).and_then(|store| {
+            store
+                .read(cx)
+                .entry_by_session(&session_id)
+                .map(|metadata| metadata.thread_id)
+        }) else {
+            return;
+        };
+        let Some(panel) = self
+            .workspace
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).panel::<AgentPanel>(cx))
+        else {
+            return;
+        };
+        panel.update(cx, |panel, cx| {
+            panel.fork_thread_before_prompt(source_thread_id, cursor, prompt, window, cx);
+        });
     }
 
     fn handle_feedback_click(

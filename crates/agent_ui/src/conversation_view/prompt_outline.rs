@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use acp_thread::{AcpThread, AgentThreadEntry, MentionUri};
 use agent_client_protocol::v2::schema as acp_v2;
-use gpui::{App, DismissEvent, Task, WeakEntity};
+use gpui::{Action as _, AnyElement, App, DismissEvent, Task, WeakEntity};
 use picker::{Picker, PickerDelegate};
-use ui::{HighlightedLabel, ListItem, ListItemSpacing, prelude::*};
+use ui::{HighlightedLabel, KeyBinding, ListItem, ListItemSpacing, Tooltip, prelude::*};
 use util::{ResultExt as _, paths::PathStyle};
 
 use super::thread_view::ThreadView;
@@ -18,6 +18,8 @@ struct PromptOutlineItem {
     text: String,
     label: SharedString,
     label_prefix_len: usize,
+    /// Whether the agent accepts forking the thread before this prompt.
+    can_fork: bool,
 }
 
 struct PromptOutlineMatch {
@@ -62,6 +64,7 @@ impl PromptOutlineDelegate {
                     text,
                     label,
                     label_prefix_len,
+                    can_fork: thread.fork_cursor_before_entry(entry_ix).is_some(),
                 }
             })
             .collect();
@@ -76,6 +79,12 @@ impl PromptOutlineDelegate {
             matches: Vec::new(),
             selected_index: 0,
         }
+    }
+
+    fn selected_item(&self) -> Option<&PromptOutlineItem> {
+        self.matches
+            .get(self.selected_index)
+            .and_then(|prompt_match| self.items.get(prompt_match.item_ix))
     }
 }
 
@@ -145,18 +154,19 @@ impl PickerDelegate for PromptOutlineDelegate {
         Task::ready(())
     }
 
-    fn confirm(&mut self, _secondary: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
-        let Some(item) = self
-            .matches
-            .get(self.selected_index)
-            .and_then(|prompt_match| self.items.get(prompt_match.item_ix))
-        else {
+    fn confirm(&mut self, secondary: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
+        let Some(item) = self.selected_item() else {
             return;
         };
         let entry_ix = item.entry_ix;
+        let fork = secondary && item.can_fork;
         self.thread_view
             .update(cx, |thread_view, cx| {
-                thread_view.scroll_to_entry(entry_ix, cx)
+                if fork {
+                    thread_view.fork_before_entry(entry_ix, window, cx);
+                } else {
+                    thread_view.scroll_to_entry(entry_ix, cx);
+                }
             })
             .log_err();
         self.dismissed(window, cx);
@@ -164,6 +174,41 @@ impl PickerDelegate for PromptOutlineDelegate {
 
     fn dismissed(&mut self, _window: &mut Window, cx: &mut Context<Picker<Self>>) {
         cx.emit(DismissEvent);
+    }
+
+    fn render_footer(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) -> Option<AnyElement> {
+        if !self.items.iter().any(|item| item.can_fork) {
+            return None;
+        }
+        let selected_can_fork = self.selected_item().is_some_and(|item| item.can_fork);
+        Some(
+            h_flex()
+                .w_full()
+                .p_1p5()
+                .justify_end()
+                .border_t_1()
+                .border_color(cx.theme().colors().border_variant)
+                .child(
+                    Button::new("fork-before-prompt", "Fork Before Prompt")
+                        .disabled(!selected_can_fork)
+                        .key_binding(
+                            KeyBinding::for_action(&menu::SecondaryConfirm, cx)
+                                .map(|key_binding| key_binding.size(rems_from_px(12_f32))),
+                        )
+                        .tooltip(Tooltip::text(
+                            "Start a new thread with the history before this prompt, \
+                             and the prompt ready to edit and send again",
+                        ))
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(menu::SecondaryConfirm.boxed_clone(), cx)
+                        }),
+                )
+                .into_any(),
+        )
     }
 
     fn render_match(

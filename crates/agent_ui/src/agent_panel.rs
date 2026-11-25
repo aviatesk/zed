@@ -1745,12 +1745,13 @@ impl AgentPanel {
         &self.connection_store
     }
 
-    /// Forks a thread into a new one that shares its history, connecting to its agent
-    /// first if necessary. The fork is recorded in the thread metadata store but not
-    /// opened. A failed fork is also reported to the user.
+    /// Forks a thread into a new one that shares its history, or only the history before
+    /// `cursor`, connecting to its agent first if necessary. The fork is recorded in the
+    /// thread metadata store but not opened. A failed fork is also reported to the user.
     pub fn fork_thread(
         &mut self,
         source_thread_id: ThreadId,
+        cursor: Option<acp_v2::CursorId>,
         cx: &mut Context<Self>,
     ) -> Task<Result<ThreadMetadata>> {
         let Some(source) = ThreadMetadataStore::global(cx)
@@ -1781,6 +1782,7 @@ impl AgentPanel {
                     .update(|cx| {
                         connected.connection.clone().fork_session(
                             session_id,
+                            cursor,
                             project,
                             source.folder_paths().clone(),
                             cx,
@@ -1829,15 +1831,44 @@ impl AgentPanel {
         let Some(thread_id) = self.active_thread_id(cx) else {
             return;
         };
-        let fork_task = self.fork_thread(thread_id, cx);
+        let fork_task = self.fork_thread(thread_id, None, cx);
+        self.open_fork(fork_task, None, window, cx);
+    }
+
+    /// Forks a thread at the cursor before one of its prompts, and opens the fork with that
+    /// prompt in its message editor, to edit and send again.
+    pub(crate) fn fork_thread_before_prompt(
+        &mut self,
+        source_thread_id: ThreadId,
+        cursor: acp_v2::CursorId,
+        prompt: Vec<acp_v2::ContentBlock>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let fork_task = self.fork_thread(source_thread_id, Some(cursor), cx);
+        let initial_content = AgentInitialContent::ContentBlock {
+            blocks: prompt,
+            auto_submit: false,
+        };
+        self.open_fork(fork_task, Some(initial_content), window, cx);
+    }
+
+    fn open_fork(
+        &mut self,
+        fork_task: Task<Result<ThreadMetadata>>,
+        initial_content: Option<AgentInitialContent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         cx.spawn_in(window, async move |this, cx| {
             let fork = fork_task.await?;
             this.update_in(cx, |this, window, cx| {
-                this.load_agent_thread(
-                    Agent::from(fork.agent_id.clone()),
-                    fork.thread_id,
+                this.external_thread(
+                    Some(Agent::from(fork.agent_id.clone())),
+                    Some(fork.thread_id),
                     Some(fork.folder_paths().clone()),
                     fork.title.clone(),
+                    initial_content,
                     true,
                     AgentThreadSource::AgentPanel,
                     window,
@@ -9079,6 +9110,7 @@ mod tests {
             connection.take_fork_session_calls(),
             vec![(
                 source_session_id.clone(),
+                None,
                 PathList::new(&[Path::new("/project")])
             )]
         );
@@ -9116,6 +9148,74 @@ mod tests {
                 .is_some_and(|thread| matches!(thread.read(cx).status(), ThreadStatus::Generating))
         });
         assert!(source_is_generating, "the source should keep running");
+    }
+
+    #[gpui::test]
+    async fn test_fork_before_prompt_opens_fork_with_the_prompt_to_edit(cx: &mut TestAppContext) {
+        // The thread view reaches the panel through the workspace.
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        let connection = StubAgentConnection::new()
+            .with_supports_load_session(true)
+            .with_supports_fork_session(true)
+            .with_agent_id("forkable-stub".into())
+            .with_telemetry_id("forkable-stub".into());
+        let (source_session_id, source_thread_id) =
+            open_generating_thread_with_loadable_connection(&panel, &connection, &mut cx);
+        let thread = panel.read_with(&cx, |panel, cx| {
+            panel.active_agent_thread(cx).expect("active thread")
+        });
+        thread.update(&mut cx, |thread, cx| {
+            thread
+                .upsert_user_message(
+                    acp_v2::UserMessage::new("prompt-2")
+                        .content(vec!["Try another approach".into()]),
+                    cx,
+                )
+                .expect("user message");
+            thread.apply_cursor_update(
+                acp_v2::CursorUpdate::new("before:prompt-2")
+                    .anchor(acp_v2::CursorAnchor::UserMessage(
+                        acp_v2::CursorMessageAnchor::new(
+                            "prompt-2",
+                            acp_v2::CursorAnchorPosition::Before,
+                        ),
+                    ))
+                    .capabilities(
+                        acp_v2::CursorCapabilities::new()
+                            .fork(acp_v2::CursorForkCapabilities::new()),
+                    ),
+                cx,
+            );
+        });
+        let prompt_ix = thread.read_with(&cx, |thread, _| thread.entries().len() - 1);
+
+        let thread_view = panel.read_with(&cx, |panel, cx| {
+            panel.active_thread_view(cx).expect("active thread view")
+        });
+        thread_view.update_in(&mut cx, |thread_view, window, cx| {
+            thread_view.fork_before_entry(prompt_ix, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            connection.take_fork_session_calls(),
+            vec![(
+                source_session_id,
+                Some(acp_v2::CursorId::new("before:prompt-2")),
+                PathList::new(&[Path::new("/project")])
+            )]
+        );
+        assert_ne!(active_thread_id(&panel, &cx), source_thread_id);
+        let prompt = panel.read_with(&cx, |panel, cx| {
+            panel
+                .active_thread_view(cx)
+                .expect("the fork's thread view")
+                .read(cx)
+                .message_editor
+                .read(cx)
+                .text(cx)
+        });
+        assert_eq!(prompt, "Try another approach");
     }
 
     #[gpui::test]

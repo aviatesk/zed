@@ -1625,6 +1625,7 @@ impl AgentConnection for AcpV2Connection {
     fn fork_session(
         self: Rc<Self>,
         session_id: acp::SessionId,
+        cursor: Option<acp::CursorId>,
         project: Entity<Project>,
         work_dirs: PathList,
         cx: &mut App,
@@ -1652,6 +1653,7 @@ impl AgentConnection for AcpV2Connection {
         // The fork is opened with the same MCP servers right after this, so an agent that
         // starts the forked session can keep it running instead of restarting it.
         let request = acp::ForkSessionRequest::new(session_id, context.cwd)
+            .cursor_id(cursor)
             .additional_directories(context.additional_directories)
             .mcp_servers(context.mcp_servers);
         let response = self.connection.send_request(request).block_task();
@@ -4519,6 +4521,7 @@ done
         let pending = cx.update(|cx| {
             harness.client.clone().fork_session(
                 "saved".into(),
+                Some(acp::CursorId::new("before:prompt-2")),
                 harness.project.clone(),
                 PathList::new(&[session_path("a"), session_path("b")]),
                 cx,
@@ -4530,6 +4533,7 @@ done
         assert_eq!(
             request,
             acp::ForkSessionRequest::new("saved", session_path("a"))
+                .cursor_id(acp::CursorId::new("before:prompt-2"))
                 .additional_directories(vec![acp::AbsolutePath::new(session_path("b"))])
         );
         responder
@@ -4537,6 +4541,47 @@ done
             .expect("fork response");
         let fork_session_id = bounded(pending, cx).await.expect("fork succeeds");
         assert_eq!(fork_session_id, acp::SessionId::new("forked"));
+    }
+
+    #[gpui::test]
+    async fn v2_session_cursors_mark_the_prompts_a_thread_can_fork_before(cx: &mut TestAppContext) {
+        let harness = SessionHarness::new(session_capabilities(), vec![], vec![], cx).await;
+        let thread = harness.thread(cx).await;
+        let session_id = cx.read(|cx| thread.read(cx).session_id().to_string());
+        for update in [
+            acp::SessionUpdate::UserMessage(
+                acp::UserMessage::new("prompt-1").content(vec!["first".into()]),
+            ),
+            acp::SessionUpdate::AgentMessage(
+                acp::AgentMessage::new("reply-1").content(vec!["reply".into()]),
+            ),
+            acp::SessionUpdate::UserMessage(
+                acp::UserMessage::new("prompt-2").content(vec!["second".into()]),
+            ),
+            acp::SessionUpdate::CursorUpdate(
+                acp::CursorUpdate::new("before:prompt-2")
+                    .anchor(acp::CursorAnchor::UserMessage(
+                        acp::CursorMessageAnchor::new(
+                            "prompt-2",
+                            acp::CursorAnchorPosition::Before,
+                        ),
+                    ))
+                    .capabilities(
+                        acp::CursorCapabilities::new().fork(acp::CursorForkCapabilities::new()),
+                    ),
+            ),
+        ] {
+            harness.send_update(&session_id, update);
+        }
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(thread.fork_cursor_before_entry(0), None);
+            assert_eq!(
+                thread.fork_cursor_before_entry(2),
+                Some(&acp::CursorId::new("before:prompt-2"))
+            );
+        });
     }
 
     #[gpui::test]
@@ -4548,6 +4593,7 @@ done
             .update(|cx| {
                 harness.client.clone().fork_session(
                     "saved".into(),
+                    None,
                     harness.project.clone(),
                     PathList::new(&[session_path("a")]),
                     cx,

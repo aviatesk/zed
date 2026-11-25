@@ -24,6 +24,12 @@ pub struct AcpBetaFeatureFlag;
 impl FeatureFlag for AcpBetaFeatureFlag {
     const NAME: &'static str = "acp-beta";
     type Value = PresenceFlag;
+
+    /// Forking a thread before a prompt needs ACP v2. Debug builds already get the beta
+    /// as staff, which keeps it overridable there so tests can turn it off to cover v1.
+    fn enabled_for_all() -> bool {
+        !cfg!(debug_assertions)
+    }
 }
 register_feature_flag!(AcpBetaFeatureFlag);
 

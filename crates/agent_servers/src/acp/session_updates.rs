@@ -191,6 +191,7 @@ pub enum InboundSessionUpdate {
     /// Creates or patches a subagent session, so the connection applies it rather than
     /// the parent thread.
     Subagent(acp_v2::SubagentUpdate),
+    Cursor(acp_v2::CursorUpdate),
 }
 
 impl From<DecodedTerminalNotification> for InboundSessionNotification {
@@ -282,6 +283,7 @@ impl TryFrom<acp_v2::UpdateSessionNotification> for InboundSessionNotification {
                 InboundSessionUpdate::CompactionSummary(chunk)
             }
             acp_v2::SessionUpdate::SubagentUpdate(update) => InboundSessionUpdate::Subagent(update),
+            acp_v2::SessionUpdate::CursorUpdate(update) => InboundSessionUpdate::Cursor(update),
             update => {
                 notification.update = update;
                 return Err(notification);
@@ -386,6 +388,10 @@ impl InboundSessionNotification {
             }
             InboundSessionUpdate::Subagent(_) => {
                 anyhow::bail!("Subagent updates must be applied by the ACP connection")
+            }
+            InboundSessionUpdate::Cursor(update) => {
+                thread.apply_cursor_update(update, cx);
+                Ok(())
             }
         }
     }

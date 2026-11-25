@@ -341,6 +341,11 @@ pub fn subagent_session_info_from_meta(meta: &Option<acp_v2::Meta>) -> Option<Su
         .and_then(|v| serde_json::from_value(v.clone()).ok())
 }
 
+struct SessionCursor {
+    anchor: acp_v2::CursorAnchor,
+    can_fork: bool,
+}
+
 /// In-process side-channel between Zed's local LSP MCP bridge and the
 /// `AcpThread` that owns the ACP connection it lives on.
 ///
@@ -3994,6 +3999,9 @@ pub struct AcpThread {
     /// rewriter consults this on a `ToolCallUpdate` to know which queue
     /// entry to pop, instead of relying on agent-specific meta fields.
     bridge_tool_names: HashMap<acp_v1::ToolCallId, String>,
+    /// Positions in the session the agent announced, with whether it currently accepts
+    /// forking the session at each.
+    session_cursors: HashMap<acp_v2::CursorId, SessionCursor>,
 }
 
 enum IdleSleepPrevention {
@@ -4344,6 +4352,7 @@ impl AcpThread {
             bridge_result_queue: None,
             bridge_active_calls: HashMap::default(),
             bridge_tool_names: HashMap::default(),
+            session_cursors: HashMap::default(),
         }
     }
 
@@ -4403,6 +4412,55 @@ impl AcpThread {
     /// no-op for them.
     pub fn set_bridge_result_queue(&mut self, queue: BridgeResultQueue) {
         self.bridge_result_queue = Some(queue);
+    }
+
+    pub fn apply_cursor_update(&mut self, update: acp_v2::CursorUpdate, cx: &mut Context<Self>) {
+        let can_fork = match update.capabilities {
+            MaybeUndefined::Undefined => None,
+            MaybeUndefined::Null => Some(false),
+            MaybeUndefined::Value(capabilities) => Some(capabilities.fork.is_some()),
+        };
+        match self.session_cursors.entry(update.cursor_id) {
+            std::collections::hash_map::Entry::Occupied(mut cursor) => {
+                if let Some(can_fork) = can_fork {
+                    cursor.get_mut().can_fork = can_fork;
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(cursor) => {
+                let Some(anchor) = update.anchor else {
+                    log::warn!(
+                        "Ignoring session cursor {} announced without an anchor",
+                        cursor.key()
+                    );
+                    return;
+                };
+                cursor.insert(SessionCursor {
+                    anchor,
+                    can_fork: can_fork.unwrap_or(false),
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    /// The cursor to fork the session at to leave out the user message at `entry_ix` and
+    /// everything after it, if the agent currently accepts forking there.
+    pub fn fork_cursor_before_entry(&self, entry_ix: usize) -> Option<&acp_v2::CursorId> {
+        let AgentThreadEntry::UserMessage(message) = self.entries.get(entry_ix)? else {
+            return None;
+        };
+        let MessageIdentity::Keyed(message_id) = &message.identity else {
+            return None;
+        };
+        self.session_cursors.iter().find_map(|(cursor_id, cursor)| {
+            let acp_v2::CursorAnchor::UserMessage(anchor) = &cursor.anchor else {
+                return None;
+            };
+            (cursor.can_fork
+                && &anchor.message_id == message_id
+                && matches!(anchor.position, acp_v2::CursorAnchorPosition::Before))
+            .then_some(cursor_id)
+        })
     }
 
     pub fn parent_session_id(&self) -> Option<&acp_v2::SessionId> {
@@ -11595,6 +11653,72 @@ mod tests {
             thread.set_bridge_result_queue(queue.clone())
         });
         (thread, queue)
+    }
+
+    fn fork_cursor_before(message_id: &str) -> acp_v2::CursorUpdate {
+        acp_v2::CursorUpdate::new(format!("before:{message_id}"))
+            .anchor(acp_v2::CursorAnchor::UserMessage(
+                acp_v2::CursorMessageAnchor::new(
+                    message_id.to_string(),
+                    acp_v2::CursorAnchorPosition::Before,
+                ),
+            ))
+            .capabilities(
+                acp_v2::CursorCapabilities::new().fork(acp_v2::CursorForkCapabilities::new()),
+            )
+    }
+
+    #[gpui::test]
+    async fn test_fork_cursors_before_user_messages(cx: &mut TestAppContext) {
+        let (thread, _) = thread_with_bridge_result_queue(cx).await;
+        thread.update(cx, |thread, cx| {
+            for (message_id, text) in [("prompt-1", "first"), ("prompt-2", "second")] {
+                thread
+                    .upsert_user_message(
+                        acp_v2::UserMessage::new(message_id).content(vec![text.into()]),
+                        cx,
+                    )
+                    .expect("user message");
+                thread
+                    .upsert_assistant_message(
+                        acp_v2::AgentMessage::new(format!("reply-{message_id}"))
+                            .content(vec!["reply".into()]),
+                        cx,
+                    )
+                    .expect("agent message");
+            }
+            // Agents announce no cursor before the first entry of a history.
+            thread.apply_cursor_update(fork_cursor_before("prompt-2"), cx);
+            // A cursor announced without an anchor can't be placed.
+            thread.apply_cursor_update(acp_v2::CursorUpdate::new("unplaced"), cx);
+        });
+
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(thread.fork_cursor_before_entry(0), None);
+            assert_eq!(
+                thread.fork_cursor_before_entry(1),
+                None,
+                "not a user message"
+            );
+            assert_eq!(
+                thread.fork_cursor_before_entry(2),
+                Some(&acp_v2::CursorId::new("before:prompt-2"))
+            );
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.apply_cursor_update(
+                acp_v2::CursorUpdate::new("before:prompt-2").capabilities(None),
+                cx,
+            );
+        });
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(
+                thread.fork_cursor_before_entry(2),
+                None,
+                "the agent stopped accepting forks there"
+            );
+        });
     }
 
     #[gpui::test]

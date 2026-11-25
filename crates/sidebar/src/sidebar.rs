@@ -4631,7 +4631,9 @@ impl Sidebar {
                 let panel = workspace
                     .panel::<AgentPanel>(cx)
                     .ok_or_else(|| anyhow::anyhow!("The thread's workspace has no agent panel"))?;
-                anyhow::Ok(panel.update(cx, |panel, cx| panel.fork_thread(source_thread_id, cx)))
+                anyhow::Ok(panel.update(cx, |panel, cx| {
+                    panel.fork_thread(source_thread_id, None, cx)
+                }))
             })?;
             let fork = fork_task.await?;
             this.update_in(cx, |this, window, cx| {

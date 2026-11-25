@@ -203,9 +203,12 @@ pub trait AgentConnection {
     /// Fork an existing session into a new one that shares its history, and return the
     /// new session's ID. The fork is not opened as a thread: open it with `load_session`
     /// or `resume_session` like any other existing session.
+    ///
+    /// With a `cursor` the agent announced, the fork only shares the history before it.
     fn fork_session(
         self: Rc<Self>,
         _session_id: acp_v2::SessionId,
+        _cursor: Option<acp_v2::CursorId>,
         _project: Entity<Project>,
         _work_dirs: PathList,
         _cx: &mut App,
@@ -1067,7 +1070,8 @@ mod test_support {
         receipt_prompt: Arc<Mutex<Option<Vec<acp_v2::ContentBlock>>>>,
         next_truncate: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
         close_session_calls: Arc<Mutex<Vec<acp_v2::SessionId>>>,
-        fork_session_calls: Arc<Mutex<Vec<(acp_v2::SessionId, PathList)>>>,
+        fork_session_calls:
+            Arc<Mutex<Vec<(acp_v2::SessionId, Option<acp_v2::CursorId>, PathList)>>>,
         next_close_responses: Arc<Mutex<VecDeque<oneshot::Receiver<Result<()>>>>>,
         set_title_calls: Arc<Mutex<Vec<(acp_v2::SessionId, SharedString)>>>,
         cancel_calls: Arc<Mutex<Vec<acp_v2::SessionId>>>,
@@ -1225,8 +1229,10 @@ mod test_support {
             std::mem::take(&mut *self.close_session_calls.lock())
         }
 
-        /// The source session and work dirs of each `fork_session` call.
-        pub fn take_fork_session_calls(&self) -> Vec<(acp_v2::SessionId, PathList)> {
+        /// The source session, cursor and work dirs of each `fork_session` call.
+        pub fn take_fork_session_calls(
+            &self,
+        ) -> Vec<(acp_v2::SessionId, Option<acp_v2::CursorId>, PathList)> {
             std::mem::take(&mut *self.fork_session_calls.lock())
         }
 
@@ -1496,6 +1502,7 @@ mod test_support {
         fn fork_session(
             self: Rc<Self>,
             session_id: acp_v2::SessionId,
+            cursor: Option<acp_v2::CursorId>,
             _project: Entity<Project>,
             work_dirs: PathList,
             cx: &mut App,
@@ -1503,7 +1510,9 @@ mod test_support {
             if !self.supports_fork_session {
                 return Task::ready(Err(anyhow::Error::msg("Forking sessions is not supported")));
             }
-            self.fork_session_calls.lock().push((session_id, work_dirs));
+            self.fork_session_calls
+                .lock()
+                .push((session_id, cursor, work_dirs));
             Task::ready(Ok(acp_v2::SessionId::new(
                 StubSessionCounter::next(cx).to_string(),
             )))
