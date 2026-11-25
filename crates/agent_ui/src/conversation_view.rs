@@ -5872,6 +5872,70 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_steering_queued_message_sends_without_cancelling_receipt_turn(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let connection = StubAgentConnection::new().with_receipt_submissions(true);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |thread, cx| {
+            thread
+                .update_session_state(
+                    acp_v2::StateUpdate::Running(acp_v2::RunningStateUpdate::new()),
+                    cx,
+                )
+                .expect("running");
+        });
+        cx.run_until_parked();
+
+        let steered = thread_view.update_in(cx, |view, window, cx| {
+            view.add_to_queue(vec!["waits".into()], vec![], window, cx);
+            view.add_to_queue(vec!["steers".into()], vec![], window, cx);
+            view.message_queue.last_id().expect("steered entry")
+        });
+        let steered_receipt = connection.defer_next_receipt_response();
+        thread_view.update_in(cx, |view, window, cx| {
+            view.steer_queue_entry(steered, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            connection.take_receipt_prompt(),
+            Some(vec!["steers".into()])
+        );
+        assert!(connection.take_cancel_calls().is_empty());
+        steered_receipt
+            .send(Ok(acp_v2::PromptResponse::new("steers")))
+            .expect("steered receipt");
+        cx.run_until_parked();
+        thread_view.read_with(cx, |view, cx| {
+            assert_eq!(view.thread.read(cx).status(), ThreadStatus::Generating);
+            assert_eq!(view.message_queue.len(), 1);
+            assert!(view.thread_error.is_none());
+        });
+
+        // Steering cancelled nothing, so the turn's own end still sends the rest of the queue.
+        let waiting_receipt = connection.defer_next_receipt_response();
+        thread.update(cx, |thread, cx| {
+            thread
+                .update_session_state(
+                    acp_v2::StateUpdate::Idle(acp_v2::IdleStateUpdate::new()),
+                    cx,
+                )
+                .expect("idle");
+        });
+        cx.run_until_parked();
+        assert_eq!(connection.take_receipt_prompt(), Some(vec!["waits".into()]));
+        waiting_receipt
+            .send(Ok(acp_v2::PromptResponse::new("waits")))
+            .expect("waiting receipt");
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
     async fn test_receipt_submission_waits_for_echo_and_reported_idle(cx: &mut TestAppContext) {
         init_test(cx);
 

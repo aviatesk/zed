@@ -965,6 +965,9 @@ pub struct TurnFields {
 enum QueuedMessageDispatchSource {
     Automatic,
     Manual,
+    /// Sent to an agent that takes prompts mid-turn, so the running turn is
+    /// left alone for the agent to steer.
+    Steer,
 }
 
 enum ThreadControlsPosition {
@@ -3209,10 +3212,35 @@ impl ThreadView {
         removed
     }
 
-    fn toggle_queue_entry_steer(&mut self, id: QueueEntryId, cx: &mut Context<Self>) {
-        self.message_queue.toggle_steer(id);
-        self.sync_queue_flag_to_native_thread(cx);
-        cx.notify();
+    /// Native threads end their turn at the next boundary for a steering
+    /// message, while external agents that take prompts mid-turn receive it
+    /// right away and decide when to take it in.
+    fn can_steer_queued_messages(&self, cx: &App) -> bool {
+        self.as_native_thread(cx).is_some() || self.steers_by_sending(cx)
+    }
+
+    fn steers_by_sending(&self, cx: &App) -> bool {
+        self.as_native_thread(cx).is_none() && self.thread.read(cx).accepts_prompts_while_running()
+    }
+
+    pub fn steer_queue_entry(
+        &mut self,
+        id: QueueEntryId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.steers_by_sending(cx) {
+            if !self.validate_queued_entry(id, cx) {
+                return;
+            }
+            if let Some(entry) = self.message_queue.remove(id) {
+                self.dispatch_queued_entry(entry, QueuedMessageDispatchSource::Steer, window, cx);
+            }
+        } else if self.as_native_thread(cx).is_some() {
+            self.message_queue.toggle_steer(id);
+            self.sync_queue_flag_to_native_thread(cx);
+            cx.notify();
+        }
     }
 
     pub fn sync_queue_flag_to_native_thread(&self, cx: &mut Context<Self>) {
@@ -3289,8 +3317,8 @@ impl ThreadView {
     }
 
     /// The shared "actually send this entry" path, used by fast-track,
-    /// auto-processing on Stopped, and "Send Now". The entry must already have
-    /// been removed from the queue.
+    /// auto-processing on Stopped, "Send Now", and steering. The entry must
+    /// already have been removed from the queue.
     fn dispatch_queued_entry(
         &mut self,
         entry: QueueEntry,
@@ -3304,7 +3332,7 @@ impl ThreadView {
 
         match source {
             QueuedMessageDispatchSource::Automatic => {}
-            QueuedMessageDispatchSource::Manual => {
+            QueuedMessageDispatchSource::Manual | QueuedMessageDispatchSource::Steer => {
                 self.message_editor.focus_handle(cx).focus(window, cx);
             }
         }
@@ -3325,13 +3353,20 @@ impl ThreadView {
             })
             .is_some();
 
-        let cancelled = self.thread.update(cx, |thread, cx| thread.cancel(cx));
+        let cancelled = match source {
+            QueuedMessageDispatchSource::Steer => None,
+            QueuedMessageDispatchSource::Automatic | QueuedMessageDispatchSource::Manual => {
+                Some(self.thread.update(cx, |thread, cx| thread.cancel(cx)))
+            }
+        };
 
         let workspace = self.workspace.clone();
 
         let should_be_following = self.should_be_following;
         let contents_task = cx.spawn_in(window, async move |this, cx| {
-            if let Err(error) = cancelled.await {
+            if let Some(cancelled) = cancelled
+                && let Err(error) = cancelled.await
+            {
                 this.update(cx, |this, cx| {
                     this.message_queue.restore_after_failed_send(entry);
                     this.sync_queue_flag_to_native_thread(cx);
@@ -5996,10 +6031,11 @@ impl ThreadView {
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let focus_handle = self.message_editor.focus_handle(cx);
+        let steers_by_sending = self.steers_by_sending(cx);
 
         Button::new(("steer", index), "Steer")
             .label_size(LabelSize::Small)
-            .toggle_state(steer_on)
+            .toggle_state(steer_on && !steers_by_sending)
             .selected_style(ButtonStyle::Tinted(TintColor::Accent))
             .when(is_next, |this| {
                 this.key_binding(
@@ -6008,16 +6044,17 @@ impl ThreadView {
                 )
             })
             .tooltip(move |_window, cx| {
-                Tooltip::with_meta(
-                    "Steer",
-                    None,
+                let description = if steers_by_sending {
+                    "Send this message without stopping the agent, \
+                     so it can take it in at its next step."
+                } else {
                     "Interrupt the agent at its next step to send this message. \
-                     When off, queued messages wait for the agent to finish.",
-                    cx,
-                )
+                     When off, queued messages wait for the agent to finish."
+                };
+                Tooltip::with_meta("Steer", None, description, cx)
             })
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.toggle_queue_entry_steer(entry_id, cx);
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.steer_queue_entry(entry_id, window, cx);
             }))
     }
 
@@ -6031,7 +6068,7 @@ impl ThreadView {
 
         let queue_len = self.message_queue.len();
         let can_fast_track = self.message_queue.can_fast_track();
-        let is_native = self.as_native_thread(cx).is_some();
+        let can_steer = self.can_steer_queued_messages(cx);
 
         v_flex()
             .id("message_queue_list")
@@ -6101,7 +6138,7 @@ impl ThreadView {
                                         );
                                     })),
                             )
-                            .when(is_native, |row| {
+                            .when(can_steer, |row| {
                                 row.child(self.render_queue_steer_button(
                                     entry_id, index, is_next, steer_on, cx,
                                 ))
@@ -6175,7 +6212,7 @@ impl ThreadView {
                                         );
                                     })),
                             )
-                            .when(is_native, |row| {
+                            .when(can_steer, |row| {
                                 row.child(self.render_queue_steer_button(
                                     entry_id, index, is_next, steer_on, cx,
                                 ))
@@ -14789,12 +14826,9 @@ impl Render for ThreadView {
                 }
             }))
             .on_action(
-                cx.listener(|this, _: &ToggleSteerFirstQueuedMessage, _, cx| {
-                    if this.as_native_thread(cx).is_none() {
-                        return;
-                    }
+                cx.listener(|this, _: &ToggleSteerFirstQueuedMessage, window, cx| {
                     if let Some(id) = this.message_queue.first_id() {
-                        this.toggle_queue_entry_steer(id, cx);
+                        this.steer_queue_entry(id, window, cx);
                     }
                 }),
             )

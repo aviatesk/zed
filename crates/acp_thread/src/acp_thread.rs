@@ -4697,6 +4697,12 @@ impl AcpThread {
         )
     }
 
+    /// Whether a prompt sent while the agent works reaches it without ending the
+    /// running turn, which lets the agent steer that turn with it.
+    pub fn accepts_prompts_while_running(&self) -> bool {
+        self.submissions.receipt_transport().is_some()
+    }
+
     pub fn foreground_state(&self) -> Option<&acp_v2::StateUpdate> {
         self.activity.state()
     }

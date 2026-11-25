@@ -359,6 +359,7 @@ actions!(
         EditFirstQueuedMessage,
         /// Toggles steering for the first queued message: when on, it interrupts
         /// the agent at its next step instead of waiting for it to finish.
+        /// External agents that take prompts mid-turn receive it right away.
         ToggleSteerFirstQueuedMessage,
         /// Clears all messages from the queue.
         ClearMessageQueue,
