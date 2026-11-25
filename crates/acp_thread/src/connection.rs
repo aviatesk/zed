@@ -195,6 +195,24 @@ pub trait AgentConnection {
         )))
     }
 
+    /// Whether this agent supports forking existing sessions.
+    fn supports_fork_session(&self) -> bool {
+        false
+    }
+
+    /// Fork an existing session into a new one that shares its history, and return the
+    /// new session's ID. The fork is not opened as a thread: open it with `load_session`
+    /// or `resume_session` like any other existing session.
+    fn fork_session(
+        self: Rc<Self>,
+        _session_id: acp_v2::SessionId,
+        _project: Entity<Project>,
+        _work_dirs: PathList,
+        _cx: &mut App,
+    ) -> Task<Result<acp_v2::SessionId>> {
+        Task::ready(Err(anyhow::Error::msg("Forking sessions is not supported")))
+    }
+
     /// Whether this agent supports showing session history.
     fn supports_session_history(&self) -> bool {
         self.supports_load_session() || self.supports_resume_session()
@@ -1049,6 +1067,7 @@ mod test_support {
         receipt_prompt: Arc<Mutex<Option<Vec<acp_v2::ContentBlock>>>>,
         next_truncate: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
         close_session_calls: Arc<Mutex<Vec<acp_v2::SessionId>>>,
+        fork_session_calls: Arc<Mutex<Vec<(acp_v2::SessionId, PathList)>>>,
         next_close_responses: Arc<Mutex<VecDeque<oneshot::Receiver<Result<()>>>>>,
         set_title_calls: Arc<Mutex<Vec<(acp_v2::SessionId, SharedString)>>>,
         cancel_calls: Arc<Mutex<Vec<acp_v2::SessionId>>>,
@@ -1058,6 +1077,7 @@ mod test_support {
         supports_retry: bool,
         supports_load_session: bool,
         supports_close_session: bool,
+        supports_fork_session: bool,
         announces_subagents: bool,
         close_sessions_on_release: bool,
         supports_set_title: bool,
@@ -1098,6 +1118,7 @@ mod test_support {
                 receipt_prompt: Default::default(),
                 next_truncate: Default::default(),
                 close_session_calls: Default::default(),
+                fork_session_calls: Default::default(),
                 next_close_responses: Default::default(),
                 set_title_calls: Default::default(),
                 cancel_calls: Default::default(),
@@ -1109,6 +1130,7 @@ mod test_support {
                 supports_retry: false,
                 supports_load_session: false,
                 supports_close_session: false,
+                supports_fork_session: false,
                 announces_subagents: false,
                 close_sessions_on_release: true,
                 supports_set_title: true,
@@ -1203,6 +1225,11 @@ mod test_support {
             std::mem::take(&mut *self.close_session_calls.lock())
         }
 
+        /// The source session and work dirs of each `fork_session` call.
+        pub fn take_fork_session_calls(&self) -> Vec<(acp_v2::SessionId, PathList)> {
+            std::mem::take(&mut *self.fork_session_calls.lock())
+        }
+
         pub fn defer_next_close_response(&self) -> oneshot::Sender<Result<()>> {
             let (sender, receiver) = oneshot::channel();
             self.next_close_responses.lock().push_back(receiver);
@@ -1288,6 +1315,11 @@ mod test_support {
 
         pub fn with_supports_truncate(mut self, supports_truncate: bool) -> Self {
             self.supports_truncate = supports_truncate;
+            self
+        }
+
+        pub fn with_supports_fork_session(mut self, supports_fork_session: bool) -> Self {
+            self.supports_fork_session = supports_fork_session;
             self
         }
 
@@ -1455,6 +1487,26 @@ mod test_support {
             }
             let thread = self.create_session(session_id, project, work_dirs, title, cx);
             Task::ready(Ok(thread))
+        }
+
+        fn supports_fork_session(&self) -> bool {
+            self.supports_fork_session
+        }
+
+        fn fork_session(
+            self: Rc<Self>,
+            session_id: acp_v2::SessionId,
+            _project: Entity<Project>,
+            work_dirs: PathList,
+            cx: &mut App,
+        ) -> Task<Result<acp_v2::SessionId>> {
+            if !self.supports_fork_session {
+                return Task::ready(Err(anyhow::Error::msg("Forking sessions is not supported")));
+            }
+            self.fork_session_calls.lock().push((session_id, work_dirs));
+            Task::ready(Ok(acp_v2::SessionId::new(
+                StubSessionCounter::next(cx).to_string(),
+            )))
         }
 
         fn authenticate(

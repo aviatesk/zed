@@ -862,6 +862,11 @@ impl ConversationView {
         })
     }
 
+    pub fn supports_fork_session(&self) -> bool {
+        self.as_connected()
+            .is_some_and(|connected| connected.connection.supports_fork_session())
+    }
+
     pub(crate) fn agent_auth_status(
         &self,
     ) -> Option<watch::Receiver<Option<acp_v2::AuthStatusResponse>>> {

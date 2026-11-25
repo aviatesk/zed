@@ -43,16 +43,19 @@ use crate::terminal_thread_metadata_store::{
     TerminalThreadMetadata, TerminalThreadMetadataStore, compose_terminal_thread_title,
     normalize_terminal_custom_title, terminal_title_without_prefix,
 };
-use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
+use crate::thread_metadata_store::{
+    ThreadId, ThreadMetadata, ThreadMetadataStore, ThreadMetadataStoreEvent,
+};
 use crate::{
     Agent, AgentInitialContent, AgentThreadSource, ExternalSourcePrompt, NewExternalAgentThread,
     NewNativeAgentThreadFromSummary,
 };
 use crate::{
-    AgentDiffPane, ConversationView, CopyThreadToClipboard, Follow, LoadThreadFromClipboard,
-    NewTerminalThread, NewThread, OpenActiveThreadAsMarkdown, OpenAgentDiff, RenameSelectedThread,
-    ResetFastModeWarnings, ResetTrialEndUpsell, ResetTrialUpsell, ShowAllSidebarThreadMetadata,
-    ShowThreadMetadata, ToggleNewThreadMenu, ToggleOptionsMenu,
+    AgentDiffPane, ConversationView, CopyThreadToClipboard, Follow, ForkActiveThread,
+    LoadThreadFromClipboard, NewTerminalThread, NewThread, OpenActiveThreadAsMarkdown,
+    OpenAgentDiff, RenameSelectedThread, ResetFastModeWarnings, ResetTrialEndUpsell,
+    ResetTrialUpsell, ShowAllSidebarThreadMetadata, ShowThreadMetadata, ToggleNewThreadMenu,
+    ToggleOptionsMenu,
     conversation_view::{
         AcpThreadViewEvent, RootThreadUpdated, ThreadView, reset_fast_mode_warnings,
     },
@@ -1740,6 +1743,109 @@ impl AgentPanel {
 
     pub fn connection_store(&self) -> &Entity<AgentConnectionStore> {
         &self.connection_store
+    }
+
+    /// Forks a thread into a new one that shares its history, connecting to its agent
+    /// first if necessary. The fork is recorded in the thread metadata store but not
+    /// opened. A failed fork is also reported to the user.
+    pub fn fork_thread(
+        &mut self,
+        source_thread_id: ThreadId,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ThreadMetadata>> {
+        let Some(source) = ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry(source_thread_id)
+            .cloned()
+        else {
+            return Task::ready(Err(anyhow!("Thread to fork was not found")));
+        };
+        let Some(session_id) = source.session_id.clone() else {
+            return Task::ready(Err(anyhow!("Thread to fork has no session yet")));
+        };
+
+        let agent = Agent::from(source.agent_id.clone());
+        let server = agent.server(self.fs.clone(), self.thread_store.clone());
+        let connect_task = self
+            .connection_store
+            .update(cx, |store, cx| store.request_connection(agent, server, cx))
+            .read(cx)
+            .wait_for_connection();
+        let project = self.project.clone();
+        let workspace = self.workspace.clone();
+
+        cx.spawn(async move |_this, cx| {
+            let result = async {
+                let connected = connect_task.await?;
+                let fork_session_id = cx
+                    .update(|cx| {
+                        connected.connection.clone().fork_session(
+                            session_id,
+                            project,
+                            source.folder_paths().clone(),
+                            cx,
+                        )
+                    })
+                    .await?;
+
+                let now = Utc::now();
+                let fork = ThreadMetadata {
+                    thread_id: ThreadId::new(),
+                    session_id: Some(fork_session_id),
+                    title_override: Some(format!("{} (fork)", source.display_title()).into()),
+                    created_at: Some(now),
+                    updated_at: now,
+                    // The sidebar orders threads by this time, so sharing the source's keeps
+                    // the fork next to it until the fork is used.
+                    interacted_at: Some(source.interacted_at.unwrap_or(source.updated_at)),
+                    archived: false,
+                    ..source
+                };
+                cx.update(|cx| {
+                    ThreadMetadataStore::global(cx)
+                        .update(cx, |store, cx| store.save(fork.clone(), cx));
+                });
+                anyhow::Ok(fork)
+            }
+            .await;
+
+            if let Err(error) = &result {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.show_error(anyhow!("Failed to fork thread: {error:#}"), cx)
+                    })
+                    .log_err();
+            }
+            result
+        })
+    }
+
+    fn fork_active_thread(
+        &mut self,
+        _: &ForkActiveThread,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(thread_id) = self.active_thread_id(cx) else {
+            return;
+        };
+        let fork_task = self.fork_thread(thread_id, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let fork = fork_task.await?;
+            this.update_in(cx, |this, window, cx| {
+                this.load_agent_thread(
+                    Agent::from(fork.agent_id.clone()),
+                    fork.thread_id,
+                    Some(fork.folder_paths().clone()),
+                    fork.title.clone(),
+                    true,
+                    AgentThreadSource::AgentPanel,
+                    window,
+                    cx,
+                );
+            })
+        })
+        .detach_and_log_err(cx);
     }
 
     pub fn selected_agent(&self, cx: &App) -> Agent {
@@ -5778,6 +5884,10 @@ impl AgentPanel {
         let has_thread_messages = conversation_view.as_ref().is_some_and(|conversation_view| {
             conversation_view.read(cx).has_user_submitted_prompt(cx)
         });
+        let can_fork_thread = has_thread_messages
+            && conversation_view.as_ref().is_some_and(|conversation_view| {
+                conversation_view.read(cx).supports_fork_session()
+            });
 
         let has_auth_methods = match &self.base_view {
             BaseView::AgentThread { conversation_view } => {
@@ -5852,6 +5962,11 @@ impl AgentPanel {
                                             }
                                         }
                                     });
+                                }
+
+                                if can_fork_thread {
+                                    menu =
+                                        menu.action("Fork Thread", ForkActiveThread.boxed_clone());
                                 }
 
                                 menu = menu.separator();
@@ -6752,6 +6867,7 @@ impl Render for AgentPanel {
                 this.open_configuration(window, cx);
             }))
             .on_action(cx.listener(Self::open_active_thread_as_markdown))
+            .on_action(cx.listener(Self::fork_active_thread))
             .on_action(cx.listener(Self::manage_skills))
             .on_action(cx.listener(Self::toggle_options_menu))
             .on_action(cx.listener(Self::increase_font_size))
@@ -8932,6 +9048,99 @@ mod tests {
         send_message(panel, cx);
 
         (session_id, thread_id)
+    }
+
+    #[gpui::test]
+    async fn test_fork_active_thread_opens_fork_while_source_keeps_running(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let connection = StubAgentConnection::new()
+            .with_supports_load_session(true)
+            .with_supports_fork_session(true)
+            .with_agent_id("forkable-stub".into())
+            .with_telemetry_id("forkable-stub".into());
+        let (source_session_id, source_thread_id) =
+            open_generating_thread_with_loadable_connection(&panel, &connection, &mut cx);
+        let source = cx.update(|_, cx| {
+            ThreadMetadataStore::global(cx)
+                .read(cx)
+                .entry(source_thread_id)
+                .cloned()
+                .expect("source thread should have metadata")
+        });
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.fork_active_thread(&ForkActiveThread, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            connection.take_fork_session_calls(),
+            vec![(
+                source_session_id.clone(),
+                PathList::new(&[Path::new("/project")])
+            )]
+        );
+        let fork_thread_id = active_thread_id(&panel, &cx);
+        assert_ne!(fork_thread_id, source_thread_id);
+        let fork_session_id = active_session_id(&panel, &cx);
+        assert_ne!(fork_session_id, source_session_id);
+
+        let fork = cx.update(|_, cx| {
+            ThreadMetadataStore::global(cx)
+                .read(cx)
+                .entry(fork_thread_id)
+                .cloned()
+                .expect("fork should have metadata")
+        });
+        // The stub replays no history, so this also checks that the empty fork keeps its
+        // session instead of being demoted to a draft.
+        assert_eq!(fork.session_id, Some(fork_session_id));
+        assert_eq!(fork.agent_id, source.agent_id);
+        assert_eq!(
+            fork.title_override,
+            Some(format!("{} (fork)", source.display_title()).into())
+        );
+        assert_eq!(
+            fork.interacted_at,
+            Some(source.interacted_at.unwrap_or(source.updated_at))
+        );
+        assert_eq!(fork.worktree_paths, source.worktree_paths);
+
+        let source_is_generating = panel.read_with(&cx, |panel, cx| {
+            panel
+                .retained_threads
+                .get(&source_thread_id)
+                .and_then(|view| view.read(cx).root_thread(cx))
+                .is_some_and(|thread| matches!(thread.read(cx).status(), ThreadStatus::Generating))
+        });
+        assert!(source_is_generating, "the source should keep running");
+    }
+
+    #[gpui::test]
+    async fn test_fork_active_thread_keeps_source_when_agent_cannot_fork(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let connection = StubAgentConnection::new()
+            .with_supports_load_session(true)
+            .with_agent_id("non-forkable-stub".into())
+            .with_telemetry_id("non-forkable-stub".into());
+        let (_, source_thread_id) =
+            open_generating_thread_with_loadable_connection(&panel, &connection, &mut cx);
+        let thread_count =
+            cx.update(|_, cx| ThreadMetadataStore::global(cx).read(cx).entries().count());
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.fork_active_thread(&ForkActiveThread, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(connection.take_fork_session_calls().is_empty());
+        assert_eq!(active_thread_id(&panel, &cx), source_thread_id);
+        assert_eq!(
+            cx.update(|_, cx| ThreadMetadataStore::global(cx).read(cx).entries().count()),
+            thread_count
+        );
     }
 
     #[gpui::test]

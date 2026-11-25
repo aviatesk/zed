@@ -5835,6 +5835,79 @@ async fn test_parallel_threads_shown_with_live_status(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_fork_thread_activates_fork_next_to_source(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    let workspace = multi_workspace.read_with(cx, |mw, _cx| mw.workspace().clone());
+
+    let connection = StubAgentConnection::new()
+        .with_supports_load_session(true)
+        .with_supports_fork_session(true)
+        .with_agent_id("forkable-stub".into())
+        .with_telemetry_id("forkable-stub".into());
+    connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+        acp_v1::ContentChunk::new("Done".into()),
+    )]);
+    open_thread_with_custom_connection(&panel, connection.clone(), cx);
+    send_message(&panel, cx);
+    let source_session_id = active_session_id(&panel, cx);
+    let source_thread_id = active_thread_id(&panel, cx);
+
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.fork_thread(
+            source_thread_id,
+            ThreadEntryWorkspace::Open(workspace.clone()),
+            window,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        connection.take_fork_session_calls(),
+        vec![(
+            source_session_id.clone(),
+            PathList::new(&[Path::new("/my-project")])
+        )]
+    );
+    let fork_session_id = active_session_id(&panel, cx);
+    assert_ne!(fork_session_id, source_session_id);
+    sidebar.read_with(cx, |sidebar, _cx| {
+        assert_active_thread(sidebar, &fork_session_id, "the fork should be active");
+        let thread_index = |session_id: &acp::SessionId| {
+            sidebar
+                .contents
+                .entries
+                .iter()
+                .position(|entry| {
+                    matches!(entry, ListEntry::Thread(thread)
+                        if thread.metadata.session_id.as_ref() == Some(session_id))
+                })
+                .expect("thread should be listed in the sidebar")
+        };
+        let source_index = thread_index(&source_session_id);
+        let fork_index = thread_index(&fork_session_id);
+        assert_eq!(
+            source_index.abs_diff(fork_index),
+            1,
+            "the fork should be listed next to its source"
+        );
+        let (ListEntry::Thread(source), ListEntry::Thread(fork)) = (
+            &sidebar.contents.entries[source_index],
+            &sidebar.contents.entries[fork_index],
+        ) else {
+            unreachable!("both entries were matched as threads");
+        };
+        assert_eq!(
+            fork.metadata.display_title(),
+            format!("{} (fork)", source.metadata.display_title())
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_subagent_permission_request_marks_parent_sidebar_thread_waiting(
     cx: &mut TestAppContext,
 ) {

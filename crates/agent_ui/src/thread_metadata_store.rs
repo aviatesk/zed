@@ -1324,8 +1324,14 @@ impl ThreadMetadataStore {
         if thread_ref.project().read(cx).is_via_collab() {
             return;
         }
-        let is_draft = thread_ref.is_draft_thread();
         let existing_thread = self.entry(thread_id);
+        // A thread reopening the session its row already records stays a thread even
+        // while it has no entries, as when the agent replays no history for a fork.
+        // Demoting it would drop the session ID, and with it the conversation.
+        let is_draft = thread_ref.is_draft_thread()
+            && existing_thread.is_none_or(|existing| {
+                existing.session_id.as_ref() != Some(thread_ref.session_id())
+            });
 
         // Draft session IDs may change on reload, so let's not save them until they're valid
         let session_id = if is_draft {

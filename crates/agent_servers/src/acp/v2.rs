@@ -1596,6 +1596,53 @@ impl AgentConnection for AcpV2Connection {
         self.open_session(session_id, project, work_dirs, title, false, cx)
     }
 
+    fn supports_fork_session(&self) -> bool {
+        self.initialize_response
+            .capabilities
+            .session
+            .as_ref()
+            .is_some_and(|session| session.fork.is_some())
+    }
+
+    fn fork_session(
+        self: Rc<Self>,
+        session_id: acp::SessionId,
+        project: Entity<Project>,
+        work_dirs: PathList,
+        cx: &mut App,
+    ) -> Task<Result<acp::SessionId>> {
+        if !self.supports_fork_session() {
+            return Task::ready(Err(anyhow!(
+                "Forking sessions is not supported by this agent."
+            )));
+        }
+        if is_connection_closed(&self.connection) {
+            return Task::ready(Err(anyhow!("Agent connection is closed")));
+        }
+        if self.is_subagent_session(&session_id) {
+            return Task::ready(Err(anyhow!("Cannot fork a subagent session")));
+        }
+        let path_style = project.read(cx).path_style(cx);
+        let context = match self.session_context(
+            mcp_configurations_for_project(&project, cx),
+            &work_dirs,
+            |path| path_style.is_absolute(path),
+        ) {
+            Ok(context) => context,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        // The fork is opened with the same MCP servers right after this, so an agent that
+        // starts the forked session can keep it running instead of restarting it.
+        let request = acp::ForkSessionRequest::new(session_id, context.cwd)
+            .additional_directories(context.additional_directories)
+            .mcp_servers(context.mcp_servers);
+        let response = self.connection.send_request(request).block_task();
+        cx.foreground_executor().spawn(async move {
+            let response = response.await.map_err(map_acp_error)?;
+            Ok(response.session_id)
+        })
+    }
+
     fn supports_close_session(&self) -> bool {
         self.initialize_response.capabilities.session.is_some()
     }
@@ -2220,6 +2267,8 @@ mod tests {
             acp::DeleteSessionRequest,
             Responder<acp::DeleteSessionResponse>,
         )>,
+        fork_requests:
+            async_channel::Receiver<(acp::ForkSessionRequest, Responder<acp::ForkSessionResponse>)>,
         closes: async_channel::Receiver<acp::SessionId>,
         close_requests: async_channel::Receiver<(
             acp::CloseSessionRequest,
@@ -2259,6 +2308,7 @@ mod tests {
             let deferred_new = hold_new_responses.clone();
             let (list_sender, list_requests) = async_channel::unbounded();
             let (delete_sender, delete_requests) = async_channel::unbounded();
+            let (fork_sender, fork_requests) = async_channel::unbounded();
             let (config_sender, config_requests) = async_channel::unbounded();
             let (config_responses, config_received) = async_channel::unbounded::<
                 Result<acp::SetSessionConfigOptionResponse, agent_client_protocol::Error>,
@@ -2306,6 +2356,15 @@ mod tests {
                             delete_sender
                                 .try_send((request, responder))
                                 .expect("delete receiver");
+                            Ok(())
+                        },
+                        agent_client_protocol::on_receive_request!(),
+                    )
+                    .on_receive_request(
+                        async move |request: acp::ForkSessionRequest, responder, _| {
+                            fork_sender
+                                .try_send((request, responder))
+                                .expect("fork receiver");
                             Ok(())
                         },
                         agent_client_protocol::on_receive_request!(),
@@ -2452,6 +2511,7 @@ mod tests {
                 hold_config,
                 list_requests,
                 delete_requests,
+                fork_requests,
                 closes,
                 close_requests,
                 hold_closes,
@@ -4414,6 +4474,63 @@ done
             assert!(harness.list_requests.is_empty());
             assert!(harness.closes.is_empty());
         }
+    }
+
+    #[gpui::test]
+    async fn v2_fork_sdk_forks_with_the_session_context(cx: &mut TestAppContext) {
+        let capabilities = acp::AgentCapabilities::new().session(
+            acp::SessionCapabilities::new()
+                .additional_directories(acp::SessionAdditionalDirectoriesCapabilities::new())
+                .fork(acp::SessionForkCapabilities::new()),
+        );
+        let harness = SessionHarness::new(capabilities, vec![], vec![], cx).await;
+        assert!(harness.client.supports_fork_session());
+
+        let pending = cx.update(|cx| {
+            harness.client.clone().fork_session(
+                "saved".into(),
+                harness.project.clone(),
+                PathList::new(&[session_path("a"), session_path("b")]),
+                cx,
+            )
+        });
+        let (request, responder) = bounded(harness.fork_requests.recv(), cx)
+            .await
+            .expect("fork request");
+        assert_eq!(
+            request,
+            acp::ForkSessionRequest::new("saved", session_path("a"))
+                .additional_directories(vec![acp::AbsolutePath::new(session_path("b"))])
+        );
+        responder
+            .respond(acp::ForkSessionResponse::new("forked"))
+            .expect("fork response");
+        let fork_session_id = bounded(pending, cx).await.expect("fork succeeds");
+        assert_eq!(fork_session_id, acp::SessionId::new("forked"));
+    }
+
+    #[gpui::test]
+    async fn v2_fork_sdk_is_not_sent_without_the_capability(cx: &mut TestAppContext) {
+        let harness = SessionHarness::new(session_capabilities(), vec![], vec![], cx).await;
+        assert!(!harness.client.supports_fork_session());
+
+        let error = cx
+            .update(|cx| {
+                harness.client.clone().fork_session(
+                    "saved".into(),
+                    harness.project.clone(),
+                    PathList::new(&[session_path("a")]),
+                    cx,
+                )
+            })
+            .await
+            .expect_err("fork fails without the capability");
+        assert!(
+            error.to_string().contains("not supported"),
+            "unexpected error: {error}"
+        );
+        cx.run_until_parked();
+        assert!(harness.fork_requests.is_empty());
     }
 
     #[gpui::test]

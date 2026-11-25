@@ -313,6 +313,8 @@ actions!(
         CyclePreviousInlineAssist,
         /// Opens the active thread as a markdown file.
         OpenActiveThreadAsMarkdown,
+        /// Forks the active thread into a new thread that shares its history.
+        ForkActiveThread,
         /// Opens the agent diff view to review changes.
         OpenAgentDiff,
         /// Copies the current thread to the clipboard as JSON for debugging.

@@ -4526,24 +4526,14 @@ impl Sidebar {
         self.activate_thread_in_other_window(metadata, workspace.clone(), target_window, cx);
     }
 
-    fn open_workspace_and_activate_thread(
-        &mut self,
-        metadata: ThreadMetadata,
+    fn open_closed_thread_workspace(
+        &self,
         folder_paths: PathList,
         project_group_key: &ProjectGroupKey,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
-            return;
-        };
-
-        let pending_thread_id = metadata.thread_id;
-        // Mark the pending thread activation so rebuild_contents
-        // preserves the Thread active_entry during loading and
-        // reconciliation cannot synthesize an empty fallback draft.
-        self.pending_thread_activation = Some(pending_thread_id);
-
+    ) -> Option<Task<anyhow::Result<Entity<Workspace>>>> {
+        let multi_workspace = self.multi_workspace.upgrade()?;
         let host = project_group_key.host().cloned();
         let provisional_key = Some(project_group_key.clone());
         let active_workspace = multi_workspace.read(cx).workspace().clone();
@@ -4563,11 +4553,37 @@ impl Sidebar {
             )
         });
 
-        cx.spawn_in(window, async move |this, cx| {
+        Some(cx.spawn_in(window, async move |_this, cx| {
             let result = open_task.await;
             // Dismiss the modal as soon as the open attempt completes so
             // failures or cancellations do not leave a stale connection modal behind.
             remote_connection::dismiss_connection_modal(&modal_workspace, cx);
+            result
+        }))
+    }
+
+    fn open_workspace_and_activate_thread(
+        &mut self,
+        metadata: ThreadMetadata,
+        folder_paths: PathList,
+        project_group_key: &ProjectGroupKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(open_task) =
+            self.open_closed_thread_workspace(folder_paths, project_group_key, window, cx)
+        else {
+            return;
+        };
+
+        let pending_thread_id = metadata.thread_id;
+        // Mark the pending thread activation so rebuild_contents
+        // preserves the Thread active_entry during loading and
+        // reconciliation cannot synthesize an empty fallback draft.
+        self.pending_thread_activation = Some(pending_thread_id);
+
+        cx.spawn_in(window, async move |this, cx| {
+            let result = open_task.await;
 
             if result.is_err() {
                 this.update(cx, |this, _cx| {
@@ -4581,6 +4597,45 @@ impl Sidebar {
             let workspace = result?;
             this.update_in(cx, |this, window, cx| {
                 this.activate_thread(metadata, &workspace, false, window, cx);
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn fork_thread(
+        &mut self,
+        source_thread_id: ThreadId,
+        thread_workspace: ThreadEntryWorkspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace_task = match thread_workspace {
+            ThreadEntryWorkspace::Open(workspace) => Task::ready(Ok(workspace)),
+            ThreadEntryWorkspace::Closed {
+                folder_paths,
+                project_group_key,
+            } => {
+                let Some(open_task) =
+                    self.open_closed_thread_workspace(folder_paths, &project_group_key, window, cx)
+                else {
+                    return;
+                };
+                open_task
+            }
+        };
+
+        cx.spawn_in(window, async move |this, cx| {
+            let workspace = workspace_task.await?;
+            let fork_task = workspace.update(cx, |workspace, cx| {
+                let panel = workspace
+                    .panel::<AgentPanel>(cx)
+                    .ok_or_else(|| anyhow::anyhow!("The thread's workspace has no agent panel"))?;
+                anyhow::Ok(panel.update(cx, |panel, cx| panel.fork_thread(source_thread_id, cx)))
+            })?;
+            let fork = fork_task.await?;
+            this.update_in(cx, |this, window, cx| {
+                this.activate_thread(fork, &workspace, false, window, cx);
             })?;
             anyhow::Ok(())
         })
@@ -6913,6 +6968,11 @@ impl Sidebar {
         );
         let is_renaming =
             self.rename_target == Some(RenameTarget::Thread(thread.metadata.thread_id));
+        // The Zed agent can't fork threads. External agents are offered forking without
+        // connecting to them first, so one that can't fork reports it when asked to.
+        let can_fork = !is_draft
+            && thread.metadata.session_id.is_some()
+            && thread.metadata.agent_id.as_ref() != ZED_AGENT_ID.as_ref();
 
         let thread_id_for_actions = thread.metadata.thread_id;
         let session_id_for_delete = thread.metadata.session_id.clone();
@@ -7012,6 +7072,25 @@ impl Sidebar {
                         })
                     });
 
+                let fork_button = can_fork.then(|| {
+                    IconButton::new(("fork-thread", ix), IconName::GitBranch)
+                        .hover_background(button_hover_bg)
+                        .active_background(button_active_bg)
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text("Fork Thread"))
+                        .on_click({
+                            let thread_workspace = thread_workspace.clone();
+                            cx.listener(move |this, _, window, cx| {
+                                this.fork_thread(
+                                    thread_id_for_actions,
+                                    thread_workspace.clone(),
+                                    window,
+                                    cx,
+                                );
+                            })
+                        })
+                });
+
                 let contextual_action: Option<AnyElement> = if can_request_stop {
                     Some(
                         IconButton::new("stop-thread", IconName::Stop)
@@ -7085,6 +7164,7 @@ impl Sidebar {
                     h_flex()
                         .gap_0p5()
                         .child(rename_button)
+                        .when_some(fork_button, |this, button| this.child(button))
                         .when_some(contextual_action, |this, action| this.child(action)),
                 )
             })
@@ -7124,6 +7204,7 @@ impl Sidebar {
         let sidebar = cx.weak_entity();
 
         let active_workspace = self.active_workspace(cx);
+        let fork_workspace = thread_workspace.clone();
         let thread_workspace = match &thread_workspace {
             ThreadEntryWorkspace::Open(workspace) => Some(workspace.clone()),
             ThreadEntryWorkspace::Closed { .. } => None,
@@ -7147,6 +7228,7 @@ impl Sidebar {
                     let markdown_title = markdown_title.clone();
                     let rename_title = rename_title.clone();
                     let folder_paths = folder_paths.clone();
+                    let fork_workspace = fork_workspace.clone();
                     ContextMenu::build(_window, cx, move |mut menu, _window, _cx| {
                         menu = menu.entry("Rename Title", None, {
                             let sidebar = sidebar.clone();
@@ -7222,6 +7304,25 @@ impl Sidebar {
                                             cx,
                                         );
                                     }
+                                }
+                            });
+                        }
+
+                        if can_fork {
+                            menu = menu.entry("Fork Thread", None, {
+                                let sidebar = sidebar.clone();
+                                let fork_workspace = fork_workspace.clone();
+                                move |window, cx| {
+                                    sidebar
+                                        .update(cx, |sidebar, cx| {
+                                            sidebar.fork_thread(
+                                                thread_id,
+                                                fork_workspace.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        })
+                                        .ok();
                                 }
                             });
                         }

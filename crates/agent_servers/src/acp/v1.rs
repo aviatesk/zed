@@ -1344,6 +1344,16 @@ impl SessionDirectories {
             .additional_directories(self.additional_directories)
             .mcp_servers(mcp_servers)
     }
+
+    fn into_fork_session_request(
+        self,
+        session_id: acp_v2::SessionId,
+        mcp_servers: Vec<acp::McpServer>,
+    ) -> acp::ForkSessionRequest {
+        acp::ForkSessionRequest::new(acp::SessionId::new(session_id.0), self.cwd)
+            .additional_directories(self.additional_directories)
+            .mcp_servers(mcp_servers)
+    }
 }
 
 fn session_directories_from_work_dirs(
@@ -1700,6 +1710,49 @@ impl AgentConnection for AcpConnection {
             },
             cx,
         )
+    }
+
+    fn supports_fork_session(&self) -> bool {
+        self.agent_capabilities.session_capabilities.fork.is_some()
+    }
+
+    fn fork_session(
+        self: Rc<Self>,
+        session_id: acp_v2::SessionId,
+        project: Entity<Project>,
+        work_dirs: PathList,
+        cx: &mut App,
+    ) -> Task<Result<acp_v2::SessionId>> {
+        if !self.supports_fork_session() {
+            return Task::ready(Err(anyhow!(
+                "Forking sessions is not supported by this agent."
+            )));
+        }
+        if self
+            .sessions
+            .borrow()
+            .get(&session_id)
+            .is_some_and(|session| session.subagent_root.is_some())
+        {
+            return Task::ready(Err(anyhow!("Cannot fork a subagent session")));
+        }
+        let directories = match self.session_directories_from_work_dirs(&work_dirs) {
+            Ok(directories) => directories,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        // The fork is opened with the same MCP servers right after this, so an agent that
+        // starts the forked session can keep it running instead of restarting it.
+        let mcp_servers = mcp_servers_for_project(&project, self.lsp_bridge_url.as_deref(), cx);
+        let request = directories.into_fork_session_request(session_id, mcp_servers);
+        let connection = self.connection.clone();
+        cx.foreground_executor().spawn(async move {
+            let response = connection
+                .send_request(request)
+                .block_task()
+                .await
+                .map_err(map_acp_error)?;
+            Ok(acp_v2::SessionId::new(response.session_id.0))
+        })
     }
 
     fn auth_methods(&self) -> &[acp_v2::AuthMethod] {
@@ -7354,6 +7407,156 @@ mod tests {
             deleted_sessions
                 .lock()
                 .expect("deleted sessions lock should not be poisoned")
+                .is_empty()
+        );
+    }
+
+    async fn connect_session_fork_test_agent(
+        supports_fork: bool,
+        fork_requests: Arc<std::sync::Mutex<Vec<acp::ForkSessionRequest>>>,
+        cx: &mut gpui::TestAppContext,
+    ) -> (Rc<AcpConnection>, Entity<project::Project>) {
+        cx.update(|cx| {
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+        });
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/", serde_json::json!({ "a": {}, "b": {} }))
+            .await;
+        let project = project::Project::test(
+            fs,
+            [std::path::Path::new("/a"), std::path::Path::new("/b")],
+            cx,
+        )
+        .await;
+
+        let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
+        cx.background_spawn(
+            Agent
+                .v1()
+                .name("fork-test-agent")
+                .on_receive_request(
+                    async move |request: acp::ForkSessionRequest, responder, _cx| {
+                        fork_requests
+                            .lock()
+                            .expect("fork requests lock should not be poisoned")
+                            .push(request);
+                        responder.respond(acp::ForkSessionResponse::new("forked-session"))
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .connect_to(agent_transport),
+        )
+        .detach();
+
+        let (connection_tx, connection_rx) = futures::channel::oneshot::channel();
+        let client_io_task = cx.background_spawn(async move {
+            Client
+                .v1()
+                .name("fork-test-client")
+                .connect_with(
+                    client_transport,
+                    move |connection: ConnectionTo<Agent>| async move {
+                        connection_tx.send(connection).ok();
+                        futures::future::pending::<Result<(), agent_client_protocol::Error>>().await
+                    },
+                )
+                .await
+                .ok();
+        });
+        let client_conn = connection_rx
+            .await
+            .expect("failed to receive ACP connection");
+
+        let agent_capabilities = acp::AgentCapabilities::default().session_capabilities(
+            acp::SessionCapabilities::new()
+                .additional_directories(acp::SessionAdditionalDirectoriesCapabilities::new())
+                .fork(supports_fork.then(acp::SessionForkCapabilities::new)),
+        );
+        let connection = cx.update(|cx| {
+            let request_elicitations = cx.new(|_| ElicitationStore::default());
+            AcpConnection::new_for_test(
+                client_conn,
+                Rc::new(RefCell::new(HashMap::default())),
+                agent_capabilities,
+                false,
+                request_elicitations,
+                WeakEntity::new_invalid(),
+                client_io_task,
+                mpsc::unbounded().0,
+                Task::ready(()),
+                cx,
+            )
+        });
+
+        (Rc::new(connection), project)
+    }
+
+    #[gpui::test]
+    async fn fork_session_sends_session_fork_and_returns_new_session(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fork_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (connection, project) =
+            connect_session_fork_test_agent(true, fork_requests.clone(), cx).await;
+        assert!(connection.supports_fork_session());
+
+        let work_dirs = util::path_list::PathList::new(&[
+            std::path::Path::new("/a"),
+            std::path::Path::new("/b"),
+        ]);
+        let fork_session_id = cx
+            .update(|cx| {
+                connection.clone().fork_session(
+                    acp_v2::SessionId::new("source-session"),
+                    project.clone(),
+                    work_dirs,
+                    cx,
+                )
+            })
+            .await
+            .expect("fork_session failed");
+
+        assert_eq!(fork_session_id, acp_v2::SessionId::new("forked-session"));
+        assert_eq!(
+            *fork_requests
+                .lock()
+                .expect("fork requests lock should not be poisoned"),
+            vec![
+                acp::ForkSessionRequest::new("source-session", "/a")
+                    .additional_directories(vec![std::path::PathBuf::from("/b")])
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn fork_session_does_not_send_when_unsupported(cx: &mut gpui::TestAppContext) {
+        let fork_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (connection, project) =
+            connect_session_fork_test_agent(false, fork_requests.clone(), cx).await;
+        assert!(!connection.supports_fork_session());
+
+        let work_dirs = util::path_list::PathList::new(&[std::path::Path::new("/a")]);
+        let error = cx
+            .update(|cx| {
+                connection.clone().fork_session(
+                    acp_v2::SessionId::new("source-session"),
+                    project.clone(),
+                    work_dirs,
+                    cx,
+                )
+            })
+            .await
+            .expect_err("fork_session should fail when unsupported");
+
+        assert!(
+            error.to_string().contains("not supported"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            fork_requests
+                .lock()
+                .expect("fork requests lock should not be poisoned")
                 .is_empty()
         );
     }
